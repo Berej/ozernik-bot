@@ -4,7 +4,6 @@ aiosignal
 aiosqlite
 anyio
 attrs
-audioop-lts
 certifi
 colorama
 discord.py>=2.0
@@ -17,7 +16,7 @@ idna
 install-playwright
 multidict
 pillow
-playwright>=1.58         # Version is important
+playwright>=1.58
 propcache
 pyee
 pylottie

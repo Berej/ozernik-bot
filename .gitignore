@@ -1,6 +1,7 @@
 build/*
 .venv
 .env
+venv
 __pycache__/
 base*
 
@@ -20,3 +21,4 @@ modules/karma_sistem/data.json
 /modules/cold_old_man/table.json
 modules/rsn/rsn.db
 database.db
+/modules/bridge/cogs/temp/
