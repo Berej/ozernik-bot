@@ -14,3 +14,5 @@ modules/bridge/data.json
 modules/karma_sistem/data.json
 /modules/cold_old_man/data.json
 /modules/cold_old_man/table.json
+modules/rsn/rsn.db
+database.db
