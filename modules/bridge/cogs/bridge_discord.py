@@ -320,8 +320,8 @@ class BridgeDiscord(commands.Cog):
 
 
 async def setup(bot):
-    await bot.add_cog(BridgeDiscord(bot))
-
+    # await bot.add_cog(BridgeDiscord(bot))
+    pass
 
 class DefaultAvatar:
     _avatars = {

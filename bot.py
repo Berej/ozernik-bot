@@ -1,89 +1,170 @@
 # main.py
-import discord
-import traceback
-from discord.ext import commands
-from datetime import timedelta, timezone
+
+import asyncio
 import os
+import traceback
+from datetime import timedelta, timezone
+
+import discord
 from colorama import Fore, Style, init
+from discord.ext import commands
+
+from config import config, DISCORD_TOKEN_MAIN
+
+from utilities import Database, DataTypes
+
 init()
 
-from config_loader import config
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
+GUILD_ID = config.GUILD_ID
+MODULES_FOLDER = "modules"
 
-# importing data from config.json
-GUILD_ID = config.GUILD
+MOSCOW_TZ = timezone(timedelta(hours=3))
 
-bot = commands.Bot(command_prefix='.', intents=intents)
 
-moscow_tz = timezone(timedelta(hours=3))
+class OzernikiBot(commands.Bot):
+    def __init__(self) -> None:
+        self.ready = False
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
 
-### modules loading
-modules_folder = 'modules'  # modules directory name
+        super().__init__(
+            command_prefix=".",
+            intents=intents,
+        )
 
-async def load_extensions():
-    i = 1
+        self.moscow_tz = MOSCOW_TZ
+        self.modules_folder = MODULES_FOLDER
 
-    for folder in os.listdir(modules_folder):
-        folder_path = os.path.join(modules_folder, folder)
+        self.db = Database()
 
-        if not os.path.isdir(folder_path):
-            continue
-        if folder.startswith("_"):
-            continue
+    def discover_modules(self) -> None:
+        """
+        Находит Python-модули в папке modules
+        и добавляет их в конфигурацию.
+        """
+        for folder in sorted(os.listdir(self.modules_folder)):
+            folder_path = os.path.join(self.modules_folder, folder)
 
-        for filename in os.listdir(folder_path):
-            if not filename.endswith(".py"):
+            if not os.path.isdir(folder_path):
                 continue
-            if filename.startswith("_"):
+
+            if folder.startswith("_"):
                 continue
 
-            module_path = f"{modules_folder}.{folder}.{filename[:-3]}"
+            for filename in sorted(os.listdir(folder_path)):
+                if not filename.endswith(".py"):
+                    continue
+
+                if filename.startswith("_"):
+                    continue
+
+                module_path = (
+                    f"{self.modules_folder}."
+                    f"{folder}."
+                    f"{filename[:-3]}"
+                )
+
+                config.module_add(module_path)
+
+    async def load_configured_extensions(self) -> None:
+        """
+        Загружает включённые расширения из config.MODULES.
+        """
+        for index, (module_path, loaded) in enumerate(
+            config.MODULES.items(),
+            start=1,
+        ):
+            module_name = module_path.rsplit(".", maxsplit=1)[-1]
+
+            if not loaded:
+                print(
+                    Fore.YELLOW
+                    + f"{index}. [{module_name}] Cog is disabled."
+                    + Style.RESET_ALL
+                )
+                continue
 
             try:
-                await bot.load_extension(module_path)
-                print(
-                    Fore.GREEN
-                    + f"{i}. [{module_path}] Cog loaded successfully!"
-                    + Style.RESET_ALL
-                )
-            except Exception as e:
+                await self.load_extension(module_path)
+
+            except Exception:
                 tb = traceback.format_exc()
+
                 print(
                     Fore.RED
-                    + f'{i}. [{module_path}] Error loading cog: "{tb}".'
+                    + f'{index}. [{module_name}] Error loading Cog:\n{tb}'
                     + Style.RESET_ALL
                 )
 
-            i += 1
+            else:
+                print(
+                    Fore.GREEN
+                    + f"{index}. [{module_name}] Cog loaded successfully!"
+                    + Style.RESET_ALL
+                )
+
+    async def setup_hook(self) -> None:
+        """
+        Выполняется один раз при запуске бота,
+        до события on_ready.
+        """
+        self.discover_modules()
+        await self.load_configured_extensions()
+
+        guild = discord.Object(id=GUILD_ID)
+
+        # Копирует глобально объявленные команды
+        # в конкретный сервер для быстрой синхронизации.
+        self.tree.copy_global_to(guild=guild)
+
+        await self.tree.sync(guild=guild)
+
+        print(f"Slash-команды синхронизированы для сервера {GUILD_ID}.")
+
+    async def close(self) -> None:
+        """
+        Закрывает ресурсы перед остановкой бота.
+        """
+        # Например:
+        # self.database.close_()
+
+        await super().close()
+
+    def db_ensure_user(self, user: discord.User) -> DataTypes.Ozernik | None:
+        ozernik = self.db.get_user_by_discord_id(user.id)
+        if ozernik is None:
+            ozernik_id = self.db.add_user(discord_id=user.id)
+            ozernik = self.db.get_user(ozernik_id)
+        return ozernik
+
+    @property
+    def unix_time(self) -> int:
+        return time.time()
+
+    @property
+    def guild(self):
+        return self.get_guild(GUILD_ID)
+
+bot = OzernikiBot()
+
 
 @bot.event
-async def on_ready():
-    print('Login: {}'.format(bot.user))
-
-    await load_extensions()  # Call modules loading
-    guild = discord.Object(id=GUILD_ID)
-
-
-    # Clearing global slash-commands
-    # Global sync then local sync only for guild
-    await bot.tree.sync()  # empy sync to delete global commands
-    await bot.tree.sync(guild=guild)  # local sync
-
-    print('Timezone setup:', moscow_tz)
-    print('Ready!')
+async def on_ready() -> None:
+    """
+    Может выполняться повторно после переподключения.
+    """
+    print(f"Login: {bot.user}")
+    print(f"Timezone setup: {bot.moscow_tz}")
+    print("Ready!")
+    bot.ready = True
 
 
-async def main():
-    token = config.TOKEN
-
+async def main() -> None:
     async with bot:
-        await bot.start(token)
-
+        await bot.start(DISCORD_TOKEN_MAIN)
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())

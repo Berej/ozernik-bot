@@ -11,10 +11,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config_loader import config
+from config import config
 
 # ====== Settings ======
-GUILD_ID = config.GUILD
+GUILD_ID = config.GUILD_ID
 DB_PATH = "ranks.db"
 LOG_CHANNEL_ID = 1342897615905226842  # log channel
 #LOG_CHANNEL_ID = 1409197452954828990 # log channel test server
@@ -75,7 +75,7 @@ def fame_note_embed(author: discord.User, target: discord.User, action: int, rea
     note.set_author(name=author.name, icon_url=author.avatar.url if hasattr(author, "avatar") and author.avatar else None)
     sign = "``+``" if action == 1 else "``-``"
     # limit length of 'reason' in embed log message
-    reason_display = (reason_text[:300] + '...') if reason_text and len(reason_text) > 300 else (reason_text or "админская правка")
+    reason_display = (reason_text[:300] + '...') if reason_text and len(reason_text) > 300 else (reason_text or "Админская правка")
     target_name = getattr(target, "display_name", str(target))
     target_tag = getattr(target, "name", "")
     note.add_field(name=f'{target_name} ({target_tag} | {target.id})', value=f'{sign} **{count}** — {reason_display}')

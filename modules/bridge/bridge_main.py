@@ -1,9 +1,5 @@
 from discord.ext import commands
 
-# импортируем телеграм процесс
-from modules.bridge.cogs.bridge_telegram import start_telegram_bot
-
-
 class BridgeMain(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -30,5 +26,5 @@ class BridgeMain(commands.Cog):
 
 
 async def setup(bot):
-    await bot.add_cog(BridgeMain(bot))
-
+    # await bot.add_cog(BridgeMain(bot))
+    pass

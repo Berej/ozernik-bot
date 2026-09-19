@@ -1,0 +1,32 @@
+{
+  "log_channel_id": 1545525361872208032,
+  "admin_notify_channel_id": 791758756392337409,
+  "export_channel_id": 1545525361872208032,
+  "admin_role_ids": [725675581881974794],
+  "moderator_role_ids": [779015800555176006],
+  "mute_role_id": 1168293205624766524,
+  "full_mute_role_id": 1550578606521188502,
+  "scale_max": 50,
+  "scale_thresholds": {
+    "isolator": [
+      31,
+      50
+    ],
+    "restricted": [
+      11,
+      30
+    ],
+    "critical": [
+      1,
+      10
+    ],
+    "ban_trigger": 0
+  },
+  "duration_multiplier": {
+    "isolator": 1,
+    "restricted": 2,
+    "critical": 3
+  },
+  "weekly_point_gain": 1,
+  "reset_points_on_return": 10
+}

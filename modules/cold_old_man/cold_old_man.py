@@ -12,8 +12,8 @@ from discord.ext import commands
 from discord.ui import View, Button
 from unicodedata import category
 
+from config import config
 from utilities import DataWorker, JsonWorker # noqa
-from config_loader import config # noqa
 
 
 data = DataWorker('modules/cold_old_man/data.json')
@@ -21,7 +21,7 @@ data = DataWorker('modules/cold_old_man/data.json')
 class ColdOldMan(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.guild: discord.Guild = bot.get_guild(config.GUILD)
+        self.guild: discord.Guild = bot.get_guild(config.GUILD_ID)
         self.category_and_roles = self.CategoryAndRoles(cog=self)
         self.buttons = self.Buttons
         self.messages = self.Messages(cog=self)
@@ -1140,7 +1140,7 @@ class ColdOldMan(commands.Cog):
             self.game.start()
     @app_commands.command(name='guess', description='Угадать цель.')
     @app_commands.describe(target='Выберите игрока.')
-    @app_commands.guilds(config.GUILD)
+    @app_commands.guilds(config.GUILD_ID)
     async def guess(self, interaction: Interaction, target: discord.User):
         try:
             target_id = target.id
@@ -1154,7 +1154,7 @@ class ColdOldMan(commands.Cog):
             await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
 
     @app_commands.command(name='alchemist_create_event', description='Подготовить категорию ивента Пьяного Алхимика.')
-    @app_commands.guilds(config.GUILD)
+    @app_commands.guilds(config.GUILD_ID)
     async def alchemist_create_event(self, interaction: Interaction):
         try:
             if not interaction.user.guild_permissions.administrator:
@@ -1206,7 +1206,7 @@ class ColdOldMan(commands.Cog):
             await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
 
     @app_commands.command(name='alchemist_recreate_roles', description='Обновить роли ивента Пьяного Алхимика.')
-    @app_commands.guilds(config.GUILD)
+    @app_commands.guilds(config.GUILD_ID)
     async def alchemist_recreate_roles(self, interaction: Interaction):
         try:
             if not interaction.user.guild_permissions.administrator:
@@ -1250,7 +1250,7 @@ class ColdOldMan(commands.Cog):
 
     @app_commands.command(name='alchemist_ban', description='Забанить игрока.')
     @app_commands.describe(user='Выберите игрока.')
-    @app_commands.guilds(config.GUILD)
+    @app_commands.guilds(config.GUILD_ID)
     async def alchemist_ban(self, interaction: Interaction, user: discord.User):
         try:
             if interaction.user.id != 512079329619083291:
@@ -1269,7 +1269,7 @@ class ColdOldMan(commands.Cog):
 
     @app_commands.command(name='alchemist_unban', description='Разбанить игрока.')
     @app_commands.describe(member='Выберите игрока.')
-    @app_commands.guilds(config.GUILD)
+    @app_commands.guilds(config.GUILD_ID)
     async def alchemist_unban(self, interaction: Interaction, member: discord.Member):
         try:
             if interaction.user.id != 512079329619083291:
@@ -1287,7 +1287,7 @@ class ColdOldMan(commands.Cog):
             await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
 
     @app_commands.command(name='alchemist_data', description='Данный ивента Пьяного Алхимика.')
-    @app_commands.guilds(config.GUILD)
+    @app_commands.guilds(config.GUILD_ID)
     async def alchemist_data(self, interaction: Interaction):
         try:
             await self.category_and_roles.update_category()
@@ -1315,7 +1315,7 @@ class ColdOldMan(commands.Cog):
             await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
 
     @app_commands.command(name='alchemist_update_rules', description='Переделать сообщение правил.')
-    @app_commands.guilds(config.GUILD)
+    @app_commands.guilds(config.GUILD_ID)
     async def alchemist_update_rules(self, interaction: Interaction):
         try:
             if interaction.user.id != 512079329619083291:
@@ -1331,7 +1331,7 @@ class ColdOldMan(commands.Cog):
             await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
 
     @app_commands.command(name='alchemist_start', description='Начать ивент.')
-    @app_commands.guilds(config.GUILD)
+    @app_commands.guilds(config.GUILD_ID)
     async def alchemist_start(self, interaction: Interaction):
         try:
             if interaction.user.id != 512079329619083291:
@@ -1360,4 +1360,5 @@ class ColdOldMan(commands.Cog):
             await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
 
 async def setup(bot):
-    await bot.add_cog(ColdOldMan(bot))
+    # await bot.add_cog(ColdOldMan(bot))
+    pass

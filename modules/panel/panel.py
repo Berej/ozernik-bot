@@ -1,11 +1,14 @@
+import traceback
 import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
 from discord import Embed
-from config_loader import config
+from typing_extensions import Literal
 
-LOG_CHANNEL = config.LOG_CHANNEL_ID
+from config import config
+
+LOG_CHANNEL = 1131880136053100616
 
 ALLOWED_ROLES = [725675581881974794, # admin role main server
                  1408776412177109142, 
@@ -17,6 +20,49 @@ ALLOWED_ROLES = [725675581881974794, # admin role main server
 class Panel(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    async def get_modules_autocomplete(self, interaction: discord.Interaction, current: str): # noqa
+        loaded_extensions: list[str] = list(self.bot.extensions.keys())
+        all_extensions: dict[str, None] = config.MODULES
+        results = []
+
+        for extension in all_extensions:
+            if current.lower() in extension.lower():
+                module_name = extension.split('.')[-1]
+                if extension not in loaded_extensions:
+                    module_name += ' (выкл)'
+                results.append(app_commands.Choice(name=module_name, value=extension))
+
+        return results[:25]
+    @app_commands.command(name='modules_control', description='Управление модулями.')
+    @app_commands.describe(module="Новое содержимое сообщения.", mode='По умолчанию "reload".')
+    @app_commands.guilds(config.GUILD_ID)
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.autocomplete(module=get_modules_autocomplete)
+    async def modules_control(self, interaction: discord.Interaction, module: str, mode: Literal["reload", "load", "unload"] | None = None):
+        try:
+            await interaction.response.defer(ephemeral=False, thinking=True)
+            module_name = module.split('.')[-1]
+
+            match mode:
+                case 'unload':
+                    await self.bot.unload_extension(module)
+                    config.module_off(module)
+                    await interaction.followup.send(f"Выгружен модуль: {module_name}")
+                    print(f"Выгружен модуль: {module_name}")
+                case 'load':
+                    await self.bot.load_extension(module)
+                    await interaction.followup.send(f"Загружен модуль: {module_name}")
+                    print(f"Загружен модуль: {module_name}")
+                case _:
+                    await self.bot.reload_extension(module)
+                    await interaction.followup.send(f"Перезагружен модуль: {module_name}")
+                    print(f"Перезагружен модуль: {module_name}")
+        except Exception as e:
+            func_name = inspect.currentframe().f_code.co_name
+            tb = traceback.format_exc()
+            print(f"Error in {func_name}: {tb}")
+            await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -35,7 +81,7 @@ class Panel(commands.Cog):
             return
 
         # require this to happen in the configured guild
-        if message.guild is None or message.guild.id != config.GUILD:
+        if message.guild is None or message.guild.id != config.GUILD_ID:
             return
 
         # ensure author is a guild Member (has roles)
@@ -89,8 +135,8 @@ class Panel(commands.Cog):
         description='Отправить сообщение от имени Бота'
     )
     @app_commands.describe(channel='Канал отправки', content="Содержимое сообщения.")
-    @app_commands.guilds(config.GUILD)
-    async def send_message(self, interaction: discord.Interaction, channel: discord.TextChannel, content: str):
+    @app_commands.guilds(config.GUILD_ID)
+    async def _send_message(self, interaction: discord.Interaction, channel: discord.TextChannel, content: str):
         # Validate everything before touching Discord
         if not any(role.id in ALLOWED_ROLES for role in interaction.user.roles):
             await interaction.response.send_message("Только для Администрации.", ephemeral=True)
@@ -167,7 +213,7 @@ class Panel(commands.Cog):
         message_id="ID сообщения.",
         content="Новое содержимое сообщения."
     )
-    @app_commands.guilds(config.GUILD)
+    @app_commands.guilds(config.GUILD_ID)
     async def edit_message(self, interaction: discord.Interaction, channel: discord.TextChannel, message_id: str, content: str):
         try:
             # Проверка ролей

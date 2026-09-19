@@ -2,10 +2,10 @@ import asyncio
 import discord
 from discord.ext import commands
 
-from config_loader import config
+from config import config
 
-VOICE_ID = config.VM_CHANNEL_ID
-CATEGORY_ID = config.VM_CATEGORY_ID  # can be = 0 if no category specified
+VOICE_ID = 1108123669747732481
+CATEGORY_ID = 1131880136053100616
 
 # Roles that should be forbidden from joining temporary voice channels
 FORBIDDEN_ROLE_IDS = [1234872836691067063, 1168293205624766524]
