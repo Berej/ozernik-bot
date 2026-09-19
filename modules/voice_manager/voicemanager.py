@@ -4,11 +4,11 @@ from discord.ext import commands
 
 from config import config
 
-VOICE_ID = 1108123669747732481
-CATEGORY_ID = 1131880136053100616
+VOICE_ID = 1150378018771050537
+CATEGORY_ID = 1002923440644304926
 
 # Roles that should be forbidden from joining temporary voice channels
-FORBIDDEN_ROLE_IDS = [1234872836691067063, 1168293205624766524]
+FORBIDDEN_ROLE_IDS = [1550578606521188502, 1168293205624766524, 1234872836691067063]
 
 class VoiceManager(commands.Cog):
     def __init__(self, bot: commands.Bot):
