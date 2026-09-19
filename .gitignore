@@ -3,9 +3,13 @@ build/*
 .env
 __pycache__/
 base*
-ranks.db
+
+*.db
+**.json
+**/temp/
+**test.py
+
 token.txt
-*test.py
 test/*
 config.json
 LinkMess.json
