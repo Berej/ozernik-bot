@@ -231,8 +231,8 @@ class RsnCog(commands.Cog):
 
     async def _check_permissions(self, interaction: discord.Interaction) -> bool:
         """Проверить, есть ли у пользователя права админа/модератора (по ролям)."""
-        admin_role_ids = 725675581881974794
-        mod_role_ids = 779015800555176006
+        admin_role_ids = "725675581881974794"
+        mod_role_ids = "779015800555176006"
         
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
