@@ -23,6 +23,10 @@ CASES_PER_PAGE = 5
 MAX_REASON_LENGTH = 100
 INTERACTION_TIMEOUT = 180
 
+ADMIN_ROLE_ID = 725675581881974794
+MOD_ROLE_ID = 779015800555176006
+
+
 
 class CaseViewPagination(discord.ui.View):
     """Pagination view for case records."""
@@ -229,21 +233,21 @@ class RsnCog(commands.Cog):
         except Exception as e:
             print(f"[RSN] Error during startup cleanup: {traceback.format_exc()}")
 
+
     async def _check_permissions(self, interaction: discord.Interaction) -> bool:
-        """Проверить, есть ли у пользователя права админа/модератора (по ролям)."""
-        admin_role_ids = "725675581881974794"
-        mod_role_ids = "779015800555176006"
-        
+        """Проверить, есть ли у пользователя права администратора или модератора."""
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
-                "❌ Ошибка: не удалось определить вашего статуса на сервере.",
+                "❌ Ошибка: не удалось определить ваш статус на сервере.",
                 ephemeral=True
             )
             return False
 
         user_role_ids = {role.id for role in interaction.user.roles}
-        has_permission = bool(
-            user_role_ids & set(admin_role_ids) or user_role_ids & set(mod_role_ids)
+
+        has_permission = (
+            ADMIN_ROLE_ID in user_role_ids
+            or MOD_ROLE_ID in user_role_ids
         )
 
         if not has_permission:
