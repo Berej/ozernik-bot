@@ -818,27 +818,59 @@ class RsnCog(commands.Cog):
 
             # Выдать роль мута
             mute_role_id = self.config.get_mute_role_id()
+            print(f"[RSN] Assigning mute role - User ID: {user.id}, Role ID: {mute_role_id}, Member: {member}")
             if mute_role_id:
                 mute_role = interaction.guild.get_role(mute_role_id)
+                print(f"[RSN] Mute role object retrieved: {mute_role} (found: {mute_role is not None})")
                 if mute_role:
-                    await member.add_roles(mute_role, reason=reason)
+                    try:
+                        await member.add_roles(mute_role, reason=reason)
+                        print(f"[RSN] ✓ Successfully assigned mute role to user {user.id}")
+                    except Exception as role_error:
+                        print(f"[RSN] ✗ ERROR assigning mute role to user {user.id}: {role_error}")
+                else:
+                    print(f"[RSN] ✗ Mute role not found on guild. Role ID: {mute_role_id}")
+            else:
+                print(f"[RSN] ✗ Mute role ID not configured in config")
 
             # Если множитель > 1, выдать дополнительный полный мут
             if multiplier > 1:
                 full_mute_role_id = self.config.get_full_mute_role_id()
+                print(f"[RSN] Multiplier > 1, assigning full mute - User ID: {user.id}, Role ID: {full_mute_role_id}")
                 if full_mute_role_id:
                     full_mute_role = interaction.guild.get_role(full_mute_role_id)
+                    print(f"[RSN] Full mute role object retrieved: {full_mute_role} (found: {full_mute_role is not None})")
                     if full_mute_role:
-                        await member.add_roles(full_mute_role, reason=reason)
+                        try:
+                            await member.add_roles(full_mute_role, reason=reason)
+                            print(f"[RSN] ✓ Successfully assigned full mute role to user {user.id}")
+                        except Exception as role_error:
+                            print(f"[RSN] ✗ ERROR assigning full mute role to user {user.id}: {role_error}")
+                    else:
+                        print(f"[RSN] ✗ Full mute role not found on guild. Role ID: {full_mute_role_id}")
+                else:
+                    print(f"[RSN] ✗ Full mute role ID not configured in config")
 
             # Если баллы <= ban_trigger (0), выдать перманентный полный мут
             ban_trigger = self.config.get_scale_thresholds().get("ban_trigger", 0)
             if new_points <= ban_trigger:
                 full_mute_role_id = self.config.get_full_mute_role_id()
+                print(f"[RSN] Points <= ban_trigger ({new_points} <= {ban_trigger}), assigning permanent full mute - User ID: {user.id}, Role ID: {full_mute_role_id}")
                 if full_mute_role_id:
                     full_mute_role = interaction.guild.get_role(full_mute_role_id)
+                    print(f"[RSN] Permanent full mute role object retrieved: {full_mute_role} (found: {full_mute_role is not None})")
                     if full_mute_role and full_mute_role not in member.roles:
-                        await member.add_roles(full_mute_role, reason="Перманент")
+                        try:
+                            await member.add_roles(full_mute_role, reason="Перманент")
+                            print(f"[RSN] ✓ Successfully assigned permanent full mute role to user {user.id}")
+                        except Exception as role_error:
+                            print(f"[RSN] ✗ ERROR assigning permanent full mute role to user {user.id}: {role_error}")
+                    elif full_mute_role in member.roles:
+                        print(f"[RSN] User {user.id} already has full mute role, skipping")
+                    else:
+                        print(f"[RSN] ✗ Permanent full mute role not found on guild. Role ID: {full_mute_role_id}")
+                else:
+                    print(f"[RSN] ✗ Full mute role ID not configured in config")
 
                 # Перманентное наказание (expires_at = None)
                 self.db.create_or_update_punishment(
@@ -945,15 +977,38 @@ class RsnCog(commands.Cog):
             mute_role_id = self.config.get_mute_role_id()
             full_mute_role_id = self.config.get_full_mute_role_id()
 
+            print(f"[RSN] Removing mute roles - User ID: {user.id}, Mute Role ID: {mute_role_id}, Full Mute Role ID: {full_mute_role_id}")
             if mute_role_id:
                 mute_role = interaction.guild.get_role(mute_role_id)
+                print(f"[RSN] Mute role object retrieved: {mute_role} (found: {mute_role is not None})")
                 if mute_role and mute_role in member.roles:
-                    await member.remove_roles(mute_role)
+                    try:
+                        await member.remove_roles(mute_role)
+                        print(f"[RSN] ✓ Successfully removed mute role from user {user.id}")
+                    except Exception as role_error:
+                        print(f"[RSN] ✗ ERROR removing mute role from user {user.id}: {role_error}")
+                elif mute_role and mute_role not in member.roles:
+                    print(f"[RSN] User {user.id} does not have mute role, skipping removal")
+                else:
+                    print(f"[RSN] ✗ Mute role not found on guild. Role ID: {mute_role_id}")
+            else:
+                print(f"[RSN] ✗ Mute role ID not configured in config")
 
             if full_mute_role_id:
                 full_mute_role = interaction.guild.get_role(full_mute_role_id)
+                print(f"[RSN] Full mute role object retrieved: {full_mute_role} (found: {full_mute_role is not None})")
                 if full_mute_role and full_mute_role in member.roles:
-                    await member.remove_roles(full_mute_role)
+                    try:
+                        await member.remove_roles(full_mute_role)
+                        print(f"[RSN] ✓ Successfully removed full mute role from user {user.id}")
+                    except Exception as role_error:
+                        print(f"[RSN] ✗ ERROR removing full mute role from user {user.id}: {role_error}")
+                elif full_mute_role and full_mute_role not in member.roles:
+                    print(f"[RSN] User {user.id} does not have full mute role, skipping removal")
+                else:
+                    print(f"[RSN] ✗ Full mute role not found on guild. Role ID: {full_mute_role_id}")
+            else:
+                print(f"[RSN] ✗ Full mute role ID not configured in config")
 
             # Удалить из активных наказаний (баллы НЕ меняются)
             self.db.delete_active_punishment(user.id)
@@ -1294,24 +1349,39 @@ class RsnCog(commands.Cog):
                     if member:
                         mute_role_id = self.config.get_mute_role_id()
                         full_mute_role_id = self.config.get_full_mute_role_id()
+                        print(f"[RSN] Removing mute roles from user {user_id} - Mute Role ID: {mute_role_id}, Full Mute Role ID: {full_mute_role_id}")
 
                         if mute_role_id:
                             mute_role = guild.get_role(mute_role_id)
+                            print(f"[RSN] Mute role object retrieved: {mute_role} (found: {mute_role is not None})")
                             if mute_role and mute_role in member.roles:
                                 try:
                                     await member.remove_roles(mute_role)
-                                    print(f"[RSN] Removed mute role from user {user_id}")
+                                    print(f"[RSN] ✓ Removed mute role from user {user_id}")
                                 except Exception as role_error:
-                                    print(f"[RSN] Failed to remove mute role from {user_id}: {role_error}")
+                                    print(f"[RSN] ✗ Failed to remove mute role from {user_id}: {role_error}")
+                            elif mute_role and mute_role not in member.roles:
+                                print(f"[RSN] User {user_id} does not have mute role")
+                            else:
+                                print(f"[RSN] ✗ Mute role not found on guild. Role ID: {mute_role_id}")
+                        else:
+                            print(f"[RSN] ✗ Mute role ID not configured in config")
 
                         if full_mute_role_id:
                             full_mute_role = guild.get_role(full_mute_role_id)
+                            print(f"[RSN] Full mute role object retrieved: {full_mute_role} (found: {full_mute_role is not None})")
                             if full_mute_role and full_mute_role in member.roles:
                                 try:
                                     await member.remove_roles(full_mute_role)
-                                    print(f"[RSN] Removed full mute role from user {user_id}")
+                                    print(f"[RSN] ✓ Removed full mute role from user {user_id}")
                                 except Exception as role_error:
-                                    print(f"[RSN] Failed to remove full mute role from {user_id}: {role_error}")
+                                    print(f"[RSN] ✗ Failed to remove full mute role from {user_id}: {role_error}")
+                            elif full_mute_role and full_mute_role not in member.roles:
+                                print(f"[RSN] User {user_id} does not have full mute role")
+                            else:
+                                print(f"[RSN] ✗ Full mute role not found on guild. Role ID: {full_mute_role_id}")
+                        else:
+                            print(f"[RSN] ✗ Full mute role ID not configured in config")
                     else:
                         print(f"[RSN] Member {user_id} not found in guild for mute removal")
 
