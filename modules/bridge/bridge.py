@@ -218,7 +218,7 @@ class ViewSelectForum(View):
                 t = 'за'
 
                 try:
-                    self.cog.db.add_chat_link(discord_chanel_id=self.channel.id, telegram_chat_id=forum_id,
+                    self.cog.db.add_chat_link(discord_channel_id=self.channel.id, telegram_chat_id=forum_id,
                                               telegram_topic_id=topic.message_thread_id)
                 except sqlite3.IntegrityError:
                     t = 'пере'
@@ -267,7 +267,7 @@ class ViewSelectGroup(View):
                 t = 'за'
 
                 try:
-                    self.cog.db.add_chat_link(discord_chanel_id=self.channel.id,
+                    self.cog.db.add_chat_link(discord_channel_id=self.channel.id,
                                               telegram_chat_id=group_id)
                 except sqlite3.IntegrityError:
                     t = 'пере'
@@ -323,7 +323,7 @@ class ViewSelectChannel(View):
                 t = 'за'
 
                 try:
-                    self.cog.db.add_chat_link(discord_chanel_id=self.channel.id,
+                    self.cog.db.add_chat_link(discord_channel_id=self.channel.id,
                                               telegram_chat_id=tg_channel_id)
                 except sqlite3.IntegrityError:
                     t = 'пере'
@@ -735,7 +735,7 @@ class Bridge(commands.Cog):
                     )
 
                     if replied_message_link:
-                        channel = self.bot.get_channel(chat_link.discord_chanel_id)
+                        channel = self.bot.get_channel(chat_link.discord_channel_id)
                         ds_replied_message: discord.Message = await channel.fetch_message(replied_message_link.discord_message_id)
 
                         reply_ping = self.get_reply_ping(ds_replied_message)
@@ -757,7 +757,7 @@ class Bridge(commands.Cog):
                     discord_message_link = self.db.deep_get_discord_message_link(external_message_id, external_chat.id)
 
                     if discord_message_link:
-                        channel = self.bot.get_channel(discord_message_link.chat_link.discord_chanel_id)
+                        channel = self.bot.get_channel(discord_message_link.chat_link.discord_channel_id)
                         ds_replied_message: discord.Message = await channel.fetch_message(discord_message_link.discord_message_id)
 
                         reply_ping = self.get_reply_ping(ds_replied_message)
@@ -789,7 +789,7 @@ class Bridge(commands.Cog):
 
     async def send_webhook_message(self, chat_link: DataTypes.ChatLink, tg_messages: list[telegram.Message], files: list):
         try:
-            channel = self.bot.get_channel(chat_link.discord_chanel_id)
+            channel = self.bot.get_channel(chat_link.discord_channel_id)
             webhook = await self.get_webhook(channel)
 
             if tg_messages:
