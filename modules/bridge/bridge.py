@@ -649,7 +649,7 @@ class Bridge(commands.Cog):
                 print('else')
                 reply_body = f'{reply_mention}'
 
-            return reply_body, reply_mention
+            return tuple(reply_body, reply_mention)
         except Exception as e:
             print(f"get_reply_body error: {e}")
 
