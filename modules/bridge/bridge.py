@@ -1442,8 +1442,8 @@ class Telegram:
                 files_path = await self.save_discord_attachments(message)
                 if files_path:
                     replaced = True
-                if getattr(await self.app_main.bot.get_chat(chat_link.telegram_chat_id), 'linked_chat_id', False):
-                    replaced = False
+                # if getattr(await self.app_main.bot.get_chat(chat_link.telegram_chat_id), 'linked_chat_id', False):
+                #     replaced = False
                 text = await self.get_text(message, have_title=replaced)
 
                 reply_parameters = None
