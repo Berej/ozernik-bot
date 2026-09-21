@@ -1386,7 +1386,7 @@ class Telegram:
                 message = update.message
                 thread_id = -1
                 post = update.channel_post
-                chat = await context._bot.get_chat(update.effective_chat.id)
+                chat = await self.app_main.bot.get_chat(update.effective_chat.id)
 
                 if message:
                     thread_id = message.message_thread_id if message.message_thread_id and update.effective_chat.is_forum else -1
