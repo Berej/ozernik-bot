@@ -533,7 +533,8 @@ class Bridge(commands.Cog):
             ozernik = self.db.get_user_by_discord_id(message.author.id)
 
             if ozernik is None:
-                ozernik = self.db.add_user(discord_id=message.author.id)
+                self.db.add_user(discord_id=message.author.id)
+                ozernik = self.db.get_user_by_discord_id(message.author.id)
 
             if not ozernik.telegram_id:
                 print('unregistered_in_telegram_user_message')
