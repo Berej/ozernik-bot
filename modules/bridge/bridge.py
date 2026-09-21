@@ -496,7 +496,6 @@ class Bridge(commands.Cog):
             channel_id = message.channel.id
             chat_link = self.db.get_chat_link(channel_id, 'discord')
             if not chat_link:
-                print('Не мост')
                 return
 
             try:
@@ -534,7 +533,7 @@ class Bridge(commands.Cog):
             ozernik = self.db.get_user_by_discord_id(message.author.id)
 
             if ozernik is None:
-                ozernik = self.db.add_discord_user(message.author.id)
+                ozernik = self.db.add_user(discord_id=message.author.id)
 
             if not ozernik.telegram_id:
                 print('unregistered_in_telegram_user_message')
@@ -649,7 +648,7 @@ class Bridge(commands.Cog):
                 print('else')
                 reply_body = f'{reply_mention}'
 
-            return reply_body, reply_mention
+            return tuple(reply_body, reply_mention)
         except Exception as e:
             print(f"get_reply_body error: {e}")
 
@@ -1038,7 +1037,6 @@ class Telegram:
             pattern = re.compile(
                 r"https://discord\.com/channels/(\d+)/(\d+)/(\d+)"
             )
-            print(content)
             for match in pattern.finditer(content):
                 full_link = match.group(0)
 
@@ -1390,13 +1388,11 @@ class Telegram:
 
                 if message:
                     thread_id = message.message_thread_id if message.message_thread_id and update.effective_chat.is_forum else -1
-                    print(f'Telegram message {message.message_id} {thread_id}')
-
+        
                 elif post:
-                    print(f'Telegram post {post.id}')
+                    pass
 
                 else:
-                    print(f'No message.')
                     return
 
                 chat_link = self.cog.db.get_chat_link(
