@@ -531,7 +531,7 @@ class Bridge(commands.Cog):
                 await self.telegram.send_main_bot_message(chat_link, message)
                 return
 
-            ozernik = self.db.get_user(message.author.id, 'discord_id')
+            ozernik = self.db.get_user_by_discord_id(message.author.id)
 
             if ozernik is None:
                 ozernik = self.db.add_discord_user(message.author.id)
@@ -566,7 +566,7 @@ class Bridge(commands.Cog):
 
     async def get_avatar(self, telegram_user_id: int) -> str:
         try:
-            ozernik = self.db.get_user(telegram_user_id, 'telegram_id')
+            ozernik = self.db.get_user_by_telegram_id(telegram_user_id)
             avatar_url = None
             bot = self.telegram.app_main.bot
 
@@ -777,7 +777,7 @@ class Bridge(commands.Cog):
         try:
             username = telegram_user.username
 
-            ozernik = self.db.get_user(telegram_user.id, 'telegram_id')
+            ozernik = self.db.get_user_by_telegram_id(telegram_user.id)
 
             if getattr(ozernik, 'discord_id', None):
                 user = await self.bot.fetch_user(ozernik.discord_id)
@@ -817,7 +817,7 @@ class Bridge(commands.Cog):
                 kwargs["files"] = discord_files
 
             message = await webhook.send(**kwargs)
-            ozernik = self.db.get_user(tg_message.from_user.id, 'telegram_id')
+            ozernik = self.db.get_user_by_telegram_id(tg_message.from_user.id)
 
             self.db.add_message_link(
                 user_id=getattr(ozernik, 'id', None),
@@ -930,7 +930,7 @@ class Telegram:
             return 'username'
 
         async def get_hat(self, author: discord.User) -> str:
-            ozernik = self.cog.db.get_user(author.id, 'discord_id')
+            ozernik = self.cog.db.get_user_by_discord_id(author.id)
             if ozernik is None:
                 return f'<b><a>{author.display_name}</a></b>:\n'
 
@@ -1008,7 +1008,7 @@ class Telegram:
         async def get_formatted_content(self, message: discord.Message) -> str:
             content = markdown_to_html_custom(message.clean_content)
             for user in message.mentions:
-                ozernik = self.cog.db.get_user(user.id, 'discord_id')
+                ozernik = self.cog.db.get_user_by_discord_id(user.id)
                 if getattr(ozernik, 'telegram_id', None):
                     content = content.replace(
                         f"@{user.display_name}",
@@ -1386,7 +1386,7 @@ class Telegram:
                 message = update.message
                 thread_id = -1
                 post = update.channel_post
-                chat = await context._bot.get_chat(update.effective_chat.id)
+                chat = await self.app_main.bot.get_chat(update.effective_chat.id)
 
                 if message:
                     thread_id = message.message_thread_id if message.message_thread_id and update.effective_chat.is_forum else -1
@@ -1482,7 +1482,7 @@ class Telegram:
                     )
                     self.add_entities(tg_message)  # noqa
 
-                    ozernik = self.cog.db.get_user(message.author.id, 'discord_id')
+                    ozernik = self.cog.db.get_user_by_discord_id(message.author.id)
                     self.cog.db.add_message_link(
                         user_id=ozernik.id,
                         link_chat_id=chat_link.id,
@@ -1505,7 +1505,7 @@ class Telegram:
                     for tg_message in tg_messages:
                         self.add_entities(tg_message)  # noqa
 
-                        ozernik = self.cog.db.get_user(message.author.id, 'discord_id')
+                        ozernik = self.cog.db.get_user_by_discord_id(message.author.id)
                         self.cog.db.add_message_link(
                             user_id=ozernik.id,
                             link_chat_id=chat_link.id,
@@ -1557,7 +1557,7 @@ class Telegram:
                     )
                     self.add_entities(tg_message) # noqa
 
-                    ozernik = self.cog.db.get_user(message.author.id, 'discord_id')
+                    ozernik = self.cog.db.get_user_by_discord_id(message.author.id)
                     self.cog.db.add_message_link(
                         user_id=ozernik.id,
                         link_chat_id=chat_link.id,
@@ -1580,7 +1580,7 @@ class Telegram:
                     for tg_message in tg_messages:
                         self.add_entities(tg_message)  # noqa
 
-                        ozernik = self.cog.db.get_user(message.author.id, 'discord_id')
+                        ozernik = self.cog.db.get_user_by_discord_id(message.author.id)
                         self.cog.db.add_message_link(
                             user_id=ozernik.id,
                             link_chat_id=chat_link.id,
