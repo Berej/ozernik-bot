@@ -26,6 +26,56 @@ INTERACTION_TIMEOUT = 180
 ADMIN_ROLE_ID = 725675581881974794
 MOD_ROLE_ID = 779015800555176006
 
+# ==================== INITIALIZATION: Hardcoded Configuration ====================
+# Замени значения ниже на свои IDs/параметры
+# ИЗМЕНЯЙ ТОЛЬКО ЭТИ ЗНАЧЕНИЯ для настройки модуля
+
+# === ROLE IDs ===
+MUTE_ROLE_ID = 1168293205624766524
+FULL_MUTE_ROLE_ID = 1550578606521188502
+# ADMIN_ROLE_ID = 725675581881974794  # Already defined above
+# MOD_ROLE_ID = 779015800555176006  # Already defined above
+ADMIN_ROLE_IDS = []  # Additional admin role IDs
+MODERATOR_ROLE_IDS = []  # Additional moderator role IDs
+
+# === CHANNEL IDs ===
+LOG_CHANNEL_ID = 1545525361872208032 
+ADMIN_NOTIFY_CHANNEL_ID = 791758756392337409 
+EXPORT_CHANNEL_ID = 1545525361872208032 
+
+# === SYSTEM PARAMETERS ===
+SCALE_MAX = 50  # Maximum points
+SCALE_THRESHOLDS = {
+    "isolator": [31, 50],  # Green zone (points 31-50)
+    "restricted": [11, 30],  # Yellow zone (points 11-30)
+    "critical": [1, 10],  # Red zone (points 1-10)
+    "ban_trigger": 0  # Permanent mute threshold (points <= 0)
+}
+DURATION_MULTIPLIER = {
+    "isolator": 1,  # x1 duration multiplier
+    "restricted": 2,  # x2 duration multiplier
+    "critical": 3  # x3 duration multiplier
+}
+WEEKLY_POINT_GAIN = 1  # Points earned per week
+RESET_POINTS_ON_RETURN = 10  # Points reset on unban
+
+# === HELPER FUNCTION ===
+def get_multiplier_for_points(points: int) -> int:
+    """
+    Получить множитель длительности на основе текущих баллов.
+    OLD: Was using self.config.get_multiplier_for_points()
+    """
+    if points >= SCALE_THRESHOLDS["isolator"][0]:
+        return DURATION_MULTIPLIER["isolator"]
+    elif points >= SCALE_THRESHOLDS["restricted"][0]:
+        return DURATION_MULTIPLIER["restricted"]
+    elif points > SCALE_THRESHOLDS["ban_trigger"]:
+        return DURATION_MULTIPLIER["critical"]
+    else:
+        return DURATION_MULTIPLIER["critical"]
+
+# ==================== END INITIALIZATION ====================
+
 
 
 class CaseViewPagination(discord.ui.View):
@@ -192,8 +242,10 @@ class RsnCog(commands.Cog):
                     try:
                         member = guild.get_member(user_id)
                         if member:
-                            mute_role_id = self.config.get_mute_role_id()
-                            full_mute_role_id = self.config.get_full_mute_role_id()
+                            # OLD: mute_role_id = self.config.get_mute_role_id()
+                            # OLD: full_mute_role_id = self.config.get_full_mute_role_id()
+                            mute_role_id = MUTE_ROLE_ID
+                            full_mute_role_id = FULL_MUTE_ROLE_ID
                             
                             if mute_role_id:
                                 mute_role = guild.get_role(mute_role_id)
@@ -267,7 +319,8 @@ class RsnCog(commands.Cog):
         moderator_id: int
     ):
         """Логировать действие в log_channel_id."""
-        channel_id = self.config.get_log_channel_id()
+        # OLD: channel_id = self.config.get_log_channel_id()
+        channel_id = LOG_CHANNEL_ID
         if not channel_id:
             return
 
@@ -792,7 +845,8 @@ class RsnCog(commands.Cog):
             current_points = score['points']
 
             # Определить множитель по ТЕКУЩИМ баллам (перед списанием)
-            multiplier = self.config.get_multiplier_for_points(current_points)
+            # OLD: multiplier = self.config.get_multiplier_for_points(current_points)
+            multiplier = get_multiplier_for_points(current_points)
 
             # Итоговая длительность
             actual_duration = duration_hours * multiplier
@@ -817,7 +871,8 @@ class RsnCog(commands.Cog):
             )
 
             # Выдать роль мута
-            mute_role_id = self.config.get_mute_role_id()
+            # OLD: mute_role_id = self.config.get_mute_role_id()
+            mute_role_id = MUTE_ROLE_ID
             print(f"[RSN] Assigning mute role - User ID: {user.id}, Role ID: {mute_role_id}, Member: {member}")
             if mute_role_id:
                 mute_role = interaction.guild.get_role(mute_role_id)
@@ -835,7 +890,8 @@ class RsnCog(commands.Cog):
 
             # Если множитель > 1, выдать дополнительный полный мут
             if multiplier > 1:
-                full_mute_role_id = self.config.get_full_mute_role_id()
+                # OLD: full_mute_role_id = self.config.get_full_mute_role_id()
+                full_mute_role_id = FULL_MUTE_ROLE_ID
                 print(f"[RSN] Multiplier > 1, assigning full mute - User ID: {user.id}, Role ID: {full_mute_role_id}")
                 if full_mute_role_id:
                     full_mute_role = interaction.guild.get_role(full_mute_role_id)
@@ -852,9 +908,11 @@ class RsnCog(commands.Cog):
                     print(f"[RSN] ✗ Full mute role ID not configured in config")
 
             # Если баллы <= ban_trigger (0), выдать перманентный полный мут
-            ban_trigger = self.config.get_scale_thresholds().get("ban_trigger", 0)
+            # OLD: ban_trigger = self.config.get_scale_thresholds().get("ban_trigger", 0)
+            ban_trigger = SCALE_THRESHOLDS.get("ban_trigger", 0)
             if new_points <= ban_trigger:
-                full_mute_role_id = self.config.get_full_mute_role_id()
+                # OLD: full_mute_role_id = self.config.get_full_mute_role_id()
+                full_mute_role_id = FULL_MUTE_ROLE_ID
                 print(f"[RSN] Points <= ban_trigger ({new_points} <= {ban_trigger}), assigning permanent full mute - User ID: {user.id}, Role ID: {full_mute_role_id}")
                 if full_mute_role_id:
                     full_mute_role = interaction.guild.get_role(full_mute_role_id)
@@ -881,7 +939,8 @@ class RsnCog(commands.Cog):
                 )
 
                 # Отправить уведомление в admin_notify_channel_id
-                notify_channel_id = self.config.get_admin_notify_channel_id()
+                # OLD: notify_channel_id = self.config.get_admin_notify_channel_id()
+                notify_channel_id = ADMIN_NOTIFY_CHANNEL_ID
                 if notify_channel_id:
                     notify_channel = self.bot.get_channel(notify_channel_id)
                     if notify_channel:
@@ -974,8 +1033,10 @@ class RsnCog(commands.Cog):
                 return
 
             # Снять роли
-            mute_role_id = self.config.get_mute_role_id()
-            full_mute_role_id = self.config.get_full_mute_role_id()
+            # OLD: mute_role_id = self.config.get_mute_role_id()
+            # OLD: full_mute_role_id = self.config.get_full_mute_role_id()
+            mute_role_id = MUTE_ROLE_ID
+            full_mute_role_id = FULL_MUTE_ROLE_ID
 
             print(f"[RSN] Removing mute roles - User ID: {user.id}, Mute Role ID: {mute_role_id}, Full Mute Role ID: {full_mute_role_id}")
             if mute_role_id:
@@ -1274,8 +1335,10 @@ class RsnCog(commands.Cog):
             
             # Выполнить начисление баллов
             active_users = self.db.get_all_active_users()
-            scale_max = self.config.get_scale_max()
-            weekly_gain = self.config.get_weekly_point_gain()
+            # OLD: scale_max = self.config.get_scale_max()
+            # OLD: weekly_gain = self.config.get_weekly_point_gain()
+            scale_max = SCALE_MAX
+            weekly_gain = WEEKLY_POINT_GAIN
 
             guild = self.bot.get_guild(GUILD_ID)
             if not guild:
@@ -1347,8 +1410,10 @@ class RsnCog(commands.Cog):
                 if kind == 'mute':
                     # === СНЯТИЕ МУТА ===
                     if member:
-                        mute_role_id = self.config.get_mute_role_id()
-                        full_mute_role_id = self.config.get_full_mute_role_id()
+                        # OLD: mute_role_id = self.config.get_mute_role_id()
+                        # OLD: full_mute_role_id = self.config.get_full_mute_role_id()
+                        mute_role_id = MUTE_ROLE_ID
+                        full_mute_role_id = FULL_MUTE_ROLE_ID
                         print(f"[RSN] Removing mute roles from user {user_id} - Mute Role ID: {mute_role_id}, Full Mute Role ID: {full_mute_role_id}")
 
                         if mute_role_id:
@@ -1410,7 +1475,8 @@ class RsnCog(commands.Cog):
 
                     # Сбросить баллы на 10 (только для бана)
                     try:
-                        reset_points = self.config.get_reset_points_on_return()
+                        # OLD: reset_points = self.config.get_reset_points_on_return()
+                        reset_points = RESET_POINTS_ON_RETURN
                         self.db.set_points(user_id, reset_points)
                         print(f"[RSN] Reset points for user {user_id} to {reset_points}")
                     except Exception as points_error:
