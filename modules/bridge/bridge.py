@@ -1557,7 +1557,7 @@ class Telegram:
                     )
                     self.add_entities(tg_message) # noqa
 
-                    ozernik = self.cog.db.get_user(message.author.id, 'discord_id')
+                    ozernik = self.cog.db.get_user_by_discord_id(message.author.id)
                     self.cog.db.add_message_link(
                         user_id=ozernik.id,
                         link_chat_id=chat_link.id,
@@ -1580,7 +1580,7 @@ class Telegram:
                     for tg_message in tg_messages:
                         self.add_entities(tg_message)  # noqa
 
-                        ozernik = self.cog.db.get_user(message.author.id, 'discord_id')
+                        ozernik = self.cog.db.get_user_by_discord_id(message.author.id)
                         self.cog.db.add_message_link(
                             user_id=ozernik.id,
                             link_chat_id=chat_link.id,
