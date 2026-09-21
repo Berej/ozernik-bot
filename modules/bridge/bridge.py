@@ -1671,5 +1671,5 @@ class Telegram:
                 return
 
 async def setup(bot):
-    # await bot.add_cog(Bridge(bot))
+    await bot.add_cog(Bridge(bot))
     pass
