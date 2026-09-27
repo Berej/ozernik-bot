@@ -924,13 +924,15 @@ def create_rank_card(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
     )
 
     if not user_cube:
-        count_available_cubes = 0
+        count_available_cubes = user_cubes[0]["count"]
         required_cubes = 1
     else:
-        count_available_cubes = user_cubes[user_cube['place'] - 1]['count']
-        required_cubes = data.required_cubes
         if user_cube["place"] == len(user_cubes):
+            count_available_cubes = 0
             required_cubes = 0
+        else:
+            count_available_cubes = user_cubes[user_cube["place"]]["count"]
+            required_cubes = data.required_cubes
 
     cube_counter_box = draw_counter(
         cube_counter_xy,
