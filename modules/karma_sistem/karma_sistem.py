@@ -3164,7 +3164,7 @@ class KarmaSistem(commands.Cog):
 
         await self.give_level_up_message(member, old_karma.karma, new_karma.karma)
 
-    @tasks.loop(seconds=5)
+    @tasks.loop(minutes=1)
     async def voice_karma_check(self):
         try:
             if not self.bot.ready:
