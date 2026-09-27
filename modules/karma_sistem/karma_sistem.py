@@ -2299,22 +2299,24 @@ class SettingsSansaraPage(Page):
         )
 
     async def _restore_roles(self, interaction: Interaction):
-        try:
-            if self.restore_task is not None and not self.restore_task.done():
-                await interaction.followup.send(
-                    'Задача уже выполняется',
-                    ephemeral=True
-                )
-                return
+        if self.restore_task is not None and not self.restore_task.done():
+            await interaction.followup.send(
+                'Задача уже выполняется',
+                ephemeral=True,
+            )
+            return
 
-            guild = self.bot.guild
-            sansara_roles = await self.roles.get_sansara_roles(recreate=True)
-            sansara_role_ids = {role.id for role in sansara_roles}
+        guild = self.bot.guild
+        sansara_roles = await self.roles.get_sansara_roles(recreate=True)
+        sansara_role_ids = {role.id for role in sansara_roles}
 
-            async def restore_roles():
-                message: discord.WebhookMessage = await interaction.followup.send(
+        async def restore_roles():
+            message = None
+
+            try:
+                message = await interaction.followup.send(
                     f'Обновление ролей участников: 0/{len(guild.members)}',
-                    ephemeral=True
+                    ephemeral=True,
                 )
 
                 n = 0
@@ -2324,7 +2326,10 @@ class SettingsSansaraPage(Page):
 
                     if n % 27 == 0:
                         await message.edit(
-                            content=f'Обновление ролей участников: {n}/{len(guild.members)}'
+                            content=(
+                                f'Обновление ролей участников: '
+                                f'{n}/{len(guild.members)}'
+                            )
                         )
 
                     ozernik = self.bot.db_ensure_user(member)
@@ -2343,8 +2348,8 @@ class SettingsSansaraPage(Page):
                     ]
 
                     if (
-                        len(current_sansara_roles) == 1
-                        and current_sansara_roles[0].id == target_role.id
+                            len(current_sansara_roles) == 1
+                            and current_sansara_roles[0].id == target_role.id
                     ):
                         continue
 
@@ -2355,29 +2360,88 @@ class SettingsSansaraPage(Page):
                     ]
 
                     if roles_to_remove:
-                        await member.remove_roles(
-                            *roles_to_remove,
+                        await self._edit_member_roles(
+                            member,
+                            remove=roles_to_remove,
                             reason="Восстановление ролей Сансары",
                         )
 
                     if target_role not in member.roles:
-                        await member.add_roles(
-                            target_role,
+                        await self._edit_member_roles(
+                            member,
+                            add=[target_role],
                             reason="Восстановление ролей Сансары",
                         )
 
-
                 await message.delete()
+
                 await interaction.followup.send(
-                    f'Обновление ролей участников завершено.',
-                    ephemeral=True
+                    'Обновление ролей участников завершено.',
+                    ephemeral=True,
                 )
 
-            SettingsSansaraPage.restore_task = asyncio.create_task(restore_roles())
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(tb)
-            print(e)
+            except asyncio.CancelledError:
+                raise
+
+            except Exception:
+                print(traceback.format_exc())
+
+                if message is not None:
+                    try:
+                        await message.edit(
+                            content='При восстановлении ролей произошла ошибка.'
+                        )
+                    except Exception:
+                        pass
+
+                try:
+                    await interaction.followup.send(
+                        'При восстановлении ролей произошла ошибка.',
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+
+        SettingsSansaraPage.restore_task = asyncio.create_task(restore_roles())
+
+    async def _edit_member_roles(
+            self,
+            member: discord.Member,
+            *,
+            add: list[discord.Role] | None = None,
+            remove: list[discord.Role] | None = None,
+            reason: str | None = None,
+    ):
+        add = add or []
+        remove = remove or []
+
+        for attempt in range(3):
+            try:
+                if remove:
+                    await member.remove_roles(
+                        *remove,
+                        reason=reason,
+                    )
+
+                if add:
+                    await member.add_roles(
+                        *add,
+                        reason=reason,
+                    )
+
+                return
+
+            except discord.DiscordServerError as e:
+                if attempt == 2:
+                    raise
+
+                print(
+                    f'Ошибка Discord API при изменении ролей '
+                    f'{member} ({member.id}): {e}. '
+                    f'Повтор через {2 ** attempt} сек.'
+                )
+
+                await asyncio.sleep(2 ** attempt)
 
     class DelayModal(discord.ui.Modal):
         def __init__(self, navigator: Navigator):
