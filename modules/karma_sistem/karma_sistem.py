@@ -3142,15 +3142,6 @@ class KarmaSistem(commands.Cog):
 
         ozernik = self.bot.db_ensure_user(member)
 
-        if message.content.startswith('qwe') and message.author.id == 512079329619083291:
-            await self.give_bind_up_message(
-                member_1=member,
-                member_2=self.bot.guild.get_member(822511700921942016),
-                old_karma=359,
-                new_karma=360,
-            )
-            return
-
         if message.content.startswith(',r'):
             avatar = await get_discord_avatar(member)
 
@@ -3269,12 +3260,12 @@ class KarmaSistem(commands.Cog):
     @app_commands.command(name='settings_karma', description='Настройка системы Кармы.')
     @app_commands.guilds(config.GUILD_ID)
     async def settings_karma(self, interaction: Interaction):
-        # if not interaction.user.guild_permissions.administrator:
-        #     await interaction.response.send_message(
-        #         "Только для Администраторов.",
-        #         ephemeral=True
-        #     )
-        #     return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "Только для Администраторов.",
+                ephemeral=True
+            )
+            return
 
         navigator = Navigator(SettingsMainPage, author=interaction.user, bot=self.bot)
 
@@ -3378,13 +3369,6 @@ class KarmaSistem(commands.Cog):
         await interaction.response.send_message(
             embed=embed
         )
-
-    @app_commands.command(name='tessst', description='Тест.')
-    @app_commands.guilds(config.GUILD_ID)
-    async def tessst(self, interaction: Interaction):
-        await interaction.response.defer(thinking=False)
-        await self.weekly_countdown()
-
 
 async def setup(bot):
     await bot.add_cog(KarmaSistem(bot))
