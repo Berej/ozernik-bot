@@ -46,15 +46,18 @@ class Panel(commands.Cog):
 
             match mode:
                 case 'unload':
+                    print(f"Выгружается модуль: {module_name}")
                     await self.bot.unload_extension(module)
                     config.module_off(module)
                     await interaction.followup.send(f"Выгружен модуль: {module_name}")
                     print(f"Выгружен модуль: {module_name}")
                 case 'load':
+                    print(f"Загружается модуль: {module_name}")
                     await self.bot.load_extension(module)
                     await interaction.followup.send(f"Загружен модуль: {module_name}")
                     print(f"Загружен модуль: {module_name}")
                 case _:
+                    print(f"Перезагружается модуль: {module_name}")
                     await self.bot.reload_extension(module)
                     await interaction.followup.send(f"Перезагружен модуль: {module_name}")
                     print(f"Перезагружен модуль: {module_name}")

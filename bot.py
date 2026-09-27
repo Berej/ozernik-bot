@@ -1,13 +1,17 @@
 # main.py
 
 import asyncio
+import sys
 import os
 import traceback
 from datetime import timedelta, timezone
+from typing import Any
 
 import discord
 from colorama import Fore, Style, init
 from discord.ext import commands
+from discord.ext.commands import Context, errors
+from discord.ext.commands._types import BotT
 
 from config import config, DISCORD_TOKEN_MAIN
 
@@ -23,6 +27,9 @@ MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
 class OzernikiBot(commands.Bot):
+
+    # ---------- ИНИЦИАЛИЗАЦИЯ -----------
+
     def __init__(self) -> None:
         self.ready = False
         intents = discord.Intents.default()
@@ -38,6 +45,33 @@ class OzernikiBot(commands.Bot):
         self.modules_folder = MODULES_FOLDER
 
         self.db = Database()
+
+    async def setup_hook(self) -> None:
+        """
+        Выполняется один раз при запуске бота,
+        до события on_ready.
+        """
+        self.discover_modules()
+        await self.load_configured_extensions()
+
+        guild = discord.Object(id=GUILD_ID)
+
+        # Копирует глобально объявленные команды
+        # в конкретный сервер для быстрой синхронизации.
+        self.tree.copy_global_to(guild=guild)
+
+        await self.tree.sync(guild=guild)
+
+        print(f"Slash-команды синхронизированы для сервера {GUILD_ID}.")
+
+    async def close(self) -> None:
+        """
+        Закрывает ресурсы перед остановкой бота.
+        """
+        # Например:
+        # self.database.close_()
+
+        await super().close()
 
     def discover_modules(self) -> None:
         """
@@ -105,32 +139,26 @@ class OzernikiBot(commands.Bot):
                     + Style.RESET_ALL
                 )
 
-    async def setup_hook(self) -> None:
-        """
-        Выполняется один раз при запуске бота,
-        до события on_ready.
-        """
-        self.discover_modules()
-        await self.load_configured_extensions()
+    # ---------- ЛОГИРОВАНИЕ -----------
 
-        guild = discord.Object(id=GUILD_ID)
+    @staticmethod
+    def print_error(source, error):
+        tb = ''.join(
+            traceback.format_exception(
+                type(error),
+                error,
+                error.__traceback__
+            )
+        )
 
-        # Копирует глобально объявленные команды
-        # в конкретный сервер для быстрой синхронизации.
-        self.tree.copy_global_to(guild=guild)
+        print(f"Error in {source}:\n{tb}")
 
-        await self.tree.sync(guild=guild)
+    async def on_error(self, event, *args, **kwargs) -> None:
+        error = sys.exc_info()[1]
 
-        print(f"Slash-команды синхронизированы для сервера {GUILD_ID}.")
+        self.print_error(event, error)
 
-    async def close(self) -> None:
-        """
-        Закрывает ресурсы перед остановкой бота.
-        """
-        # Например:
-        # self.database.close_()
-
-        await super().close()
+    # --------- ВСПОМОГАТЕЛЬНО ----------
 
     def db_ensure_user(self, user: discord.User) -> DataTypes.Ozernik | None:
         ozernik = self.db.get_user_by_discord_id(user.id)
@@ -147,8 +175,8 @@ class OzernikiBot(commands.Bot):
     def guild(self):
         return self.get_guild(GUILD_ID)
 
-bot = OzernikiBot()
 
+bot = OzernikiBot()
 
 @bot.event
 async def on_ready() -> None:
