@@ -1487,26 +1487,26 @@ class KarmaDatabase(Database):
         return [dict(row) for row in rows]
 
 class BridgeDatabase(Database):
-    def add_chat_link(self, discord_chanel_id: int, telegram_chat_id: int, telegram_topic_id: int = -1) -> DataTypes.ChatLink:
+    def add_chat_link(self, discord_channel_id: int, telegram_chat_id: int, telegram_topic_id: int = -1) -> DataTypes.ChatLink:
         with self.transaction():
             cur = self.execute("""
                 INSERT INTO chat_links (
-                    discord_chanel_id,
+                    discord_channel_id,
                     telegram_chat_id,
                     telegram_topic_id
                 )
                 VALUES (?, ?, ?)
                 RETURNING *
-            """, (discord_chanel_id, telegram_chat_id, telegram_topic_id))
+            """, (discord_channel_id, telegram_chat_id, telegram_topic_id))
             return DataTypes.ChatLink(cur.fetchone())
 
-    def update_chat_link(self, link_id: int, discord_chanel_id: int | None = None, telegram_chat_id: int | None = None, telegram_topic_id: int | None = None) -> DataTypes.ChatLink | None:
+    def update_chat_link(self, link_id: int, discord_channel_id: int | None = None, telegram_chat_id: int | None = None, telegram_topic_id: int | None = None) -> DataTypes.ChatLink | None:
         fields = []
         values = []
 
-        if discord_chanel_id is not None:
-            fields.append("discord_chanel_id = ?")
-            values.append(discord_chanel_id)
+        if discord_channel_id is not None:
+            fields.append("discord_channel_id = ?")
+            values.append(discord_channel_id)
 
         if telegram_chat_id is not None:
             fields.append("telegram_chat_id = ?")
@@ -1541,7 +1541,7 @@ class BridgeDatabase(Database):
                 """, (chat_id,))
             case 'discord':
                 cur = self.execute("""
-                    SELECT * FROM chat_links WHERE discord_chanel_id = ?
+                    SELECT * FROM chat_links WHERE discord_channel_id = ?
                 """, (chat_id,))
             case 'telegram':
                 cur = self.execute("""
@@ -1699,6 +1699,7 @@ class Assets:
         return files
 
 assets = Assets(Path(__file__).parent / 'assets')
+
 
 """ 
 Работа с discord.LayoutView. Позволяет сверстать много-вложенные сообщения без репетативной работы. 
