@@ -2167,9 +2167,13 @@ class SettingsLevelUpPage(Page):
     def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
         super().__init__(navigator, author)
         self.bot = bot
-
-        levels = list(levels_data.items())
         self.buttons = []
+
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.buttons = []
+        levels = list(levels_data.items())
 
         for i in range(0, len(levels), 20):
             group = tuple(levels[i:i + 20])
@@ -2180,11 +2184,11 @@ class SettingsLevelUpPage(Page):
             )
 
             async def callback(
-                interaction: discord.Interaction,
-                _group=group,
+                    interaction: discord.Interaction,
+                    _group=group,
             ):
                 try:
-                    await interaction.response.send_modal(self.LevelUpTextModal(_group))
+                    await interaction.response.send_modal(self.LevelUpTextModal(_group, self))
                 except Exception:
                     traceback.print_exc()
 
@@ -2193,8 +2197,9 @@ class SettingsLevelUpPage(Page):
             self.buttons.append(button)
 
     class LevelUpTextModal(discord.ui.Modal):
-        def __init__(self, levels_tuple: tuple):
+        def __init__(self, levels_tuple: tuple, page):
             super().__init__(title="Текст повышения")
+            self.page = page
 
             str_levels = collapse_dict(dict(levels_tuple))
 
@@ -2216,8 +2221,10 @@ class SettingsLevelUpPage(Page):
 
                 levels_data.update(new_levels_data)
 
-                await interaction.followup.send('Изменено.', ephemeral=True)
+                self.page.update_buttons()
+                await self.page.navigator.render()
 
+                await interaction.followup.send('Изменено.', ephemeral=True)
             except SyntaxError as error:
                 message = str(error)
 
