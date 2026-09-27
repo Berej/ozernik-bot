@@ -1,15 +1,20 @@
-import asyncio
+import asyncio # noqa
 import inspect
 import random
-import traceback
+import traceback # noqa
 import typing # noqa
+import ast
+import math
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from copy import deepcopy
 from io import BytesIO
 from itertools import combinations
 from pathlib import Path # noqa
 from typing import Any # noqa
+from pprint import pformat # noqa
 
-import discord
+import discord # noqa
 from discord import Interaction, app_commands, Role
 from discord.ext import commands, tasks
 from PIL import Image, ImageDraw, ImageFont, ImageOps # noqa
@@ -19,9 +24,12 @@ from discord.ui import Item, Button, View, LayoutView # noqa
 from bot import OzernikiBot
 from config import config
 from utilities import *
+from utilities import NewDataWorker
 
-PROJECT_DIR = Path(__file__).resolve().parents[2]
+PROJECT_DIR = Path(__file__).resolve().parents[0]
 TEMP_DIR = PROJECT_DIR / "temp"
+DATA_DIR = PROJECT_DIR / "data.json"
+LEVELS_DATA_DIR = PROJECT_DIR / "levels.json"
 
 data_setup = {
     'log_channel_id': 0,
@@ -29,6 +37,8 @@ data_setup = {
     'karma_voice_delay': 1,
     'karma_channel_id': 0,
     'blocked_channels_id': [],
+    'blocked_users_id': [],
+    'blocked_roles_id': [],
     'required_cubes': 10,
     'karma_roles': {
         'naraka': {
@@ -109,9 +119,11 @@ data_setup = {
         },
     }
 }
-
-data = DataWorker('modules/karma_sistem/data.json', setup=data_setup)
+data = DataWorker(DATA_DIR, setup=data_setup)
 db = KarmaDatabase()
+
+levels_setup = {str(i): '' for i in range(1, 101)}
+levels_data = NewDataWorker(LEVELS_DATA_DIR, setup=levels_setup)
 
 # Вспомогательные функции
 def get_status(karma: DataTypes.Karma) -> dict:
@@ -130,8 +142,11 @@ def get_status(karma: DataTypes.Karma) -> dict:
         key=lambda stage: stage["required_karma"],
     )
 
-def get_level(karma: int) -> int:
-    if karma < 0:
+def get_level(karma: int) -> int | None:
+    if karma is None:
+        return None
+
+    if karma <= 0:
         return 0
 
     level = 0
@@ -184,13 +199,12 @@ def get_cubes(ozernik_id: int) -> tuple[dict, dict, dict, dict]:
 
     for ozernik, _bind in binds:
         bind_cube = get_cube(_bind.bind_karma)
-        cube = next(
-            cube for cube in cubes_count.values()
-            if cube["name"] == bind_cube["name"]
-        )
-        cube['count'] = cube['count'] + 1
 
-    return tuple(cube for cube in cubes_count.values())
+        for cube in cubes_count.values():
+            if cube["place"] <= bind_cube["place"]:
+                cube["count"] += 1
+
+    return tuple(cubes_count.values())
 
 def get_cube_status(ozernik_id: int) -> dict | None:
     binds = db.get_user_top_karmic_binds(ozernik_id)
@@ -208,7 +222,9 @@ def get_cube_status(ozernik_id: int) -> dict | None:
     available_cubes = [
         cube
         for cube in data.cube_roles.values()
-        if cubes_count.get(cube["name"], 0) >= data.required_cubes
+        if cubes_count.get(cube["name"], 0) >= (
+            1 if cube["place"] == 1 else data.required_cubes
+        )
     ]
 
     if not available_cubes:
@@ -325,7 +341,7 @@ def get_next_cube(ozernik_id: int) -> dict | None:
     now_cube = get_cube_status(ozernik_id)
 
     if not now_cube:
-        return cubes[0]
+        return data.cube_roles['black_cube']
 
     return next(
         (
@@ -392,7 +408,7 @@ def rounded_gradient(image: Image.Image, box: tuple[int, int, int, int], radius:
         mask,
     )
 
-def format_duration(minutes: int) -> str:
+def format_duration_minutes(minutes: int, backtick: bool = False) -> str:
     days, remainder = divmod(minutes, 24 * 60)
     hours, minutes = divmod(remainder, 60)
 
@@ -412,19 +428,62 @@ def format_duration(minutes: int) -> str:
         return forms[2]
 
     parts = []
+    bt = ''
+    if backtick:
+        bt = '`'
 
     if days:
-        parts.append(f"{days} {plural(days, ('день', 'дня', 'дней'))}")
+        parts.append(f"{bt}{days}{bt} {plural(days, ('день', 'дня', 'дней'))}")
 
     if hours:
-        parts.append(f"{hours} {plural(hours, ('час', 'часа', 'часов'))}")
+        parts.append(f"{bt}{hours}{bt} {plural(hours, ('час', 'часа', 'часов'))}")
 
     if minutes:
-        parts.append(f"{minutes} {plural(minutes, ('минута', 'минуты', 'минут'))}")
+        parts.append(f"{bt}{minutes}{bt} {plural(minutes, ('минута', 'минуты', 'минут'))}")
 
     return ", ".join(parts)
 
-async def get_full_binds(member: discord.Member, amount: int = 10) -> list[dict[str, Image.Image | str | DataTypes.KarmicBind]]:
+def format_duration_seconds(seconds: int, backtick: bool = False) -> str:
+    days, remainder = divmod(seconds, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+
+    def plural(number: int, forms: tuple[str, str, str]) -> str:
+        n = number % 100
+
+        if 11 <= n <= 14:
+            return forms[2]
+
+        n %= 10
+
+        if n == 1:
+            return forms[0]
+        if 2 <= n <= 4:
+            return forms[1]
+
+        return forms[2]
+
+    parts = []
+
+    bt = ''
+    if backtick:
+        bt = '`'
+
+    if days:
+        parts.append(f"{bt}{days}{bt} {plural(days, ('день', 'дня', 'дней'))}")
+
+    if hours:
+        parts.append(f"{bt}{hours}{bt} {plural(hours, ('час', 'часа', 'часов'))}")
+
+    if minutes:
+        parts.append(f"{bt}{minutes}{bt} {plural(minutes, ('минута', 'минуты', 'минут'))}")
+
+    if seconds:
+        parts.append(f"{bt}{seconds}{bt} {plural(seconds, ('секунда', 'секунды', 'секунд'))}")
+
+    return ", ".join(parts)
+
+async def get_full_binds(member: discord.Member, bot, amount: int = 10) -> list[dict[str, Image.Image | str | DataTypes.KarmicBind]]:
     guild = member.guild
     ozernik = db.get_user_by_discord_id(member.id)
     binds = db.get_user_top_karmic_binds(ozernik.id)
@@ -436,8 +495,10 @@ async def get_full_binds(member: discord.Member, amount: int = 10) -> list[dict[
         n += 1
 
         _member = guild.get_member(_ozernik.discord_id)
+
         if _member is None:
-            continue
+            _member = await bot.fetch_user(_ozernik.discord_id)
+
         full_binds.append({
             'name': _member.display_name,
             'bind': bind,
@@ -448,6 +509,45 @@ async def get_full_binds(member: discord.Member, amount: int = 10) -> list[dict[
             break
 
     return full_binds
+
+def collapse_dict(_data: dict) -> str:
+    return ",\n".join(
+        f"{key!r}: {collapse_value(value)}"
+        for key, value in _data.items()
+    )
+
+def collapse_value(value) -> str:
+    if isinstance(value, dict):
+        return "{\n" + collapse_dict(value) + "\n}"
+
+    return repr(value)
+
+def expand_dict(text: str) -> dict:
+    return ast.literal_eval("{" + text + "}")
+
+def get_role_id_by_level(level: int) -> str:
+    karma = get_karma(level)
+
+    status = max(
+        (
+            stage
+            for stage in data.karma_roles.values()
+            if (
+                stage["required_karma"] is not None
+                and karma >= stage["required_karma"]
+        )
+        ),
+        key=lambda stage: stage["required_karma"],
+    )
+    return status['role_id']
+
+def get_level_up_text(level: int) -> str:
+    text: str = levels_data[f'{level}']
+    role_id = get_role_id_by_level(level)
+
+    text = text.replace('{role}', f'<@&{role_id}>')
+
+    return text
 
 # Функции PIL
 def create_rank_card(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, username: str):
@@ -824,21 +924,19 @@ def create_rank_card(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
     )
 
     if not user_cube:
-        count_available_cubes = sum(cube["count"] for cube in user_cubes)
-        user_cube_name = 'Drink!'
+        count_available_cubes = 0
+        required_cubes = 1
     else:
-        indent = user_cube['place']
-        if user_cube['place'] == len(user_cubes):
-            indent -= 1
-
-        count_available_cubes = sum(cube["count"] for cube in user_cubes[indent:])
-        user_cube_name = user_cube['name']
+        count_available_cubes = user_cubes[user_cube['place'] - 1]['count']
+        required_cubes = data.required_cubes
+        if user_cube["place"] == len(user_cubes):
+            required_cubes = 0
 
     cube_counter_box = draw_counter(
         cube_counter_xy,
         nums=(
             count_available_cubes,
-            data.required_cubes if user_cube_name != 'Золотой Куб' else 0,
+            required_cubes,
         ),
         fill=next_cube['color'],
         main_font=num_font,
@@ -862,7 +960,7 @@ def create_rank_card(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
         cube_counter_xy,
         nums=(
             count_available_cubes,
-            data.required_cubes if user_cube_name != 'Золотой Куб' else 0,
+            required_cubes,
         ),
         fill=next_cube['color'],
         main_font=num_font,
@@ -1040,7 +1138,7 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
     size = (1200, 800)
     size_factor = min(size) / 600
 
-    main_objects_size = size[1] // 6
+    main_objects_size = size[1] // 5
     gap = size[1] // 150
 
     radius = 20 * size_factor
@@ -1059,7 +1157,7 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
     # Определение цветов
     main_color = "#2A2C30"
     sep_color = "#24272A"
-    sign_color = "#8B8B8B"
+    sign_color = "#BFBFBF"
     status_color = status["color"]
 
     # Создание изображения и базовых прямоугольников
@@ -1125,6 +1223,46 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
     bind_boxes = left_boxes + right_boxes
     for n, full_bind in enumerate(full_binds):
         full_bind['box'] = bind_boxes[n]
+
+    for bind_box in bind_boxes:
+        mask = Image.new("L", image.size, 0)
+        mask_draw = ImageDraw.Draw(mask)
+
+        mask_draw.rounded_rectangle(
+            bind_box,
+            radius=radius,
+            fill=255,
+        )
+
+        mask_draw.rectangle(
+            (bind_box[0], bind_box[1], bind_box[2], bind_box[3] - bind_box_height / 13),
+            fill=0,
+        )
+
+        image.paste(
+            sep_color,
+            (0, 0, image.width, image.height),
+            mask,
+        )  # Незаполненная часть полоски
+
+        avatar_center_xy = (
+            bind_box[0] + bind_box_height // 2,
+            bind_box[3] - bind_box_height // 2
+        )
+
+        no_avatar_font = ImageFont.truetype(
+            font=assets.fonts['Roboto-Bold'],
+            size=25 * size_factor
+        )
+
+        draw.text(
+            avatar_center_xy,
+            '—',
+            sign_color,
+            font=no_avatar_font,
+            align="center",
+            anchor="mm"
+        )
 
     # Вставка аватара
     avatar_size = main_objects_size
@@ -1194,35 +1332,131 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
         name_xy,
         name_text,
         font=name_font,
-        fill=status_color,
+        fill=status["color"],
         anchor='lt'
     )
 
+    # sign_font = ImageFont.truetype(
+    #     assets.fonts['Roboto-Bold'],
+    #     size=35 * size_factor,
+    # )
+
+    # sign_text = 'Связи:'
+    # sign_xy = (avatar_full_box[2], main_box[3] - main_box_gap)
+    # max_sign_length = (main_box[2] - avatar_full_box[2]) - name_xy[0]
+    #
+    # if draw.textlength(username, font=name_font) >= max_sign_length:
+    #     while username:
+    #         username = username.rstrip() + '...'
+    #
+    #         if draw.textlength(username, font=name_font) <= max_sign_length:
+    #             break
+    #
+    #         username = username[:-4]
+    #
+    # draw.text(
+    #     sign_xy,
+    #     sign_text,
+    #     font=sign_font,
+    #     fill='#9F9F9F',
+    #     anchor='lb',
+    #     spacing=10
+    # )
+
+    # Вставка рангов
     sign_font = ImageFont.truetype(
+        assets.fonts['Roboto'],
+        size=20 * size_factor,
+    )
+    num_font = ImageFont.truetype(
         assets.fonts['Roboto-Bold'],
-        size=35 * size_factor,
+        size=30 * size_factor,
     )
 
-    sign_text = "Кармические связи"
-    sign_xy = (avatar_full_box[2], main_box[3] - main_box_gap)
-    max_sign_length = (main_box[2] - avatar_full_box[2]) - name_xy[0]
+    avatar_right_end = avatar_full_box[2]
+    cube_left_end = main_box[2] - cube_size - cube_gap * 2
 
-    if draw.textlength(username, font=name_font) >= max_sign_length:
-        while username:
-            username = username.rstrip() + '...'
+    column_width = (cube_left_end - avatar_right_end) / 3
 
-            if draw.textlength(username, font=name_font) <= max_sign_length:
-                break
+    ranks_x1 = avatar_right_end + column_width * 0.3
+    ranks_x2 = avatar_right_end + column_width * 1.1
+    ranks_x3 = avatar_right_end + column_width * 1.9
+    ranks_x4 = avatar_right_end + column_width * 2.7
 
-            username = username[:-4]
+    ranks_y = main_box[3] / 10 * 6
+    ranks_y2 = main_box[3] - (main_box[3] - ranks_y) / 2
+
+    gold_text =  f'{user_cubes[3]['count']}' if user_cubes[3]['count'] >= 10 else f'{user_cubes[3]['count']}/10'
+    blue_text =  f'{user_cubes[2]['count']}' if user_cubes[2]['count'] >= 10 else f'{user_cubes[2]['count']}/10'
+    white_text = f'{user_cubes[1]['count']}' if user_cubes[1]['count'] >= 10 else f'{user_cubes[1]['count']}/10'
+    black_text = f'{user_cubes[0]['count']}' if user_cubes[0]['count'] >= 1 else f'{user_cubes[0]['count']}/1'
 
     draw.text(
-        sign_xy,
-        sign_text,
+        (ranks_x1, ranks_y),
+        'ЗОЛОТЫЕ',
+        align="center",
         font=sign_font,
-        fill='#9F9F9F',
-        anchor='lb',
-        spacing=10
+        fill=sign_color,
+        anchor="mm",
+    )
+
+    draw.text(
+        (ranks_x1, ranks_y2),
+        gold_text,
+        font=num_font,
+        fill='#BFBFBF',
+        anchor="mm",
+    )
+
+    draw.text(
+        (ranks_x2, ranks_y),
+        'СИНИЕ+',
+        align="center",
+        font=sign_font,
+        fill=sign_color,
+        anchor="mm",
+    )
+
+    draw.text(
+        (ranks_x2, ranks_y2),
+        blue_text,
+        font=num_font,
+        fill='#BFBFBF',
+        anchor="mm",
+    )
+
+    draw.text(
+        (ranks_x3, ranks_y),
+        'БЕЛЫЕ+',
+        align="center",
+        font=sign_font,
+        fill=sign_color,
+        anchor="mm",
+    )
+
+    draw.text(
+        (ranks_x3, ranks_y2),
+        white_text,
+        font=num_font,
+        fill='#BFBFBF',
+        anchor="mm",
+    )
+
+    draw.text(
+        (ranks_x4, ranks_y),
+        'ЧЕРНЫЕ+',
+        align="center",
+        font=sign_font,
+        fill=sign_color,
+        anchor="mm",
+    )
+
+    draw.text(
+        (ranks_x4, ranks_y2),
+        black_text,
+        font=num_font,
+        fill='#BFBFBF',
+        anchor="mm",
     )
 
     # Вставка связей
@@ -1339,7 +1573,7 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
         bind_counter_xy = (full_bind['box'][0] + bind_box_height, full_bind['box'][3] - bind_box_height / 6)
         draw.text(
             bind_counter_xy,
-            format_duration(full_bind['bind'].bind_karma),
+            format_duration_minutes(full_bind['bind'].bind_karma),
             font=bind_counter_font,
             fill=bind_color,
             anchor='ld'
@@ -1349,13 +1583,11 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
             bind_ambition_xy = (full_bind['box'][2] - bind_box_height / 4, bind_counter_xy[1])
             draw.text(
                 bind_ambition_xy,
-                format_duration(next_cube['required_karma']),
+                format_duration_minutes(next_cube['required_karma']),
                 font=bind_counter_font,
                 fill=sign_color,
                 anchor='rd'
             )
-
-            print(bind_ambition_xy, bind_counter_xy)
 
     # Сохранение изображения
     buffer = BytesIO()
@@ -1363,25 +1595,29 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
     buffer.seek(0)
     return buffer
 
+# ---------------------------------------------------------
+# |||||||||||||||| Класс работы с ролями ||||||||||||||||||
+# ---------------------------------------------------------
+
 class Roles:
     def __init__(self, bot: OzernikiBot):
         self._bot = bot
 
-        self._sansara_roles: dict[str, Role | None] = {
-            'naraka': None,
-            'preta': None,
-            'animal': None,
-            'human': None,
-            'asur': None,
-            'deva': None,
-        }
+        self._sansara_roles = [
+            "naraka",
+            "preta",
+            "animal",
+            "human",
+            "asur",
+            "deva",
+        ]
 
-        self._cubes_roles: dict[str, Role | None] = {
-            'black_cube': None,
-            'white_cube': None,
-            'blue_cube': None,
-            'gold_cube': None,
-        }
+        self._cubes_roles = [
+            "black_cube",
+            "white_cube",
+            "blue_cube",
+            "gold_cube",
+        ]
 
     async def get_sansara_role(
         self,
@@ -1393,19 +1629,23 @@ class Roles:
             'asur',
             'deva',
         ],
+        recreate: bool = True,
     ) -> Role | None:
         guild: discord.Guild = self._bot.guild
 
         if not guild:
             return None
 
-        role = self._sansara_roles[role_name]
         karma_roles = data.karma_roles
-
+        role = guild.get_role(karma_roles[role_name]['role_id'])
         if role is None:
-            role = guild.get_role(karma_roles[role_name]['role_id'])
+            try:
+                role = await guild.fetch_role(karma_roles[role_name]['role_id'])
+            except discord.HTTPException:
+                pass
 
-            if role is None:
+        if role is None and recreate:
+            try:
                 role = await guild.create_role(
                     reason="Восстановление роли.",
                     name=karma_roles[role_name]['name'],
@@ -1418,8 +1658,9 @@ class Roles:
 
                 karma_roles[role_name]['role_id'] = role.id
                 data.karma_roles = karma_roles
-
-            self._sansara_roles[role_name] = role
+            except Exception as e:
+                print(e)
+                print(traceback.format_exc())
 
         try:
             with open(assets.sansara[role_name], "rb") as f:
@@ -1439,19 +1680,24 @@ class Roles:
             'blue_cube',
             'gold_cube',
         ],
+        recreate: bool = True,
     ) -> Role | None:
         guild: discord.Guild = self._bot.guild
 
         if not guild:
             return None
 
-        role = self._cubes_roles[role_name]
         cube_roles = data.cube_roles
+        role = guild.get_role(cube_roles[role_name]['role_id'])
 
         if role is None:
-            role = guild.get_role(cube_roles[role_name]['role_id'])
+            try:
+                role = await guild.fetch_role(cube_roles[role_name]['role_id'])
+            except discord.HTTPException:
+                pass
 
-            if role is None:
+        if role is None and recreate:
+            try:
                 role = await guild.create_role(
                     reason="Восстановление роли.",
                     name=cube_roles[role_name]['name'],
@@ -1464,8 +1710,9 @@ class Roles:
 
                 cube_roles[role_name]['role_id'] = role.id
                 data.cube_roles = cube_roles
-
-            self._cubes_roles[role_name] = role
+            except Exception as e:
+                print(e)
+                print(traceback.format_exc())
 
         try:
             with open(assets.cubes[role_name], "rb") as f:
@@ -1477,22 +1724,22 @@ class Roles:
 
         return role
 
-    async def get_sansara_roles(self) -> list[Role] | None:
+    async def get_sansara_roles(self, recreate: bool = True) -> list[Role] | None:
         roles = []
 
         for role_name in self._sansara_roles:
-            role = await self.get_sansara_role(role_name)
+            role = await self.get_sansara_role(role_name, recreate)
 
             if role is not None:
                 roles.append(role)
 
         return roles or None
 
-    async def get_cube_roles(self) -> list[Role] | None:
+    async def get_cube_roles(self, recreate: bool = True) -> list[Role] | None:
         roles = []
 
         for role_name in self._cubes_roles:
-            role = await self.get_cube_role(role_name)
+            role = await self.get_cube_role(role_name, recreate)
 
             if role is not None:
                 roles.append(role)
@@ -1500,198 +1747,146 @@ class Roles:
         return roles or None
 
 # ---------------------------------------------------------
-# Базовый класс для view настроек
+# ||||||||| Классы страниц у команды настроек |||||||||||||
 # ---------------------------------------------------------
 
-class BaseSettingsView(discord.ui.LayoutView):
-    def __init__(
-        self,
-        author: discord.Member,
-        *,
-        timeout: float = 300,
-    ):
-        super().__init__(timeout=timeout)
+class SettingsMainPage(Page):
+    """
+    Главная страница настроек. Хаб для навигации.
+    """
+    title = 'Карма'
 
-        self.author = author
-        self.message: discord.Message | None = None
+    def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
+        super().__init__(navigator, author)
+        self.bot = bot
 
-    async def interaction_check(
-        self,
-        interaction: discord.Interaction,
-    ) -> bool:
-        if interaction.user.id != self.author.id:
-            await interaction.response.send_message(
-                "Это меню принадлежит другому пользователю.",
-                ephemeral=True,
-            )
-            return False
-
-        return True
-
-    async def update_message(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        """
-        Обновляет текущее сообщение этим View.
-
-        Если interaction ещё не обработан —
-        используем response.edit_message().
-
-        Если уже был defer()/response —
-        редактируем message напрямую.
-        """
-
-        if interaction.response.is_done():
-            await interaction.message.edit(view=self)
-        else:
-            await interaction.response.edit_message(view=self)
-
-    async def on_timeout(self) -> None:
-        self.disable_all()
-
-        if self.message is not None:
-            await self.message.edit(view=self)
-
-    def disable_all(self) -> None:
-        for item in self.walk_children():
-            if hasattr(item, "disabled"):
-                item.disabled = True
-
-    async def on_error(
-        self,
-        interaction: discord.Interaction,
-        error: Exception,
-        item: discord.ui.Item[Any],
-    ) -> None:
-        func_name = getattr(
-            item.callback,
-            "__name__",
-            "unknown",
+        self.general_button = discord.ui.Button(
+            label="Общие",
+            style=discord.ButtonStyle.primary,
         )
 
-        traceback_text = traceback.format_exc()
+        async def general_callback(interaction):
+            await self.navigator.push(SettingsGeneralPage, author=self.author, bot=self.bot)
+            await interaction.response.defer()
 
-        print(
-            f"Error in {func_name}:\n"
-            f"{traceback_text}"
+        self.general_button.callback = (
+            general_callback
         )
 
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                f"Произошла ошибка:\n```python\n{error}\n```",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                f"Произошла ошибка:\n```python\n{error}\n```",
-                ephemeral=True,
-            )
-
-
-# ---------------------------------------------------------
-# Вспомогательные классы кнопок
-# ---------------------------------------------------------
-
-class SecInputModal(discord.ui.Modal):
-    def __init__(
-        self,
-        author: discord.Member,
-        title: str,
-        label: str,
-        default: int,
-        callback,
-        min_value: int = 0,
-        max_value: int = 1000,
-    ):
-        super().__init__(title=title)
-
-        self.author = author
-        self.callback_function = callback
-        self.min_value = min_value
-        self.max_value = max_value
-
-        self.input = discord.ui.TextInput(
-            label=label,
-            default=str(default),
-            placeholder=f"{min_value}–{max_value}",
-            max_length=len(str(max_value)),
-            required=True,
+        self.sansara_button = discord.ui.Button(
+            label="Сансара",
+            style=discord.ButtonStyle.primary,
         )
 
-        self.add_item(self.input)
+        async def sansara_callback(interaction):
+            await self.navigator.push(SettingsSansaraPage, author=self.author, bot=self.bot)
+            await interaction.response.defer()
 
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            value = int(self.input.value)
-        except ValueError:
-            await interaction.response.send_message(
-                "Введите целое число.",
-                ephemeral=True,
-            )
-            return
-
-        if not self.min_value <= value <= self.max_value:
-            await interaction.response.send_message(
-                f"Введите число от {self.min_value} "
-                f"до {self.max_value}.",
-                ephemeral=True,
-            )
-            return
-
-        await self.callback_function(interaction, value)
-
-    async def on_error(
-        self,
-        interaction: discord.Interaction,
-        error: Exception,
-    ) -> None:
-        func_name = self.callback_function.__name__
-
-        traceback_text = traceback.format_exc()
-
-        print(
-            f"Error in {func_name}:\n"
-            f"{traceback_text}"
+        self.sansara_button.callback = (
+            sansara_callback
         )
 
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                f"Произошла ошибка:\n```python\n{error}\n```",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                f"Произошла ошибка:\n```python\n{error}\n```",
-                ephemeral=True,
-            )
-
-# ---------------------------------------------------------
-# Общие настройки
-# ---------------------------------------------------------
-
-class GeneralSettingsView(BaseSettingsView):
-    def __init__(
-        self,
-        author: discord.Member,
-        main_view: "MainSettingsView",
-    ):
-        super().__init__(
-            author,
-            timeout=300,
+        self.cubes_button = discord.ui.Button(
+            label="Кубы",
+            style=discord.ButtonStyle.primary,
         )
 
-        self.main_view = main_view
+        async def cubes_callback(interaction):
+            await self.navigator.push(SettingsCubesPage, author=self.author, bot=self.bot)
+            await interaction.response.defer()
+
+        self.cubes_button.callback = (
+            cubes_callback
+        )
+
+        self.level_up_button = discord.ui.Button(
+            label="Текст повышений",
+            style=discord.ButtonStyle.primary,
+        )
+
+        async def level_up_callback(interaction): # noqa
+            await self.navigator.push(SettingsLevelUpPage, author=self.author, bot=self.bot)
+            await interaction.response.defer()
+
+        self.level_up_button.callback = (
+            level_up_callback
+        )
+
+    def build_content(self, container: discord.Container):
+        container.add_item(
+            discord.ui.TextDisplay(
+                '*На создание этого меню у меня ушло неприлично много времени, так что наслаждайтесь этим текстом в назидание о правильном времяпрепровождении, а не этим всем.*\n'
+                '*Если возникнут какие-то вопросы, обращайтесь к Габу (если я еще не умер).*'
+            )
+        )
+
+        container.add_item(
+            discord.ui.ActionRow(
+                self.general_button
+            )
+        )
+
+        container.add_item(
+            discord.ui.ActionRow(
+                self.sansara_button
+            )
+        )
+
+        container.add_item(
+            discord.ui.ActionRow(
+                self.cubes_button
+            )
+        )
+
+        container.add_item(
+            discord.ui.ActionRow(
+                self.level_up_button
+            )
+        )
+
+class SettingsGeneralPage(Page):
+    """
+    Страница общих настроек.
+    """
+    title = 'Карма -> Общие'
+
+    def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
+        super().__init__(navigator, author)
+        self.bot = bot
 
         # Изменяемые значения
         self.karma_channel_id = data.karma_channel_id
         self.log_channel_id = data.log_channel_id
         self.blocked_channels_id = set(data.blocked_channels_id)
+        self.blocked_roles_id = set(data.blocked_roles_id)
 
         # Флаги изменений
-        self.karma_channel_edited = False
-        self.log_channel_edited = False
+        self.original_karma_channel_id = data.karma_channel_id
+        self.original_log_channel_id = data.log_channel_id
         self.original_blocked_channels_id = set(data.blocked_channels_id)
+        self.original_blocked_roles_id = set(data.blocked_roles_id)
+
+        # -------------------------------------------------
+        # Блокировка каналов
+        # -------------------------------------------------
+
+        self.blocked_channels_select = discord.ui.ChannelSelect(
+            placeholder="Изменить каналы"
+        )
+        self.blocked_channels_select.callback = (
+            self.blocked_channels_callback
+        )
+
+        # -------------------------------------------------
+        # Блокировка ролей
+        # -------------------------------------------------
+
+        self.blocked_roles_select = discord.ui.RoleSelect(
+            placeholder="Изменить роли"
+        )
+        self.blocked_roles_select.callback = (
+            self.blocked_roles_callback
+        )
 
         # -------------------------------------------------
         # Канал оповещений
@@ -1709,20 +1904,6 @@ class GeneralSettingsView(BaseSettingsView):
 
         # -------------------------------------------------
         # Канал логов
-        # -------------------------------------------------
-
-        self.blocked_channels_select = discord.ui.ChannelSelect(
-            placeholder="Изменить каналы",
-            channel_types=[
-                discord.ChannelType.text,
-            ]
-        )
-        self.blocked_channels_select.callback = (
-            self.blocked_channels_callback
-        )
-
-        # -------------------------------------------------
-        # Блокировка каналов
         # -------------------------------------------------
 
         self.log_channel_select = discord.ui.ChannelSelect(
@@ -1745,50 +1926,46 @@ class GeneralSettingsView(BaseSettingsView):
         )
         self.confirm_button.callback = self.confirm_callback
 
-        self.back_button = discord.ui.Button(
-            label="Назад",
-            style=discord.ButtonStyle.secondary,
-        )
-        self.back_button.callback = self.back_callback
-
-        # -------------------------------------------------
-        # Layout
-        # -------------------------------------------------
-
-        self.update_container()
-
+    def build_content(self, container: discord.Container):
         self.update_buttons()
 
-    def update_container(self):
-        container = discord.ui.Container()
+        container.add_item(
+            discord.ui.TextDisplay(
+                '*Этим меню будут пользоваться одновременно чаще всего и одновременно никогда. И то, наверное, только Дракон (долгих лет ему жизни.)\n\n'
+                'Чтобы использовать это меню, нужно изменить канал или каналы на нужные значения, а затем нажать «Подтвердить». Тут всё довольно наглядно, поэтому не побоюсь этого страшного слова — «интуитивно».\n\n'
+                'Если вы мисскликнули по каналу и после этого не можете выбрать его снова, то это потому, что в подобных выпадающих списках нельзя нажать на один и тот же канал дважды. Я долго пытался решить эту проблему, но в итоге забил и оставил хотя бы это сообщение.\n\n'
+                '-# Во избежание проблемы выше можно не мисскликать. Ну или нажать по очереди на другие каналы, чтобы сбросить «хвост».*'
+            )
+        )
 
         container.add_item(
-            discord.ui.TextDisplay("# Карма -> Общие")
+            discord.ui.TextDisplay(
+                self.get_blocked_channels_text()
+            )
         )
 
         container.add_item(
-            discord.ui.Separator()
+            discord.ui.ActionRow(
+                self.blocked_channels_select
+            )
         )
 
-        blocked_channels_text = discord.ui.TextDisplay(
-            self.get_blocked_channels_text()
-        )
         container.add_item(
-            blocked_channels_text
+            discord.ui.TextDisplay(
+                self.get_roles_channels_text()
+            )
         )
 
-        blocked_channels_row = discord.ui.ActionRow(
-            self.blocked_channels_select
-        )
         container.add_item(
-            blocked_channels_row
+            discord.ui.ActionRow(
+                self.blocked_roles_select
+            )
         )
 
-        karma_channel_text = discord.ui.TextDisplay(
-            self.get_karma_channel_text()
-        )
         container.add_item(
-            karma_channel_text
+            discord.ui.TextDisplay(
+                self.get_karma_channel_text()
+            )
         )
 
         container.add_item(
@@ -1797,11 +1974,10 @@ class GeneralSettingsView(BaseSettingsView):
             )
         )
 
-        log_channel_text = discord.ui.TextDisplay(
-            self.get_log_channel_text()
-        )
         container.add_item(
-            log_channel_text
+            discord.ui.TextDisplay(
+                self.get_log_channel_text()
+            )
         )
 
         container.add_item(
@@ -1810,47 +1986,39 @@ class GeneralSettingsView(BaseSettingsView):
             )
         )
 
-        container.add_item(
-            discord.ui.Separator()
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.confirm_button,
-                self.back_button,
-            )
-        )
-
-        self.clear_items()
-        self.add_item(container)
-
-    # -----------------------------------------------------
-    # Текст
-    # -----------------------------------------------------
+    def build_footer_buttons(self):
+        footer_buttons = [self.confirm_button]
+        return footer_buttons
 
     def get_karma_channel_text(self) -> str:
         if self.karma_channel_id is None:
             return "### Канал оповещений: не выбран"
 
-        marker = "*" if self.karma_channel_edited else ""
-        form = "__" if self.karma_channel_edited else ""
-
-        return (
-            f"### Канал оповещений: "
-            f"{form}<#{self.karma_channel_id}>{form}{marker}"
-        )
+        if self.karma_channel_id == self.original_karma_channel_id:
+            return (
+                f"### Канал оповещений: "
+                f"<#{self.karma_channel_id}>"
+            )
+        else:
+            return (
+                f"### Канал оповещений: "
+                f"__<#{self.karma_channel_id}>__*"
+            )
 
     def get_log_channel_text(self) -> str:
         if self.log_channel_id is None:
             return "### Канал логов: не выбран"
 
-        marker = "*" if self.log_channel_edited else ""
-        form = "__" if self.log_channel_edited else ""
-
-        return (
-            f"### Канал логов: "
-            f"{form}<#{self.log_channel_id}>{form}{marker}"
-        )
+        if self.log_channel_id == self.original_log_channel_id:
+            return (
+                f"### Канал логов: "
+                f"<#{self.log_channel_id}>"
+            )
+        else:
+            return (
+                f"### Канал логов: "
+                f"__<#{self.log_channel_id}>__*"
+            )
 
     def get_blocked_channels_text(self) -> str:
         if not self.blocked_channels_id and (
@@ -1887,482 +2055,821 @@ class GeneralSettingsView(BaseSettingsView):
                 + ", ".join(parts)
         )
 
-    # -----------------------------------------------------
-    # Кнопки
-    # -----------------------------------------------------
+    def get_roles_channels_text(self) -> str:
+        if not self.blocked_roles_id and (
+                self.original_blocked_roles_id
+                == self.blocked_roles_id
+        ):
+            return "### Заблокированные роли: не выбраны"
 
-    def update_buttons(self) -> None:
-        edited = (
-            self.karma_channel_edited
-            or self.log_channel_edited
-            or (
-                self.blocked_channels_id
-                != self.original_blocked_channels_id
+        parts = []
+
+        for role_id in (self.original_blocked_roles_id | self.blocked_roles_id):
+            removed = (
+                    role_id in self.original_blocked_roles_id
+                    and role_id not in self.blocked_roles_id
             )
+
+            added = (
+                    role_id not in self.original_blocked_roles_id
+                    and role_id in self.blocked_roles_id
+            )
+
+            if removed:
+                parts.append(f"~~<@&{role_id}>~~\\*")
+            elif added:
+                parts.append(f"<@&{role_id}>\\*")
+            else:
+                parts.append(f"<@&{role_id}>")
+
+        if not parts:
+            return "### Заблокированные роли: не выбраны"
+
+        return (
+                "### Заблокированные роли: "
+                + ", ".join(parts)
         )
 
-        self.confirm_button.disabled = not edited
-
-    # -----------------------------------------------------
-    # Выбор каналов
-    # -----------------------------------------------------
-
-    async def karma_channel_callback(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
+    async def karma_channel_callback(self, interaction: discord.Interaction) -> None:
         channel = self.karma_channel_select.values[0]
 
         self.karma_channel_id = channel.id
-        self.karma_channel_edited = (
-            self.karma_channel_id != data.karma_channel_id
-        )
-
-        self.update_container()
 
         self.update_buttons()
 
-        await self.update_message(interaction)
+        await self.navigator.render()
+        await interaction.response.defer()
 
-    async def log_channel_callback(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
+    async def log_channel_callback(self, interaction: discord.Interaction) -> None:
         channel = self.log_channel_select.values[0]
 
         self.log_channel_id = channel.id
-        self.log_channel_edited = (
-            self.log_channel_id != data.log_channel_id
-        )
-
-        self.update_container()
 
         self.update_buttons()
 
-        await self.update_message(interaction)
+        await self.navigator.render()
+        await interaction.response.defer()
 
-    async def blocked_channels_callback(
-            self,
-            interaction: discord.Interaction,
-    ) -> None:
-
+    async def blocked_channels_callback(self, interaction: discord.Interaction) -> None:
         channels = [channel.id for channel in self.blocked_channels_select.values]
 
         self.blocked_channels_id.symmetric_difference_update(channels)
-        data_blocked_channels_id = data.blocked_channels_id
 
-        self.blocked_channels_edited = (
-            [id_ not in data_blocked_channels_id for id_ in self.blocked_channels_id]
-        )
-        if len(self.blocked_channels_id) < len(data_blocked_channels_id):
-            self.blocked_channels_edited.append(True)
+        await self.navigator.render()
+        await interaction.response.defer()
 
-        self.update_container()
-        
-        self.update_buttons()
+    async def blocked_roles_callback(self, interaction: discord.Interaction) -> None:
+        roles = [role.id for role in self.blocked_roles_select.values]
 
-        await self.update_message(interaction)
+        self.blocked_roles_id.symmetric_difference_update(roles)
 
-    # -----------------------------------------------------
-    # Подтверждение
-    # -----------------------------------------------------
+        await self.navigator.render()
+        await interaction.response.defer()
 
-    async def confirm_callback(
-            self,
-            interaction: discord.Interaction,
-    ) -> None:
-
-        if self.karma_channel_edited:
+    async def confirm_callback(self, interaction: discord.Interaction) -> None:
+        if self.karma_channel_id != self.original_karma_channel_id:
             data.karma_channel_id = self.karma_channel_id
-            self.karma_channel_edited = False
+            self.original_karma_channel_id = self.karma_channel_id
 
-        if self.log_channel_edited:
+        if self.log_channel_id != self.original_log_channel_id:
             data.log_channel_id = self.log_channel_id
-            self.log_channel_edited = False
+            self.original_log_channel_id = self.log_channel_id
 
         if self.blocked_channels_id != self.original_blocked_channels_id:
             data.blocked_channels_id = list(self.blocked_channels_id)
-            self.original_blocked_channels_id = set(
-                self.blocked_channels_id
-            )
+            self.original_blocked_channels_id = set(self.blocked_channels_id)
 
-        self.update_container()
+        if self.blocked_roles_id != self.original_blocked_roles_id:
+            data.blocked_roles_id = list(self.blocked_roles_id)
+            self.original_blocked_roles_id = set(self.blocked_roles_id)
 
-        self.update_buttons()
-
-        await self.update_message(interaction)
-
-    # -----------------------------------------------------
-    # Назад
-    # -----------------------------------------------------
-
-    async def back_callback(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        self.stop()
-
-        self.main_view.active_view = None
-
-        await interaction.response.edit_message(
-            view=self.main_view
-        )
-
-class SansaraSettingsView(BaseSettingsView):
-    def __init__(
-        self,
-        author: discord.Member,
-        main_view: "MainSettingsView",
-    ):
-        super().__init__(
-            author,
-            timeout=300,
-        )
-
-        self.main_view = main_view
-
-        # Оригинальные значения
-        self.og_karma_message_delay = data.karma_message_delay
-        self.og_karma_roles = data.karma_roles
-
-        # Изменяемые значения
-        self.karma_message_delay = data.karma_message_delay
-        self.karma_roles = data.karma_roles
-
-        # -------------------------------------------------
-        # Канал оповещений
-        # -------------------------------------------------
-
-        self.karma_message_delay_button = discord.ui.Button(
-            label="Изменить",
-            style=discord.ButtonStyle.secondary,
-        )
-        self.karma_message_delay_button.callback = (
-            self.karma_message_delay_callback
-        )
-
-        # -------------------------------------------------
-        # Канал логов
-        # -------------------------------------------------
-
-
-
-        # -------------------------------------------------
-        # Блокировка каналов
-        # -------------------------------------------------
-
-
-
-        # -------------------------------------------------
-        # Кнопки
-        # -------------------------------------------------
-
-        self.confirm_button = discord.ui.Button(
-            label="Подтвердить",
-            style=discord.ButtonStyle.primary,
-        )
-        self.confirm_button.callback = self.confirm_callback
-
-        self.back_button = discord.ui.Button(
-            label="Назад",
-            style=discord.ButtonStyle.secondary,
-        )
-        self.back_button.callback = self.back_callback
-
-        # -------------------------------------------------
-        # Layout
-        # -------------------------------------------------
-
-        self.container = discord.ui.Container()
-
-        self.container.add_item(
-            discord.ui.TextDisplay("# Карма -> Сансара")
-        )
-
-        self.container.add_item(
-            discord.ui.Separator()
-        )
-
-        self.karma_delay_text = discord.ui.TextDisplay(
-            self.get_karma_delay_text()
-        )
-
-        self.karma_delay_section = discord.ui.Section(
-            self.karma_delay_text,
-            accessory=self.karma_message_delay_button,
-        )
-
-        self.container.add_item(
-            self.karma_delay_section
-        )
-
-        self.container.add_item(
-            discord.ui.Separator()
-        )
-
-        self.container.add_item(
-            discord.ui.ActionRow(
-                self.confirm_button,
-                self.back_button,
-            )
-        )
-
-        self.add_item(self.container)
-
-        self.update_buttons()
-
-    # -----------------------------------------------------
-    # Текст
-    # -----------------------------------------------------
-
-    def get_karma_delay_text(self) -> str:
-        if self.og_karma_message_delay != self.karma_message_delay:
-            return (
-                f"### Задержка между сообщениями: "
-                f"__`{self.karma_message_delay}`__*"
-            )
-        else:
-            return (
-                f"### Задержка между сообщениями: "
-                f"`{self.karma_message_delay}`"
-            )
-
-    # -----------------------------------------------------
-    # Кнопки
-    # -----------------------------------------------------
+        await self.navigator.render()
+        await interaction.response.defer()
 
     def update_buttons(self) -> None:
         edited = (
-            self.og_karma_message_delay != self.karma_message_delay
+            self.karma_channel_id != self.original_karma_channel_id
+            or self.log_channel_id != self.original_log_channel_id
+            or self.blocked_channels_id != self.original_blocked_channels_id
+            or self.blocked_roles_id != self.original_blocked_roles_id
         )
-        print(edited)
 
         self.confirm_button.disabled = not edited
 
-    # -----------------------------------------------------
-    # Выбор каналов
-    # -----------------------------------------------------
+class SettingsLevelUpPage(Page):
+    """
+    Страница настроек текстов повышений.
+    """
+    title = 'Карма -> Текст повышений'
 
-    async def karma_message_delay_callback(
-            self,
-            interaction: discord.Interaction,
-    ):
-        async def set_karma_message_delay(
-                set_interaction: discord.Interaction,
-                value: int,
-        ):
-            self.karma_message_delay = value
+    def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
+        super().__init__(navigator, author)
+        self.bot = bot
 
-            self.karma_delay_text.content = self.get_karma_delay_text()
+        levels = list(levels_data.items())
+        self.buttons = []
 
-            self.update_buttons()
+        for i in range(0, len(levels), 20):
+            group = tuple(levels[i:i + 20])
 
-            await self.update_message(set_interaction)
+            button = discord.ui.Button(
+                label=f"Изменить ({i + 1} - {i + 20})",
+                style=discord.ButtonStyle.primary,
+            )
 
-        await interaction.response.send_modal(
-            SecInputModal(
-                author=self.author,
-                title="Пауза выдачи кармы между сообщениями.",
-                label="Количество секунд",
-                default=self.karma_message_delay,
-                min_value=0,
-                max_value=10,
-                callback=set_karma_message_delay,
+            async def callback(
+                interaction: discord.Interaction,
+                _group=group,
+            ):
+                try:
+                    await interaction.response.send_modal(self.LevelUpTextModal(_group))
+                except Exception:
+                    traceback.print_exc()
+
+            button.callback = callback
+
+            self.buttons.append(button)
+
+    class LevelUpTextModal(discord.ui.Modal):
+        def __init__(self, levels_tuple: tuple):
+            super().__init__(title="Текст повышения")
+
+            str_levels = collapse_dict(dict(levels_tuple))
+
+            self.text_input = discord.ui.TextInput(
+                label="Текст",
+                style=discord.TextStyle.long,
+                default=str_levels,
+                placeholder="Введите текст повышения...",
+                required=True,
+                max_length=4000,
+            )
+
+            self.add_item(self.text_input)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            await interaction.response.defer()
+            try:
+                new_levels_data = expand_dict(self.text_input.value)
+
+                levels_data.update(new_levels_data)
+
+                await interaction.followup.send('Изменено.', ephemeral=True)
+
+            except SyntaxError as error:
+                message = str(error)
+
+                if "unterminated string literal" in message:
+                    explanation = "Строка не закрыта. Проверьте кавычки."
+                elif "unterminated triple-quoted string literal" in message:
+                    explanation = "Многострочная строка не закрыта. Проверьте тройные кавычки."
+                elif "unexpected EOF while parsing" in message:
+                    explanation = "Выражение неожиданно закончилось. Возможно, не хватает закрывающей скобки или кавычки."
+                elif "invalid syntax" in message:
+                    explanation = "Обнаружена ошибка в синтаксисе."
+                else:
+                    explanation = message
+
+                text = self.text_input.value
+
+                if error.lineno is not None:
+                    explanation += f"\nСтрока: {error.lineno}"
+                    lines = text.splitlines()
+                    lines.insert(error.lineno, '^' * len(lines[error.lineno]))
+                    text = "\n".join(lines)
+
+
+                if error.offset is not None:
+                    explanation += f"\nПозиция: {error.offset}"
+
+                await interaction.followup.send(
+                    f'{explanation}\n```{text}```',
+                    ephemeral=True
+                )
+
+    def build_content(self, container: discord.Container):
+        container.add_item(
+            discord.ui.TextDisplay(
+                '*Речь о текстах которые показываются при повышении уровней Сансары.*\n'
+                '*Изменяются только __явно__ измененные значения. То есть, при удалении строки {\'n\': \'qwerty\'} из блока изменений целиком, её содержимое изменено не будет.*\n'
+                '*Для упоминания ролей, каналов, пользователей, игр, времени или чего-бы то ни было в каком-то из уровней, используйте стандартную нотацию Discord через айди или ключевое слово. (пример мне делать лень)*'
             )
         )
-
-    # -----------------------------------------------------
-    # Подтверждение
-    # -----------------------------------------------------
-
-    async def confirm_callback(
-            self,
-            interaction: discord.Interaction,
-    ) -> None:
-
-        if self.og_karma_message_delay != self.karma_message_delay:
-            data.karma_message_delay = self.karma_message_delay
-            self.og_karma_message_delay = self.karma_message_delay
-
-        self.karma_delay_text.content = self.get_karma_delay_text()
-
-        self.update_buttons()
-
-        await self.update_message(interaction)
-
-    # -----------------------------------------------------
-    # Назад
-    # -----------------------------------------------------
-
-    async def back_callback(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        self.stop()
-
-        self.main_view.active_view = None
-
-        await interaction.response.edit_message(
-            view=self.main_view
-        )
-
-
-# ---------------------------------------------------------
-# Главное меню
-# ---------------------------------------------------------
-
-class MainSettingsView(BaseSettingsView):
-    def __init__(
-        self,
-        author: discord.Member,
-    ):
-        super().__init__(
-            author,
-            timeout=300,
-        )
-
-        self.active_view: discord.ui.LayoutView | None = None
-
-        # -------------------------------------------------
-        # Кнопки
-        # -------------------------------------------------
-
-        self.general_button = discord.ui.Button(
-            label="Общие",
-            style=discord.ButtonStyle.primary,
-        )
-        self.general_button.callback = (
-            self.general_callback
-        )
-
-        self.sansara_button = discord.ui.Button(
-            label="Сансара",
-            style=discord.ButtonStyle.primary,
-        )
-        self.sansara_button.callback = (
-            self.sansara_callback
-        )
-
-        self.cubes_button = discord.ui.Button(
-            label="Кубы",
-            style=discord.ButtonStyle.primary,
-        )
-        self.cubes_button.callback = (
-            self.cubes_callback
-        )
-
-        self.level_up_button = discord.ui.Button(
-            label="Текст повышений",
-            style=discord.ButtonStyle.primary,
-        )
-        self.level_up_button.callback = (
-            self.level_up_callback
-        )
-
-        # -------------------------------------------------
-        # Layout
-        # -------------------------------------------------
-
-        container = discord.ui.Container()
 
         container.add_item(
             discord.ui.TextDisplay(
-                "# Карма"
+                '-# *Тут планируется показ уровней, но Габу его делать лень, остальная Сансара не ждет (она ждёт).*'
+            )
+        )
+
+        for button in self.buttons:
+            container.add_item(
+                discord.ui.ActionRow(
+                    button
+                )
+            )
+
+class SettingsSansaraPage(Page):
+    """
+    Страница настроек Сансары.
+    """
+    title = 'Карма -> Сансара'
+    restore_task: asyncio.Task | None = None
+
+    def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
+        super().__init__(navigator, author)
+        self.bot = bot
+        self.roles = Roles(bot)
+
+        # Кнопка задержки между выдачей опыта сообщений
+        self.karma_message_delay_button = discord.ui.Button(
+            label="Изменить",
+            style=discord.ButtonStyle.primary,
+        )
+
+        async def karma_message_delay_button_callback(interaction: discord.Interaction):
+            await interaction.response.send_modal(self.DelayModal(self.navigator))
+
+        self.karma_message_delay_button.callback = karma_message_delay_button_callback
+
+        self.karma_edit_roles_by_data_button = self.create_confirm_button(
+            label="Восстановить роли",
+            confirm_label="Подтвердить восстановление ролей",
+            action=self._restore_roles,
+        )
+
+    async def _restore_roles(self, interaction: Interaction):
+        try:
+            if self.restore_task is not None and not self.restore_task.done():
+                await interaction.followup.send(
+                    'Задача уже выполняется',
+                    ephemeral=True
+                )
+                return
+
+            guild = self.bot.guild
+            sansara_roles = await self.roles.get_sansara_roles(recreate=True)
+            sansara_role_ids = {role.id for role in sansara_roles}
+
+            async def restore_roles():
+                message: discord.WebhookMessage = await interaction.followup.send(
+                    f'Обновление ролей участников: 0/{len(guild.members)}',
+                    ephemeral=True
+                )
+
+                n = 0
+
+                for member in guild.members:
+                    n += 1
+
+                    if n % 27 == 0:
+                        await message.edit(
+                            content=f'Обновление ролей участников: {n}/{len(guild.members)}'
+                        )
+
+                    ozernik = self.bot.db_ensure_user(member)
+
+                    karma = db.get_karma(ozernik.id)
+                    status = get_status(karma)
+
+                    target_role = await self.roles.get_sansara_role(
+                        status["tag_name"]
+                    )
+
+                    current_sansara_roles = [
+                        role
+                        for role in member.roles
+                        if role.id in sansara_role_ids
+                    ]
+
+                    if (
+                        len(current_sansara_roles) == 1
+                        and current_sansara_roles[0].id == target_role.id
+                    ):
+                        continue
+
+                    roles_to_remove = [
+                        role
+                        for role in current_sansara_roles
+                        if role.id != target_role.id
+                    ]
+
+                    if roles_to_remove:
+                        await member.remove_roles(
+                            *roles_to_remove,
+                            reason="Восстановление ролей Сансары",
+                        )
+
+                    if target_role not in member.roles:
+                        await member.add_roles(
+                            target_role,
+                            reason="Восстановление ролей Сансары",
+                        )
+
+
+                await message.delete()
+                await interaction.followup.send(
+                    f'Обновление ролей участников завершено.',
+                    ephemeral=True
+                )
+
+            SettingsSansaraPage.restore_task = asyncio.create_task(restore_roles())
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(tb)
+            print(e)
+
+    class DelayModal(discord.ui.Modal):
+        def __init__(self, navigator: Navigator):
+            super().__init__(title="Задержка между сообщениями")
+
+            self.navigator = navigator
+
+            delay = data.karma_message_delay
+
+            str_delay = str(delay)
+
+            self.text_input = discord.ui.TextInput(
+                label="Задержка между сообщениями в секундах",
+                style=discord.TextStyle.short,
+                default=str_delay,
+                placeholder=f"1–9",
+                required=True,
+                max_length=1,
+            )
+
+            self.add_item(self.text_input)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            try:
+                value = int(self.text_input.value)
+            except ValueError:
+                await interaction.response.send_message(
+                    "Введите целое число.",
+                    ephemeral=True,
+                )
+                return
+
+            if not 1 <= value <= 9:
+                await interaction.response.send_message(
+                    "Введите число от 1 до 9.",
+                    ephemeral=True,
+                )
+                return
+
+            data.karma_message_delay = value
+            await interaction.response.defer()
+            await self.navigator.render()
+
+        async def on_error(
+                self,
+                interaction: discord.Interaction,
+                error: Exception,
+        ) -> None:
+            traceback_text = traceback.format_exc()
+
+            print(
+                f"Error:\n"
+                f"{traceback_text}"
+            )
+
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"Произошла ошибка:\n```python\n{error}\n```",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"Произошла ошибка:\n```python\n{error}\n```",
+                    ephemeral=True,
+                )
+
+    def build_content(self, container: discord.Container):
+        container.add_item(
+            discord.ui.TextDisplay(
+                '*Это меню я изначально не хотел делать, но потом подумал, что редактирование ролей Сансары — довольно важная функция.\n'
+                'Как ни странно, это меню я сделал третьим — после «Общих» и «Текстов повышений». Поэтому решил совместить в нём подходы, которые использовал в этих двух меню.\n\n'
+                'Здравствуй, админ, решивший сюда заглянуть. Вероятно, просто чтобы просто почитать.*\n'
             )
         )
 
         container.add_item(
-            discord.ui.Separator()
+            discord.ui.TextDisplay(
+                self.get_karma_roles_text()
+            )
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                f'## Уровни сансары:\n'
+                f'*Каждые десять уровней увеличивается количество кармы, необходимое для перехода на следующий уровень: '
+                f'сначала на 100 ед. к., затем на 200, затем на 400, затем на 800 и т. д. '
+                f'Поэтому чем выше уровень Сансары, тем больше кармы требуется для каждого нового уровня.*'
+            )
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                self.get_karma_levels_text()
+            )
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                '## Восстановление ролей:\n'
+                '*Все роли которые подверглись изменениям будут возвращены в исходное состояние (название и цвет), также будут возвращены удаленные роли.\n'
+                'Также все пользователи которым выдана неправильная роль или не выдана роль будут обновлены.\n'
+                '-# Может занять некоторое время.*'
+            )
         )
 
         container.add_item(
             discord.ui.ActionRow(
-                self.general_button
+                self.karma_edit_roles_by_data_button
+            )
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                self.get_karma_message_delay_text()
+            )
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                '*Карма выдается максимум только раз в определенный промежуток времени — это задержка между выдачей Кармы.*'
             )
         )
 
         container.add_item(
             discord.ui.ActionRow(
-                self.sansara_button
+                self.karma_message_delay_button
+            )
+        )
+
+    @staticmethod
+    def get_karma_message_delay_text() -> str:
+        if data.karma_message_delay:
+            n = format_duration_seconds(data.karma_message_delay, True)
+            return (
+                f"## Задержка между выдачей Кармы: "
+                f"{n}."
+            )
+        else:
+            return (
+                f"## Задержка между выдачей Кармы: "
+                f"Не задана"
+            )
+
+    @staticmethod
+    def get_karma_roles_text() -> str:
+        lines = [f'## Роли сансары:']
+        for karma_role in data.karma_roles.values():
+            required_karma = karma_role['required_karma']
+            level = get_level(required_karma)
+
+            if level is None:
+                level = '25+'
+                required_karma = '5000+'
+
+            lines.append(
+                f'- <@&{karma_role['role_id']}>:'
+                f' `{karma_role['name']}`,'
+                f' `{required_karma}` кармы ({level} ур.)''.'
+            )
+
+        return '\n'.join(lines)
+
+    @staticmethod
+    def get_karma_levels_text() -> str:
+        fin_lines = []
+
+        lines = []
+        for level in range(1, 31):
+            required_karma = get_karma(level)
+            str_level = str(level).zfill(2)
+
+            lines.append(
+                f'{str_level} ур: `{required_karma}`'
+            )
+
+        third = math.ceil(len(lines) / 3)
+
+        for i in range(third):
+            left = lines[i]
+            middle = lines[i + third] if i + third < len(lines) else ""
+            right = lines[i + third * 2] if i + third * 2 < len(lines) else ""
+
+            left_text = f'{left}' if left else ''
+            middle_text = f'{middle}' if middle else ''
+            right_text = f'{right}' if right else ''
+
+            line = f"{left_text.ljust(14)} {middle_text.ljust(14)} {right_text}"
+
+            line = line.replace('1 ур: ', '1 ур:  ')
+            line = line.replace('07 ур: ', '07 ур:  ')
+            line = line.replace('10 ур: ', '10 ур:  ')
+            line = line.replace('`1000`  ', '`1000` ')
+            line = line.replace('`3000`  ', '`3000` ')
+
+            fin_lines.append(line)
+
+        fin_lines.append('и т.д.')
+
+        return '\n'.join(fin_lines)
+
+class SettingsCubesPage(Page):
+    """
+    Страница настроек Кубов.
+    """
+    title = 'Карма -> Кубы'
+    restore_task: asyncio.Task | None = None
+
+    def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
+        super().__init__(navigator, author)
+        self.bot = bot
+        self.roles = Roles(bot)
+
+        # Кнопка изменения предела золотого куба
+        self.gold_cube_required_karma_button = discord.ui.Button(
+            label="Изменить",
+            style=discord.ButtonStyle.primary,
+        )
+
+        async def gold_cube_required_karma_button_callback(interaction: discord.Interaction):
+            await interaction.response.send_modal(self.GoldCubeModal(self.navigator))
+
+        self.gold_cube_required_karma_button.callback = gold_cube_required_karma_button_callback
+
+        self.cubes_edit_roles_by_data_button = self.create_confirm_button(
+            label="Восстановить роли",
+            confirm_label="Подтвердить восстановление ролей",
+            action=self._restore_roles,
+        )
+
+    async def _restore_roles(self, interaction: Interaction):
+        try:
+            if self.restore_task is not None and not self.restore_task.done():
+                await interaction.followup.send(
+                    'Задача уже выполняется',
+                    ephemeral=True
+                )
+                return
+
+            guild = self.bot.guild
+            cube_roles = await self.roles.get_cube_roles(recreate=True)
+
+            async def restore_roles():
+                message: discord.WebhookMessage = await interaction.followup.send(
+                    f'Обновление ролей участников: 0/{len(guild.members)}',
+                    ephemeral=True
+                )
+
+                n = 0
+
+                for member in guild.members:
+                    n += 1
+
+                    if n % 27 == 0:
+                        await message.edit(
+                            content=(
+                                f'Обновление ролей участников: '
+                                f'{n}/{len(guild.members)}'
+                            )
+                        )
+
+                    ozernik = self.bot.db_ensure_user(member)
+
+                    member_cube = get_cube_status(ozernik.id)
+
+                    if not member_cube:
+                        continue
+
+                    member_cube_role = await self.roles.get_cube_role(
+                        member_cube['tag_name']
+                    )
+
+                    current_cube_roles = [
+                        role
+                        for role in member.roles
+                        if role in cube_roles
+                    ]
+
+                    if (
+                            len(current_cube_roles) == 1
+                            and current_cube_roles[0] == member_cube_role
+                    ):
+                        continue
+
+                    roles_to_remove = [
+                        role
+                        for role in current_cube_roles
+                        if role != member_cube_role
+                    ]
+
+                    if roles_to_remove:
+                        await member.remove_roles(
+                            *roles_to_remove,
+                            reason="Восстановление ролей Кубов",
+                        )
+
+                    if member_cube_role not in member.roles:
+                        await member.add_roles(
+                            member_cube_role,
+                            reason="Восстановление ролей Кубов",
+                        )
+
+                await message.delete()
+                await interaction.followup.send(
+                    'Обновление ролей участников завершено.',
+                    ephemeral=True
+                )
+
+            SettingsSansaraPage.restore_task = asyncio.create_task(restore_roles())
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(tb)
+            print(e)
+
+    class GoldCubeModal(discord.ui.Modal):
+        def __init__(self, navigator: Navigator):
+            super().__init__(title="Необходимая Карма связи для Золотого Куба")
+
+            self.navigator = navigator
+
+            required_days = data.cube_roles['gold_cube']['required_karma'] / 60 / 24
+
+            self.text_input = discord.ui.TextInput(
+                label="Необходимая Карма связи для Золотого Куба",
+                style=discord.TextStyle.short,
+                default=f"{required_days:g}",
+                placeholder=f"От 3, до 7.",
+                required=True,
+                max_length=1,
+            )
+
+            self.add_item(self.text_input)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            if interaction.user.id in config.OWNERS_IDS:
+                await interaction.response.send_message(
+                    "Доступно только <@512079329619083291>. Согласуйте это изменение с ним или другим разработчиком Бота если Габ исчез.",
+                    ephemeral=True,
+                )
+                return
+
+            try:
+                value = int(self.text_input.value)
+            except ValueError:
+                await interaction.response.send_message(
+                    "Введите целое число.",
+                    ephemeral=True,
+                )
+                return
+
+            if not 3 <= value <= 7:
+                await interaction.response.send_message(
+                    "Введите число от 3 до 7.",
+                    ephemeral=True,
+                )
+                return
+
+            required_karma = value * 24 * 60
+
+            cube_roles = data.cube_roles
+            cube_roles['gold_cube']['required_karma'] = required_karma
+            data.cube_roles = cube_roles
+
+            await interaction.response.defer()
+            await self.navigator.render()
+
+        async def on_error(
+                self,
+                interaction: discord.Interaction,
+                error: Exception,
+        ) -> None:
+            traceback_text = traceback.format_exc()
+
+            print(
+                f"Error:\n"
+                f"{traceback_text}"
+            )
+
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"Произошла ошибка:\n```python\n{error}\n```",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"Произошла ошибка:\n```python\n{error}\n```",
+                    ephemeral=True,
+                )
+
+    def build_content(self, container: discord.Container):
+        container.add_item(
+            discord.ui.TextDisplay(
+                '*Если делать меню Сансары, то надо делать меню Кубов.\n'
+                'Я просто скопировал меню Сансары и поменял значения.\n\n'
+                'Расцветё-ё-ё-ём, на во-одоле-е.*\n'
+            )
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                self.get_cubes_roles_text()
+            )
+        )
+
+        cube_roles = data.cube_roles
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                '## О Кубах и Связи\n'
+                'Кармическая связь или просто "Связь"  — это единица опыта выдаваемая за время в голосовой канале с конкретным человеком.\n'
+                '- 1 минута это 1 ед. связи.\n'
+                '- У каждой пары юзер-юзер есть отдельный счётчик Связи.\n'
+                '- Каждый юзер имеет таблицу Связи со всеми юзерами, с которыми он когда-либо проводил время в голосовых каналах.\n'
+                'Уровень воспоминаний — это оценка количества накопленной Связи между двумя конкретными юзерами. Имеет всего четыре уровня:\n'
+               f'- Черная — {cube_roles['black_cube']['required_karma']} ед. с.\n'
+               f'- Белая — {cube_roles['white_cube']['required_karma']} ед. с. ({format_duration_minutes(cube_roles['white_cube']['required_karma'])})\n'
+               f'- Синяя — {cube_roles['blue_cube']['required_karma']} ед. с. ({format_duration_minutes(cube_roles['blue_cube']['required_karma'])})\n'
+               f'- Золотая — {cube_roles['gold_cube']['required_karma']} ед. с. ({format_duration_minutes(cube_roles['gold_cube']['required_karma'])})\n'
+                'Этап воспоминаний — это общая оценка Связи юзера с другими людьми. Он определяется количеством его связей, достигших определённого уровня. Для повышения этапа необходимо иметь как минимум десять связей соответствующего уровня или выше.\n'
+                '- Черный куб — 1 связь являются Черной или выше.\n'
+                '- Белый куб — 10 связей являются Белыми или выше.\n'
+                '- Синий куб — 10 связей являются Синими или выше.\n'
+                '- Золотой куб — 10 связей являются Золотыми.\n'
+            )
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                '## Восстановление ролей:\n'
+                '*Все роли которые подверглись изменениям будут возвращены в исходное состояние (название и цвет), также будут возвращены удаленные роли.\n'
+                'Также все пользователи которым выдана неправильная роль или не выдана роль будут обновлены.\n'
+                '-# Может занять некоторое время.*'
             )
         )
 
         container.add_item(
             discord.ui.ActionRow(
-                self.cubes_button
+                self.cubes_edit_roles_by_data_button
+            )
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                self.get_gold_cube_required_karma_text()
+            )
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                '*Необходимое количество дней для Золотой Связи можно изменить.*'
             )
         )
 
         container.add_item(
             discord.ui.ActionRow(
-                self.level_up_button
+                self.gold_cube_required_karma_button
             )
         )
 
-        container.add_item(
-            discord.ui.Separator()
+    @staticmethod
+    def get_gold_cube_required_karma_text() -> str:
+        format_duration = format_duration_minutes(data.cube_roles['gold_cube']['required_karma'], True)
+        return (
+            f"## Количество дней для Золотой Связи: "
+            f"{format_duration}."
         )
 
-        self.add_item(container)
+    @staticmethod
+    def get_cubes_roles_text() -> str:
+        lines = [f'## Роли Кубов:']
+        for cube_role in data.cube_roles.values():
+            required_karma = cube_role['required_karma']
+            format_duration = format_duration_minutes(required_karma)
 
-    # -----------------------------------------------------
-    # General
-    # -----------------------------------------------------
+            if not format_duration:
+                format_duration = '0 минут'
 
-    async def general_callback(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        self.active_view = GeneralSettingsView(
-            self.author,
-            self,
-        )
+            lines.append(
+                f'- <@&{cube_role['role_id']}>:'
+                f' `{cube_role['name']}`,'
+                f' `{required_karma}` ед. с. ({format_duration}) для 1 связи.'
+            )
 
-        await interaction.response.edit_message(
-            view=self.active_view
-        )
-
-    # -----------------------------------------------------
-    # Остальные разделы
-    # -----------------------------------------------------
-
-    async def sansara_callback(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        self.active_view = SansaraSettingsView(
-            self.author,
-            self,
-        )
-
-        await interaction.response.edit_message(
-            view=self.active_view
-        )
-
-    async def cubes_callback(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        await interaction.response.send_message(
-            "Настройки Кубов",
-            ephemeral=True,
-        )
-
-    async def level_up_callback(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        await interaction.response.send_message(
-            "Настройки текстов повышений",
-            ephemeral=True,
-        )
-
+        return '\n'.join(lines)
 
 # ---------------------------------------------------------
-# Класс модуля
+#  ||||||||||||||||||| Класс модуля |||||||||||||||||||||||
 # ---------------------------------------------------------
 
 class KarmaSistem(commands.Cog):
+
+    # ---------- ИНИЦИАЛИЗАЦИЯ -----------
+
     def __init__(self, bot: OzernikiBot):
         self.bot = bot
         self.roles = Roles(bot)
@@ -2370,9 +2877,40 @@ class KarmaSistem(commands.Cog):
 
     def cog_load(self):
         self.voice_karma_check.start()
+        self.weekly_countdown.start()
 
-    def cog_unload(self):
+    async def cog_unload(self):
+        await levels_data.close()
         self.voice_karma_check.cancel()
+        self.weekly_countdown.cancel()
+
+    async def cog_command_error(self, ctx: commands.Context, error):
+        self.bot.print_error(ctx.command, error)
+
+        await ctx.send(
+            f"Произошла ошибка:\n"
+            f"```\n{error}\n```",
+            ephemeral=True
+        )
+
+    async def cog_app_command_error(self, interaction: discord.Interaction, error):
+        func_name = inspect.currentframe().f_code.co_name
+        self.bot.print_error(func_name, error)
+
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"Произошла ошибка:\n"
+                f"```\n{error}\n```",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"Произошла ошибка:\n"
+                f"```\n{error}\n```",
+                ephemeral=True
+            )
+
+    # --------- ВСПОМОГАТЕЛЬНО -----------
 
     async def add_delay(self, user_id: int, delay: int) -> None:
         self.delays.add(user_id)
@@ -2385,11 +2923,29 @@ class KarmaSistem(commands.Cog):
         asyncio.create_task(self.add_delay(user_id, data.karma_message_delay))
         return False
 
+    # - ПРОВЕРКА БЛОКИРОВОК ВЫДАЧИ ОПЫТА -
+
     @staticmethod
-    def check_channel(channel_id: int) -> bool:
+    def check_blocked_channels(channel_id: int) -> bool:
         if channel_id in data.blocked_channels_id:
             return True
         return False
+
+    @staticmethod
+    def check_blocked_roles(roles: list[discord.Role]) -> bool:
+        blocked_roles_id = data.blocked_roles_id
+        for role in roles:
+            if role.id in blocked_roles_id:
+                return True
+        return False
+
+    @staticmethod
+    def check_blocked_users(user_id: int) -> bool:
+        if user_id in data.blocked_users_id:
+            return True
+        return False
+
+    # ------ ОБНОВЛЕНИЕ УЧАСТНИКОВ -------
 
     async def update_cube_roles(self, member: discord.Member) -> Role:
         ozernik = db.get_user_by_discord_id(member.id)
@@ -2409,7 +2965,7 @@ class KarmaSistem(commands.Cog):
 
         return member_cube_role
 
-    async def update_sansara_roles(self, member: discord.Member) -> None:
+    async def update_sansara_roles(self, member: discord.Member) -> Role:
         ozernik = db.get_user_by_discord_id(member.id)
         karma = db.get_karma(ozernik.id)
         member_status = get_status(karma)
@@ -2428,6 +2984,8 @@ class KarmaSistem(commands.Cog):
 
         return member_sansara_role
 
+    # ------------ СООБЩЕНИЯ -------------
+
     async def give_level_up_message(self, member: discord.Member, old_karma: int, new_karma: int) -> None:
         channel = self.bot.get_channel(data.karma_channel_id if data.karma_channel_id else 0)
 
@@ -2440,10 +2998,31 @@ class KarmaSistem(commands.Cog):
         old_level = get_level(old_karma)
         new_level = get_level(new_karma)
 
-        await self.update_sansara_roles(member)
-
         for level in range(old_level + 1, new_level + 1):
-            await channel.send(f"{member.mention} достиг {level} уровня!")
+            role = await self.update_sansara_roles(member)
+
+            description = get_level_up_text(level)
+            print(description)
+
+            embed = discord.Embed(
+                title=f"**{member.display_name} повысил уровень!**",
+                description=description,
+                colour=role.colour
+            )
+
+            embed.set_thumbnail(url=member.avatar.url)
+
+            embed.set_footer(text=role.guild.name, icon_url=role.guild.icon.url)
+
+            await channel.send(
+                member.mention,
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(
+                    users=True,
+                    roles=False,
+                ),
+            )
+
             await asyncio.sleep(0.2)
 
     async def give_bind_up_message(self, member_1: discord.Member, member_2: discord.Member, old_karma: int, new_karma: int) -> None:
@@ -2507,21 +3086,24 @@ class KarmaSistem(commands.Cog):
 
             match cube_name:
                 case 'Черный Куб':
-                    description = ("**Столкнись со своими демонами.**\n"
-                                   f"Теперь у вас есть {role.mention}")
+                    description = ("**«Столкнись со своими демонами»\n"
+                                   "Вы достигли 1 Черной связи.\n"
+                                   f"Теперь у вас есть {role.mention}**")
 
                 case 'Белый Куб':
-                    description = ("***«Переживи свою прошлую жизнь вновь»***\n"
-                                   "**Вы достигли 10 Белых связей.\n"
+                    description = ("**«Переживи свою прошлую жизнь вновь»\n"
+                                   "Вы достигли 10 Белых связей.\n"
                                    f"Теперь у вас есть {role.mention}**")
 
                 case 'Синий Куб':
-                    description = ("**Прошлое никогда не умирает, оно даже не прошлое.**\n"
-                                   f"**Теперь у вас есть {role.mention}**")
+                    description = ("**«Прошлое никогда не умирает, оно даже не прошлое»\n"
+                                   "Вы достигли 10 Синих связей.\n"
+                                   f"Теперь у вас есть {role.mention}**")
 
                 case 'Золотой Куб':
-                    description = ("**Воспоминания — это не только ключ к прошлому, но и к будущему.**\n"
-                                   f"**Теперь у вас есть {role.mention}**")
+                    description = ("**«Воспоминания — это не только ключ к прошлому, но и к будущему»\n"
+                                   "Вы достигли 10 Золотых связей.\n"
+                                   f"Теперь у вас есть {role.mention}**")
 
             embed = discord.Embed(
                 title=title,
@@ -2546,42 +3128,53 @@ class KarmaSistem(commands.Cog):
             tb = traceback.format_exc()
             print(f"Error in {func_name}: {tb}")
 
+    # ------------- СОБЫТИЯ --------------
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        try:
-            if message.guild is None:
-                return
+        if message.guild is None:
+            return
 
-            member = message.guild.get_member(message.author.id)
+        member = self.bot.guild.get_member(message.author.id)
 
-            if member is None:
-                return
+        if member is None:
+            return
 
-            if message.content == 'qwe':
-                print('qwe')
-                await self.give_cube_up_message(member, None, data.cube_roles['gold_cube'])
+        ozernik = self.bot.db_ensure_user(member)
 
-            ozernik = self.bot.db_ensure_user(member)
+        if message.content.startswith('qwe') and message.author.id == 512079329619083291:
+            await self.give_bind_up_message(
+                member_1=member,
+                member_2=self.bot.guild.get_member(822511700921942016),
+                old_karma=359,
+                new_karma=360,
+            )
+            return
 
-            if message.content == ',r':
-                avatar = await get_discord_avatar(member)
-                rank_card = create_rank_card(ozernik, avatar, member.display_name)
-                file = discord.File(rank_card)
-                await message.reply(file=file)
+        if message.content.startswith(',r'):
+            avatar = await get_discord_avatar(member)
 
-            if self.check_delay(ozernik.id):
-                return
+            rank_card_bytes = create_rank_card(ozernik, avatar, member.display_name)
 
-            if self.check_channel(message.channel.id):
-                return
+            file = discord.File(rank_card_bytes, filename=f"{member.name}_sansara_rank.png")
+            await message.reply(file=file, allowed_mentions=discord.AllowedMentions(replied_user=False))
+            return
 
-            old_karma, new_karma = db.add_karma(ozernik.id, 1, True)
+        if self.check_delay(ozernik.id): # Проверка кулдауна
+            return
 
-            await self.give_level_up_message(member, old_karma.karma, new_karma.karma)
-        except Exception:
-            func_name = inspect.currentframe().f_code.co_name
-            tb = traceback.format_exc()
-            print(f"Error in {func_name}: {tb}")
+        if self.check_blocked_channels(message.channel.id): # Проверка заблокирован ли канал
+            return
+
+        if self.check_blocked_roles(message.author.roles):
+            print('blocked')
+            return
+
+        print('not blocked')
+
+        old_karma, new_karma = db.add_karma(ozernik.id, 1, True)
+
+        await self.give_level_up_message(member, old_karma.karma, new_karma.karma)
 
     @tasks.loop(seconds=5)
     async def voice_karma_check(self):
@@ -2594,91 +3187,204 @@ class KarmaSistem(commands.Cog):
                 if not members:
                     continue
 
-                print(channel.name)
-
                 for user_1, user_2 in combinations(members, 2):
                     ozernik_1 = self.bot.db_ensure_user(user_1)
                     ozernik_2 = self.bot.db_ensure_user(user_2)
 
+                    ozernik_1_old_cube = get_cube_status(ozernik_1.id)
+                    ozernik_2_old_cube = get_cube_status(ozernik_2.id)
+
                     bind = db.add_bind_karma(ozernik_1.id, ozernik_2.id, karma=1)
-                    print("    ", user_1.name, user_2.name, bind.bind_karma)
 
                     await self.give_bind_up_message(user_1, user_2, bind.bind_karma - 1, bind.bind_karma)
+
+                    ozernik_1_new_cube = get_cube_status(ozernik_1.id)
+                    ozernik_2_new_cube = get_cube_status(ozernik_2.id)
+
+                    await self.give_cube_up_message(user_1, ozernik_1_old_cube, ozernik_1_new_cube)
+                    await self.give_cube_up_message(user_2, ozernik_2_old_cube, ozernik_2_new_cube)
+
         except Exception:
             func_name = inspect.currentframe().f_code.co_name
             tb = traceback.format_exc()
             print(f"Error in {func_name}: {tb}")
 
-    # Команды
+    @voice_karma_check.error
+    async def update_something_error(self, error):
+        log_error("update_something", error)
+
+    @tasks.loop()
+    async def weekly_countdown(self):
+        now = datetime.now(timezone.utc).astimezone(self.bot.moscow_tz)
+
+        next_week = (now + timedelta(days=7 - now.weekday())).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        remaining = next_week - now
+
+        print(
+            f"До конца недели осталось: "
+            f"{remaining.days} дн. "
+            f"{remaining.seconds // 3600} ч. "
+            f"{remaining.seconds % 3600 // 60} мин."
+        )
+
+        await asyncio.sleep(remaining.total_seconds())
+
+        leaderboard = db.get_top_weekly_karma()[:3]
+
+        winner_1 = leaderboard[0]
+        winner_2 = leaderboard[1]
+        winner_3 = leaderboard[2]
+
+        view = discord.ui.LayoutView()
+
+        container = discord.ui.Container()
+
+        container.add_item(discord.ui.TextDisplay(
+            f'# Победители Недели!\n'
+            f'## 1. <@{winner_1[0].discord_id}> — `{winner_1[1].weekly_karma}` к.\n'
+            f'## 2. <@{winner_2[0].discord_id}> — `{winner_2[1].weekly_karma}` к.\n'
+            f'## 3. <@{winner_3[0].discord_id}> — `{winner_3[1].weekly_karma}` к.\n'
+        ))
+
+        view.add_item(container)
+
+        channel = self.bot.get_channel(data.karma_channel_id if data.karma_channel_id else 0)
+
+        if not channel:
+            return
+
+        await channel.send(view=view)
+
+        db.reset_weekly_karma()
+
+
+    # ------------- КОМАНДЫ --------------
+
     @app_commands.command(name='settings_karma', description='Настройка системы Кармы.')
     @app_commands.guilds(config.GUILD_ID)
     async def settings_karma(self, interaction: Interaction):
-        try:
-            # if not interaction.user.guild_permissions.administrator:
-            #     await interaction.response.send_message(
-            #         "Только для Администраторов.",
-            #         ephemeral=True
-            #     )
-            #     return
+        # if not interaction.user.guild_permissions.administrator:
+        #     await interaction.response.send_message(
+        #         "Только для Администраторов.",
+        #         ephemeral=True
+        #     )
+        #     return
 
-            view = MainSettingsView(interaction.user)
+        navigator = Navigator(SettingsMainPage, author=interaction.user, bot=self.bot)
 
-            await interaction.response.send_message(view=view)
-            view.message = await interaction.original_response()
-        except Exception as e:
-            func_name = inspect.currentframe().f_code.co_name
-            tb = traceback.format_exc()
-            print(f"Error in {func_name}: {tb}")
-            await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
+        await navigator.send(interaction)
 
     @app_commands.command(name='rank_sansara', description='Просмотр ранга Сансары.')
     @app_commands.guilds(config.GUILD_ID)
     async def rank_sansara(self, interaction: Interaction, user: discord.Member = None):
-        try:
-            if user is None:
-                user = interaction.user
-            ozernik = db.get_user_by_discord_id(user.id)
+        if user is None:
+            user = interaction.user
+        ozernik = db.get_user_by_discord_id(user.id)
 
-            avatar = await get_discord_avatar(user)
+        avatar = await get_discord_avatar(user)
 
-            rank_card_bytes = create_rank_card(ozernik, avatar, user.display_name)
+        rank_card_bytes = create_rank_card(ozernik, avatar, user.display_name)
 
-            file = discord.File(rank_card_bytes, filename=f"{user.name}_sansara_rank.png")
+        file = discord.File(rank_card_bytes, filename=f"{user.name}_sansara_rank.png")
 
-            await interaction.response.send_message(file=file)
-        except Exception as e:
-            func_name = inspect.currentframe().f_code.co_name
-            tb = traceback.format_exc()
-            print(f"Error in {func_name}: {tb}")
-            await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
+        await interaction.response.send_message(file=file)
 
     @app_commands.command(name='rank_cube', description='Просмотр ранга Куба.')
     @app_commands.guilds(config.GUILD_ID)
     async def rank_cube(self, interaction: Interaction, user: discord.Member = None):
-        try:
-            await interaction.response.defer()
-            if user is None:
-                user = interaction.user
-            ozernik = db.get_user_by_discord_id(user.id)
+        await interaction.response.defer()
+        if user is None:
+            user = interaction.user
+        ozernik = db.get_user_by_discord_id(user.id)
 
-            avatar = await get_discord_avatar(user)
-            full_binds = await get_full_binds(user)
+        avatar = await get_discord_avatar(user)
+        full_binds = await get_full_binds(user, self.bot)
 
-            rank_card_bytes = create_cube_cart(
-                ozernik,
-                avatar,
-                user.display_name,
-                full_binds,
-            )
+        rank_card_bytes = create_cube_cart(
+            ozernik,
+            avatar,
+            user.display_name,
+            full_binds,
+        )
 
-            file = discord.File(rank_card_bytes, filename=f"{user.name}_cube_rank.png")
+        file = discord.File(rank_card_bytes, filename=f"{user.name}_cube_rank.png")
 
-            await interaction.followup.send(file=file)
-        except Exception as e:
-            func_name = inspect.currentframe().f_code.co_name
-            tb = traceback.format_exc()
-            print(f"Error in {func_name}: {tb}")
-            await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
+        await interaction.followup.send(file=file)
+
+    @app_commands.command(name='leaderboard', description='Просмотр ранга Куба.')
+    @app_commands.guilds(config.GUILD_ID)
+    async def leaderboard(self, interaction: Interaction):
+        leaderboard = db.get_top_karma()
+        if not leaderboard:
+            await interaction.response.send_message('Нет таблицы лидеров.', ephemeral=True)
+
+        embed = discord.Embed(
+            title='Таблица лидеров',
+            colour=interaction.user.top_role.colour,
+        )
+
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+
+        lines = ['*Ментальное здоровье и рыбалка.*']
+
+        for n, (ozernik, karma) in enumerate(leaderboard[:10], 1):
+            level = get_level(karma.karma)
+            next_level_karma = get_karma(level + 1)
+
+            lines.append('')
+            lines.append(f'**#{n} <:cigar:1553555007331368991> <@{ozernik.discord_id}>**\n'
+                         f'ㅤ  Уровень: `{level}`\n'
+                         f'ㅤ  Карма: `{karma.karma}/{next_level_karma}`')
+
+        embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
+
+        await interaction.response.send_message(
+            embed=embed
+        )
+
+    @app_commands.command(name='leaderboard_weekly', description='Просмотр ранга Куба.')
+    @app_commands.guilds(config.GUILD_ID)
+    async def leaderboard_weekly(self, interaction: Interaction):
+        leaderboard = db.get_top_weekly_karma()
+        if not leaderboard:
+            await interaction.response.send_message('Нет недельной таблицы лидеров.', ephemeral=True)
+
+        embed = discord.Embed(
+            title='Таблица лидеров',
+            colour=interaction.user.top_role.colour,
+        )
+
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+
+        lines = ['*Место для опустошения разума, \nразмышлений о прошлом и будущем.*']
+
+        for n, (ozernik, karma) in enumerate(leaderboard[:10], 1):
+            level = get_level(karma.karma)
+            next_level_karma = get_karma(level + 1)
+
+            lines.append('')
+            lines.append(f'**#{n} <:cigar:1553555007331368991> <@{ozernik.discord_id}>**\n'
+                         f'ㅤ  Уровень: `{level}`\n'
+                         f'ㅤ  Карма: `{karma.karma}/{next_level_karma}`')
+
+        embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
+
+        await interaction.response.send_message(
+            embed=embed
+        )
+
+    @app_commands.command(name='tessst', description='Тест.')
+    @app_commands.guilds(config.GUILD_ID)
+    async def tessst(self, interaction: Interaction):
+        await interaction.response.defer(thinking=False)
+        await self.weekly_countdown()
+
 
 async def setup(bot):
     await bot.add_cog(KarmaSistem(bot))

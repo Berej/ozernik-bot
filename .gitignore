@@ -6,7 +6,6 @@ base*
 
 *.db
 **.json
-**/temp/
 **test.py
 
 token.txt

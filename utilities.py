@@ -1,11 +1,14 @@
 import json
 import os
+import traceback
+
+import discord
+import asyncio
 from threading import Lock
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 import sqlite3
-from typing import Literal
-from PIL import Image
+from collections.abc import MutableMapping
 
 class JsonWorker:
     def __init__(self, path: str):
@@ -46,6 +49,58 @@ class DataWorker(JsonWorker):
 
         self._data[name] = value
         self._commit_data()
+
+class NewDataWorker(JsonWorker, MutableMapping):
+    def __init__(self, path: str, setup: dict | None = None):
+        super().__init__(path)
+
+        self._commit_event = asyncio.Event()
+        self._commit_task = asyncio.create_task(
+            self._commit_worker()
+        )
+
+        if setup:
+            self._data.update({**setup, **self._data})
+            self._commit()
+
+    async def _commit_worker(self):
+        try:
+            while True:
+                await self._commit_event.wait()
+                self._commit_event.clear()
+
+                await asyncio.to_thread(self._commit_data)
+
+        except asyncio.CancelledError:
+            raise
+
+    def _commit(self):
+        self._commit_event.set()
+
+    async def close(self):
+        self._commit_task.cancel()
+
+        try:
+            await self._commit_task
+        except asyncio.CancelledError:
+            pass
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __setitem__(self, key, value):
+        self._data[key] = value
+        self._commit()
+
+    def __delitem__(self, key):
+        del self._data[key]
+        self._commit()
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
 
 class BridgeStorage:
     """
@@ -925,14 +980,15 @@ class KarmaDatabase(Database):
         rows = self.fetchall("""
             SELECT users.*,
                    karma.user_id,
+                   karma.status,
                    karma.karma,
                    karma.gift_karma,
                    karma.weekly_karma
             FROM users
             JOIN karma ON karma.user_id = users.id
             ORDER BY karma.karma DESC,
-                     users.id ASC
-        """, (limit, offset))
+                     users.id DESC
+        """)
 
         return [(DataTypes.Ozernik(row), DataTypes.Karma(row)) for row in rows]
 
@@ -950,6 +1006,7 @@ class KarmaDatabase(Database):
         rows = self.fetchall("""
             SELECT users.*,
                    karma.user_id,
+                   karma.status,
                    karma.karma,
                    karma.gift_karma,
                    karma.weekly_karma
@@ -1642,3 +1699,231 @@ class Assets:
         return files
 
 assets = Assets(Path(__file__).parent / 'assets')
+
+""" 
+Работа с discord.LayoutView. Позволяет сверстать много-вложенные сообщения без репетативной работы. 
+"""
+
+class Page:
+    title = 'None'
+
+    def __init__(self, navigator, author: discord.Member):
+        self.navigator = navigator
+        self.author = author
+
+    def build(self):
+        view = discord.ui.LayoutView(timeout=360)
+        view.interaction_check = self._interaction_check
+
+        async def on_timeout():
+            await self._on_timeout(view)
+
+        view.on_timeout = on_timeout
+
+        container = discord.ui.Container()
+        view.add_item(container)
+
+        self.build_header(container)
+        self.build_content(container)
+        self.build_footer(container)
+
+        return view
+
+    async def _interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message(
+                "Это меню принадлежит другому пользователю.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    async def _on_timeout(self, view: discord.ui.LayoutView):
+        if self.navigator.current_page != self:
+            return
+
+        for item in view.walk_children():
+            if hasattr(item, "disabled"):
+                item.disabled = True
+
+        if self.navigator.message:
+            await self.navigator.message.edit(view=view)
+
+    def build_header(self, container):
+        container.add_item(
+            discord.ui.TextDisplay(f'# {self.title}')
+        )
+
+        container.add_item(
+            discord.ui.Separator()
+        )
+
+    def build_content(self, container):
+        raise NotImplementedError
+
+    def build_footer(self, container):
+        container.add_item(
+            discord.ui.Separator()
+        )
+
+        row = discord.ui.ActionRow()
+
+        if self.navigator.can_back:
+            back_button = discord.ui.Button(
+                label="Назад",
+                style=discord.ButtonStyle.secondary
+            )
+
+            back_button.callback = self._back_callback
+
+            row.add_item(back_button)
+
+        for button in self.build_footer_buttons():
+            row.add_item(button)
+
+        if len(row.children):
+            container.add_item(row)
+
+    def build_footer_buttons(self): # noqa
+        return []
+
+    async def _back_callback(self, interaction): # noqa
+        await self.navigator.back()
+        await interaction.response.defer()
+
+    def create_confirm_button(
+            self,
+            label: str,
+            confirm_label: str,
+            action,
+    ) -> discord.ui.Button:
+
+        button = discord.ui.Button(
+            label=label,
+            style=discord.ButtonStyle.primary,
+        )
+
+        async def first_callback(interaction: discord.Interaction):
+            await interaction.response.defer()
+
+            button.label = confirm_label
+            button.style = discord.ButtonStyle.danger
+            button.callback = second_callback
+
+            await self.navigator.render()
+
+        async def second_callback(interaction: discord.Interaction):
+            await interaction.response.defer()
+
+            button.label = label
+            button.style = discord.ButtonStyle.primary
+            button.callback = first_callback
+
+            await action(interaction)
+
+            await self.navigator.render()
+
+        button.callback = first_callback
+
+        return button
+
+    async def on_open(self):
+        pass
+
+    async def on_close(self):
+        pass
+
+class Navigator:
+    def __init__(self, page, **kwargs):
+        self.history = []
+        self.current_page = page(
+            self,
+            **kwargs
+        )
+        self.message = None
+
+    @property
+    def can_back(self):
+        return bool(self.history)
+
+    async def send(self, interaction):
+        view = self.current_page.build()
+
+        await interaction.response.send_message(view=view)
+
+        self.message = await interaction.original_response()
+
+    async def push(self, page, **kwargs):
+        try:
+            await self.current_page.on_close()
+
+            self.history.append(self.current_page)
+
+            self.current_page = page(
+                self,
+                **kwargs
+            )
+
+            await self.current_page.on_open()
+
+            await self.render()
+        except Exception as e:
+            print(e)
+            print(traceback.format_exc())
+
+    async def back(self):
+        if not self.history:
+            return
+
+        await self.current_page.on_close()
+
+        self.current_page = self.history.pop()
+
+        await self.current_page.on_open()
+
+        await self.render()
+
+    async def render(self):
+        view = self.current_page.build()
+
+        await self.message.edit(
+            view=view
+        )
+
+    async def close(self):
+        await self.current_page.on_close()
+        await self.message.delete()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
