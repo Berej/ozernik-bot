@@ -3158,10 +3158,7 @@ class KarmaSistem(commands.Cog):
             return
 
         if self.check_blocked_roles(message.author.roles):
-            print('blocked')
             return
-
-        print('not blocked')
 
         old_karma, new_karma = db.add_karma(ozernik.id, 1, True)
 
