@@ -54,6 +54,7 @@ class Panel(commands.Cog):
                 case 'load':
                     print(f"Загружается модуль: {module_name}")
                     await self.bot.load_extension(module)
+                    config.module_on(module)
                     await interaction.followup.send(f"Загружен модуль: {module_name}")
                     print(f"Загружен модуль: {module_name}")
                 case _:
