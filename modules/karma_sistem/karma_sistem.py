@@ -3338,7 +3338,7 @@ class KarmaSistem(commands.Cog):
             next_level_karma = get_karma(level + 1)
 
             lines.append('')
-            lines.append(f'**#{n} <:cigar:1553555007331368991> <@{ozernik.discord_id}>**\n'
+            lines.append(f'**#{n} <:cigar:1208007437639225415> <@{ozernik.discord_id}>**\n'
                          f'ㅤ  Уровень: `{level}`\n'
                          f'ㅤ  Карма: `{karma.karma}/{next_level_karma}`')
 
@@ -3369,9 +3369,9 @@ class KarmaSistem(commands.Cog):
             next_level_karma = get_karma(level + 1)
 
             lines.append('')
-            lines.append(f'**#{n} <:cigar:1553555007331368991> <@{ozernik.discord_id}>**\n'
+            lines.append(f'**#{n} <:cigar:1208007437639225415> <@{ozernik.discord_id}>**\n'
                          f'ㅤ  Уровень: `{level}`\n'
-                         f'ㅤ  Карма: `{karma.karma}/{next_level_karma}`')
+                         f'ㅤ  Карма: `{karma.weekly_karma}/{next_level_karma}`')
 
         embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
 
