@@ -21,7 +21,6 @@ class RsnConfig:
         "admin_role_ids": [],
         "moderator_role_ids": [],
         "mute_role_id": 0,
-        "full_mute_role_id": 0,
         "scale_max": 50,
         "scale_thresholds": {
             "isolator": [31, 50],
@@ -114,12 +113,6 @@ class RsnConfig:
     def set_mute_role_id(self, role_id: int):
         self.set("mute_role_id", role_id)
 
-    def get_full_mute_role_id(self) -> int:
-        return self.get("full_mute_role_id", 0)
-
-    def set_full_mute_role_id(self, role_id: int):
-        self.set("full_mute_role_id", role_id)
-
     # Scale settings
     def get_scale_max(self) -> int:
         return self.get("scale_max", 50)
@@ -172,8 +165,3 @@ class RsnConfig:
         """Установить timestamp последнего еженедельного начисления."""
         self.set("last_weekly_gain_timestamp", timestamp)
 
-    def is_admin_or_mod(self, user_id: int) -> bool:
-        """Проверить, админ ли или модератор."""
-        admin_ids = self.get_admin_role_ids()
-        mod_ids = self.get_moderator_role_ids()
-        return user_id in admin_ids or user_id in mod_ids
