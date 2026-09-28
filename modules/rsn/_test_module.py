@@ -9,8 +9,8 @@ from pathlib import Path
 def test_imports():
     """Test that all modules can be imported."""
     try:
-        from rsn_db import RsnDatabase
-        from rsn_config import RsnConfig
+        from _rsn_db import RsnDatabase
+        from _rsn_config import RsnConfig
         print("✓ Imports successful")
         return True
     except Exception as e:
@@ -21,7 +21,7 @@ def test_db_init():
     """Test database initialization."""
     try:
         import tempfile
-        from rsn_db import RsnDatabase
+        from _rsn_db import RsnDatabase
         
         with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
             db_path = f.name
@@ -43,6 +43,16 @@ def test_db_init():
         db.set_active(12345, 1)
         score = db.get_score(12345)
         assert score['active'] == 1
+
+        # Test record + timer (active punishment) operations
+        record_id = db.create_record(12345, "mute", "test", 1.5, -5, 999)
+        assert record_id > 0
+        db.create_or_update_punishment(12345, "mute", 0, record_id)
+        active = db.get_active_punishment(12345)
+        assert active is not None and active['kind'] == 'mute'
+        assert db.get_expired_punishments()
+        db.delete_active_punishment(12345)
+        assert db.get_active_punishment(12345) is None
         
         db.close()
         Path(db_path).unlink()
@@ -56,7 +66,7 @@ def test_config_init():
     """Test configuration initialization."""
     try:
         import tempfile
-        from rsn_config import RsnConfig
+        from _rsn_config import RsnConfig
         
         with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
             config_path = f.name
@@ -90,7 +100,7 @@ def test_syntax():
     try:
         import ast
         
-        for module_file in ['rsn_db.py', 'rsn_config.py', 'rsn.py']:
+        for module_file in ['_rsn_db.py', '_rsn_config.py', 'rsn.py']:
             with open(module_file) as f:
                 ast.parse(f.read())
         

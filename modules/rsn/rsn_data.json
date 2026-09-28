@@ -5,7 +5,6 @@
   "admin_role_ids": [725675581881974794],
   "moderator_role_ids": [779015800555176006],
   "mute_role_id": 1168293205624766524,
-  "full_mute_role_id": 1550578606521188502,
   "scale_max": 50,
   "scale_thresholds": {
     "isolator": [
@@ -28,5 +27,6 @@
     "critical": 3
   },
   "weekly_point_gain": 1,
-  "reset_points_on_return": 10
+  "reset_points_on_return": 10,
+  "last_weekly_gain_timestamp": 0
 }

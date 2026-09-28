@@ -7,6 +7,7 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from config import config as cfg
+import re
 import traceback
 import time
 import asyncio
@@ -23,25 +24,12 @@ CASES_PER_PAGE = 5
 MAX_REASON_LENGTH = 100
 INTERACTION_TIMEOUT = 180
 
-ADMIN_ROLE_ID = 725675581881974794
-MOD_ROLE_ID = 779015800555176006
-
 # ==================== INITIALIZATION: Hardcoded Configuration ====================
 # Замени значения ниже на свои IDs/параметры
 # ИЗМЕНЯЙ ТОЛЬКО ЭТИ ЗНАЧЕНИЯ для настройки модуля
+# Роли админов/модераторов берутся из modules/rsn/rsn_data.json
 
-# === ROLE IDs ===
-MUTE_ROLE_ID = 1168293205624766524
-FULL_MUTE_ROLE_ID = 1550578606521188502
-# ADMIN_ROLE_ID = 725675581881974794  # Already defined above
-# MOD_ROLE_ID = 779015800555176006  # Already defined above
-ADMIN_ROLE_IDS = []  # Additional admin role IDs
-MODERATOR_ROLE_IDS = []  # Additional moderator role IDs
-
-# === CHANNEL IDs ===
-LOG_CHANNEL_ID = 1545525361872208032 
-ADMIN_NOTIFY_CHANNEL_ID = 791758756392337409 
-EXPORT_CHANNEL_ID = 1545525361872208032 
+# === CHANNEL IDs (берутся из modules/rsn/rsn_data.json) ===
 
 # === SYSTEM PARAMETERS ===
 SCALE_MAX = 50  # Maximum points
@@ -73,6 +61,61 @@ def get_multiplier_for_points(points: int) -> int:
         return DURATION_MULTIPLIER["critical"]
     else:
         return DURATION_MULTIPLIER["critical"]
+
+
+# === DURATION PARSING (minutes / hours only) ===
+DURATION_PATTERN = re.compile(r"^\s*(\d+)\s*([mh])\s*$", re.IGNORECASE)
+MIN_DURATION_MINUTES = 1
+MAX_DURATION_MINUTES = 525600  # 1 year safety cap
+
+DURATION_FORMAT_HINT = (
+    "❌ Неверный формат длительности. Укажите минуты или часы, "
+    "например `30m` или `2h` (значение должно быть положительным)."
+)
+
+
+def parse_duration(text: Optional[str]) -> Optional[int]:
+    """
+    Разобрать длительность в формате "30m" (минуты) или "2h" (часы).
+
+    - Только целые положительные значения.
+    - Только минуты (m) или часы (h), регистр не важен.
+    - Возвращает количество минут или None, если формат неверный.
+    """
+    if not isinstance(text, str):
+        return None
+
+    match = DURATION_PATTERN.match(text)
+    if not match:
+        return None
+
+    value = int(match.group(1))
+    unit = match.group(2).lower()
+
+    if value <= 0:
+        return None
+
+    minutes = value if unit == "m" else value * 60
+    if minutes < MIN_DURATION_MINUTES or minutes > MAX_DURATION_MINUTES:
+        return None
+
+    return minutes
+
+
+def format_duration(hours: Optional[float]) -> str:
+    """Сформатировать длительность (в часах) как "30м", "2ч" или "1ч 30м"."""
+    if not hours:
+        return "Перманент"
+
+    minutes = int(round(hours * 60))
+    if minutes < 60:
+        return f"{minutes}м"
+
+    whole_hours, rest_minutes = divmod(minutes, 60)
+    if rest_minutes == 0:
+        return f"{whole_hours}ч"
+    return f"{whole_hours}ч {rest_minutes}м"
+
 
 # ==================== END INITIALIZATION ====================
 
@@ -127,11 +170,7 @@ class CaseViewPagination(discord.ui.View):
             if len(record["reason"]) > MAX_REASON_LENGTH:
                 reason += "..."
             
-            duration_str = (
-                f"{record['duration_hours']}h"
-                if record['duration_hours']
-                else "Перманент"
-            )
+            duration_str = format_duration(record['duration_hours'])
             
             created_dt = datetime.fromtimestamp(
                 record['created_at'],
@@ -192,99 +231,143 @@ class RsnCog(commands.Cog):
 
     @commands.Cog.listener("on_ready")
     async def _cleanup_expired_on_startup(self):
-        """Очистить истёкшие наказания при загрузке бота (максимум 1 раз).
-        
-        Проверяет все активные наказания и удаляет истёкшие роли мута,
-        даже если бот был выключен во время наказания.
+        """Обработать наказания, истёкшие пока бот был выключен (максимум 1 раз).
+
+        Модерация выполняется вручную: бот только фиксирует окончание срока,
+        уведомляет модераторов и отправляет ЛС пользователю.
         """
         # Флаг для однократного выполнения за сеанс бота
         if not hasattr(self, '_startup_cleanup_done'):
             self._startup_cleanup_done = False
-        
+
         if self._startup_cleanup_done:
             return
-        
+
         self._startup_cleanup_done = True
-        
+
         try:
             print("[RSN] Starting expired punishments cleanup on bot startup...")
-            
-            guild = self.bot.get_guild(GUILD_ID)
-            if not guild:
-                print("[RSN] Guild not found for startup cleanup")
+            expired = self.db.get_expired_punishments()
+            if not expired:
+                print("[RSN] No expired punishments found on startup")
                 return
-            
-            # Получить все активные наказания
-            cursor = self.db.conn.cursor()
-            cursor.execute("SELECT * FROM rsn_active_punishments")
-            all_punishments = [dict(row) for row in cursor.fetchall()]
-            
-            if not all_punishments:
-                print("[RSN] No active punishments found")
-                return
-            
-            now_ts = int(time.time())
-            cleanup_count = 0
-            
-            for punishment in all_punishments:
-                user_id = punishment['user_id']
-                kind = punishment['kind']
-                expires_at = punishment['expires_at']
-                
-                # Пропустить наказания без срока (перманентные) или ещё активные
-                if expires_at is None or expires_at > now_ts:
-                    continue
-                
-                print(f"[RSN] Found expired {kind} punishment for user {user_id}")
-                
-                # Пытаемся получить пользователя и удалить роли если это мут
-                if kind == 'mute':
-                    try:
-                        member = guild.get_member(user_id)
-                        if member:
-                            # OLD: mute_role_id = self.config.get_mute_role_id()
-                            # OLD: full_mute_role_id = self.config.get_full_mute_role_id()
-                            mute_role_id = MUTE_ROLE_ID
-                            full_mute_role_id = FULL_MUTE_ROLE_ID
-                            
-                            if mute_role_id:
-                                mute_role = guild.get_role(mute_role_id)
-                                if mute_role and mute_role in member.roles:
-                                    try:
-                                        await member.remove_roles(mute_role)
-                                        print(f"[RSN] Removed mute role from user {user_id} during startup cleanup")
-                                    except Exception as e:
-                                        print(f"[RSN] Failed to remove mute role from {user_id}: {e}")
-                            
-                            if full_mute_role_id:
-                                full_mute_role = guild.get_role(full_mute_role_id)
-                                if full_mute_role and full_mute_role in member.roles:
-                                    try:
-                                        await member.remove_roles(full_mute_role)
-                                        print(f"[RSN] Removed full mute role from user {user_id} during startup cleanup")
-                                    except Exception as e:
-                                        print(f"[RSN] Failed to remove full mute role from {user_id}: {e}")
-                        else:
-                            print(f"[RSN] Member {user_id} not found in guild for mute removal during startup")
-                    except Exception as e:
-                        print(f"[RSN] Error processing mute cleanup for user {user_id}: {e}")
-                
-                elif kind == 'ban':
-                    try:
-                        await guild.unban(discord.Object(id=user_id))
-                        print(f"[RSN] Unbanned user {user_id} during startup cleanup")
-                    except Exception as e:
-                        print(f"[RSN] Failed to unban user {user_id}: {e}")
-                
-                # Удалить из активных наказаний
-                self.db.delete_active_punishment(user_id)
-                cleanup_count += 1
-            
-            print(f"[RSN] Startup cleanup completed: {cleanup_count} expired punishments processed")
-            
-        except Exception as e:
+
+            for punishment in expired:
+                await self._process_expired_punishment(punishment)
+
+            print(f"[RSN] Startup cleanup completed: {len(expired)} expired punishments processed")
+
+        except Exception:
             print(f"[RSN] Error during startup cleanup: {traceback.format_exc()}")
 
+    async def _send_dm(self, user_id: int, text: str):
+        """Отправить ЛС пользователю (best-effort)."""
+        try:
+            dm_user = await self.bot.fetch_user(user_id)
+            dm = await dm_user.create_dm()
+            await dm.send(text)
+        except Exception as dm_error:
+            print(f"[RSN] Could not send DM to user {user_id}: {dm_error}")
+
+    async def _notify_moderators(self, text: str):
+        """Уведомить канал модерации/логов (best-effort)."""
+        channel_id = self.config.get_admin_notify_channel_id()
+        if not channel_id:
+            return
+        channel = self.bot.get_channel(channel_id)
+        if not channel:
+            return
+        try:
+            embed = discord.Embed(
+                title="⏰ Срок наказания истёк",
+                description=text,
+                color=0x8B0000,
+                timestamp=datetime.now(timezone.utc)
+            )
+            await channel.send(embed=embed)
+        except Exception as e:
+            print(f"[RSN] Error notifying moderators: {e}")
+
+    async def _remove_mute_role(self, user_id: int) -> bool:
+        """Снять роль мута с участника (best-effort). Возвращает True при успехе."""
+        mute_role_id = self.config.get_mute_role_id()
+        if not mute_role_id:
+            print("[RSN] Mute role ID is not configured")
+            return False
+
+        guild = self.bot.get_guild(GUILD_ID)
+        if not guild:
+            return False
+
+        member = guild.get_member(user_id)
+        if not member:
+            print(f"[RSN] Member {user_id} not found in guild, cannot remove mute role")
+            return False
+
+        role = guild.get_role(mute_role_id)
+        if not role:
+            print(f"[RSN] Mute role {mute_role_id} not found on guild")
+            return False
+
+        if role not in member.roles:
+            return True
+
+        try:
+            await member.remove_roles(role, reason="Срок мута истёк")
+            print(f"[RSN] Removed mute role {mute_role_id} from user {user_id}")
+            return True
+        except Exception as e:
+            print(f"[RSN] Failed to remove mute role from {user_id}: {e}")
+            return False
+
+    async def _process_expired_punishment(self, punishment: dict):
+        """Обработать истёкшее наказание.
+
+        - мут: снять роль мута (если участник на сервере) и очистить наказание;
+        - бан: снять наказание в БД, сбросить баллы и уведомить модераторов
+          (разбан выполняется вручную);
+        - отправить ЛС пользователю и залогировать действие.
+        """
+        user_id = punishment['user_id']
+        kind = punishment['kind']
+        record_id = punishment.get('record_id')
+
+        self.db.delete_active_punishment(user_id)
+
+        if kind == 'ban':
+            try:
+                self.db.set_points(user_id, RESET_POINTS_ON_RETURN)
+                print(f"[RSN] Reset points for user {user_id} to {RESET_POINTS_ON_RETURN}")
+            except Exception as points_error:
+                print(f"[RSN] Failed to reset points for {user_id}: {points_error}")
+        else:
+            # Автоматическое снятие роли мута (best-effort)
+            await self._remove_mute_role(user_id)
+
+        kind_ru = "мут" if kind == "mute" else "бан"
+        print(f"[RSN] Expired {kind} punishment for user {user_id} processed")
+
+        if kind == 'ban':
+            await self._send_dm(
+                user_id,
+                "✓ Срок вашего бана истёк. Разбан будет выполнен модератором вручную."
+            )
+            await self._notify_moderators(
+                f"Бан пользователя <@{user_id}> (`{user_id}`) истёк "
+                f"(дело #{record_id}). Разбаньте вручную."
+            )
+        else:
+            await self._send_dm(
+                user_id,
+                "✓ Срок вашего мута истёк, роль мута снята автоматически."
+            )
+
+        await self._log_action(
+            "Истечение срока наказания",
+            f"**Дело #{record_id}** | <@{user_id}> (`{user_id}`) | тип: {kind_ru}",
+            user_id,
+            self.bot.user.id if self.bot.user else 0
+        )
 
     async def _check_permissions(self, interaction: discord.Interaction) -> bool:
         """Проверить, есть ли у пользователя права администратора или модератора."""
@@ -297,10 +380,18 @@ class RsnCog(commands.Cog):
 
         user_role_ids = {role.id for role in interaction.user.roles}
 
-        has_permission = (
-            ADMIN_ROLE_ID in user_role_ids
-            or MOD_ROLE_ID in user_role_ids
+        allowed_role_ids = (
+            set(self.config.get_admin_role_ids())
+            | set(self.config.get_moderator_role_ids())
         )
+
+        if not allowed_role_ids:
+            print(
+                "[RSN] WARNING: no admin/moderator role IDs "
+                "configured in rsn_data.json"
+            )
+
+        has_permission = bool(user_role_ids & allowed_role_ids)
 
         if not has_permission:
             await interaction.response.send_message(
@@ -319,8 +410,7 @@ class RsnCog(commands.Cog):
         moderator_id: int
     ):
         """Логировать действие в log_channel_id."""
-        # OLD: channel_id = self.config.get_log_channel_id()
-        channel_id = LOG_CHANNEL_ID
+        channel_id = self.config.get_log_channel_id()
         if not channel_id:
             return
 
@@ -424,11 +514,7 @@ class RsnCog(commands.Cog):
                         except:
                             mod_name = f"ID:{record['moderator_id']}"
                         
-                        duration_str = (
-                            f"{record['duration_hours']}h"
-                            if record['duration_hours']
-                            else "Перманент"
-                        )
+                        duration_str = format_duration(record['duration_hours'])
                         created_dt = datetime.fromtimestamp(
                             record['created_at'],
                             tz=timezone.utc
@@ -651,7 +737,7 @@ class RsnCog(commands.Cog):
         record_id: int,
         reason: str,
         points_delta: int,
-        duration_hours: float
+        duration: str
     ):
         """Отредактировать запись."""
         try:
@@ -674,12 +760,14 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            if duration_hours < 0:
+            total_minutes = parse_duration(duration)
+            if total_minutes is None:
                 await interaction.response.send_message(
-                    "❌ Длительность должна быть неотрицательным числом (≥ 0).",
+                    DURATION_FORMAT_HINT,
                     ephemeral=True
                 )
                 return
+            duration_hours = total_minutes / 60
 
             # Обработать знак баллов в зависимости от типа нарушения
             if record['kind'] == 'mute':
@@ -744,19 +832,10 @@ class RsnCog(commands.Cog):
             user_id = record['user_id']
             self.db.delete_record(record_id)
 
-            # Проверить активный мут и удалить роль если мута нет
-            member = interaction.guild.get_member(user_id)
-            if member:
-                active_punishment = self.db.get_active_punishment(user_id)
-                if not active_punishment or active_punishment['kind'] != 'mute':
-                    # Нет активного мута - убрать роль
-                    mute_role = interaction.guild.get_role(self.config.get_mute_role_id())
-                    if mute_role and mute_role in member.roles:
-                        try:
-                            await member.remove_roles(mute_role)
-                            print(f"[RSN] Removed mute role from user {user_id}")
-                        except Exception as role_error:
-                            print(f"[RSN] Failed to remove mute role: {role_error}")
+            # Если активного мута больше нет — снять роль мута (best-effort)
+            active_punishment = self.db.get_active_punishment(user_id)
+            if not active_punishment or active_punishment['kind'] != 'mute':
+                await self._remove_mute_role(user_id)
 
             embed = discord.Embed(
                 title="✓ Запись удалена",
@@ -789,7 +868,7 @@ class RsnCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         user: discord.User,
-        duration_hours: float,
+        duration: str,
         reason: str,
         points: int
     ):
@@ -815,10 +894,11 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            # Валидация времени наказания
-            if duration_hours < 1.0:
+            # Валидация времени наказания (минуты/часы, только положительные)
+            total_minutes = parse_duration(duration)
+            if total_minutes is None:
                 await interaction.response.send_message(
-                    "❌ Минимальная длительность наказания — 1 час.",
+                    DURATION_FORMAT_HINT,
                     ephemeral=True
                 )
                 return
@@ -831,11 +911,36 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            # Получить члена сервера
+            # Получить участника сервера (для выдачи роли мута)
             member = interaction.guild.get_member(user.id)
             if not member:
                 await interaction.response.send_message(
                     f"❌ {user.mention} не найден на сервере.",
+                    ephemeral=True
+                )
+                return
+
+            # Получить роль мута из конфига
+            mute_role_id = self.config.get_mute_role_id()
+            if not mute_role_id:
+                await interaction.response.send_message(
+                    "❌ Роль мута не настроена (mute_role_id в rsn_data.json).",
+                    ephemeral=True
+                )
+                return
+
+            mute_role = interaction.guild.get_role(mute_role_id)
+            if not mute_role:
+                await interaction.response.send_message(
+                    f"❌ Роль мута с ID `{mute_role_id}` не найдена на сервере.",
+                    ephemeral=True
+                )
+                return
+
+            # Проверить иерархию ролей бота
+            if mute_role >= interaction.guild.me.top_role:
+                await interaction.response.send_message(
+                    "❌ Не удалось выдать мут: роль мута выше роли бота.",
                     ephemeral=True
                 )
                 return
@@ -848,10 +953,23 @@ class RsnCog(commands.Cog):
             # OLD: multiplier = self.config.get_multiplier_for_points(current_points)
             multiplier = get_multiplier_for_points(current_points)
 
-            # Итоговая длительность
-            actual_duration = duration_hours * multiplier
-            expires_at = int(time.time()) + (int(actual_duration * 3600))
-            print(f"[RSN] Mute calculation: duration={duration_hours}h, multiplier={multiplier}, actual={actual_duration}h, expires_at={expires_at}")
+            # Итоговая длительность (целочисленная арифметика в минутах)
+            actual_minutes = total_minutes * multiplier
+            actual_duration = actual_minutes / 60
+            expires_at = int(time.time()) + (actual_minutes * 60)
+            print(f"[RSN] Mute calculation: duration={total_minutes}m, multiplier={multiplier}, actual={actual_minutes}m, expires_at={expires_at}")
+
+            # Выдать роль мута (реальная модерация)
+            try:
+                await member.add_roles(mute_role, reason=reason)
+                print(f"[RSN] Assigned mute role {mute_role_id} to user {user.id}")
+            except Exception:
+                print(f"[RSN] Failed to assign mute role to {user.id}: {traceback.format_exc()}")
+                await interaction.response.send_message(
+                    "❌ Не удалось выдать роль мута. Проверьте права бота.",
+                    ephemeral=True
+                )
+                return
 
             # Списать баллы (с валидацией диапазона)
             new_points = current_points - points
@@ -870,66 +988,9 @@ class RsnCog(commands.Cog):
                 moderator_id=interaction.user.id
             )
 
-            # Выдать роль мута
-            # OLD: mute_role_id = self.config.get_mute_role_id()
-            mute_role_id = MUTE_ROLE_ID
-            print(f"[RSN] Assigning mute role - User ID: {user.id}, Role ID: {mute_role_id}, Member: {member}")
-            if mute_role_id:
-                mute_role = interaction.guild.get_role(mute_role_id)
-                print(f"[RSN] Mute role object retrieved: {mute_role} (found: {mute_role is not None})")
-                if mute_role:
-                    try:
-                        await member.add_roles(mute_role, reason=reason)
-                        print(f"[RSN] ✓ Successfully assigned mute role to user {user.id}")
-                    except Exception as role_error:
-                        print(f"[RSN] ✗ ERROR assigning mute role to user {user.id}: {role_error}")
-                else:
-                    print(f"[RSN] ✗ Mute role not found on guild. Role ID: {mute_role_id}")
-            else:
-                print(f"[RSN] ✗ Mute role ID not configured in config")
-
-            # Если множитель > 1, выдать дополнительный полный мут
-            if multiplier > 1:
-                # OLD: full_mute_role_id = self.config.get_full_mute_role_id()
-                full_mute_role_id = FULL_MUTE_ROLE_ID
-                print(f"[RSN] Multiplier > 1, assigning full mute - User ID: {user.id}, Role ID: {full_mute_role_id}")
-                if full_mute_role_id:
-                    full_mute_role = interaction.guild.get_role(full_mute_role_id)
-                    print(f"[RSN] Full mute role object retrieved: {full_mute_role} (found: {full_mute_role is not None})")
-                    if full_mute_role:
-                        try:
-                            await member.add_roles(full_mute_role, reason=reason)
-                            print(f"[RSN] ✓ Successfully assigned full mute role to user {user.id}")
-                        except Exception as role_error:
-                            print(f"[RSN] ✗ ERROR assigning full mute role to user {user.id}: {role_error}")
-                    else:
-                        print(f"[RSN] ✗ Full mute role not found on guild. Role ID: {full_mute_role_id}")
-                else:
-                    print(f"[RSN] ✗ Full mute role ID not configured in config")
-
-            # Если баллы <= ban_trigger (0), выдать перманентный полный мут
-            # OLD: ban_trigger = self.config.get_scale_thresholds().get("ban_trigger", 0)
+            # Если баллы <= ban_trigger (0), записать перманентное наказание
             ban_trigger = SCALE_THRESHOLDS.get("ban_trigger", 0)
             if new_points <= ban_trigger:
-                # OLD: full_mute_role_id = self.config.get_full_mute_role_id()
-                full_mute_role_id = FULL_MUTE_ROLE_ID
-                print(f"[RSN] Points <= ban_trigger ({new_points} <= {ban_trigger}), assigning permanent full mute - User ID: {user.id}, Role ID: {full_mute_role_id}")
-                if full_mute_role_id:
-                    full_mute_role = interaction.guild.get_role(full_mute_role_id)
-                    print(f"[RSN] Permanent full mute role object retrieved: {full_mute_role} (found: {full_mute_role is not None})")
-                    if full_mute_role and full_mute_role not in member.roles:
-                        try:
-                            await member.add_roles(full_mute_role, reason="Перманент")
-                            print(f"[RSN] ✓ Successfully assigned permanent full mute role to user {user.id}")
-                        except Exception as role_error:
-                            print(f"[RSN] ✗ ERROR assigning permanent full mute role to user {user.id}: {role_error}")
-                    elif full_mute_role in member.roles:
-                        print(f"[RSN] User {user.id} already has full mute role, skipping")
-                    else:
-                        print(f"[RSN] ✗ Permanent full mute role not found on guild. Role ID: {full_mute_role_id}")
-                else:
-                    print(f"[RSN] ✗ Full mute role ID not configured in config")
-
                 # Перманентное наказание (expires_at = None)
                 self.db.create_or_update_punishment(
                     user_id=user.id,
@@ -939,8 +1000,7 @@ class RsnCog(commands.Cog):
                 )
 
                 # Отправить уведомление в admin_notify_channel_id
-                # OLD: notify_channel_id = self.config.get_admin_notify_channel_id()
-                notify_channel_id = ADMIN_NOTIFY_CHANNEL_ID
+                notify_channel_id = self.config.get_admin_notify_channel_id()
                 if notify_channel_id:
                     notify_channel = self.bot.get_channel(notify_channel_id)
                     if notify_channel:
@@ -965,7 +1025,7 @@ class RsnCog(commands.Cog):
 
             embed = discord.Embed(
                 title="✓ Мут выдан",
-                description=f"**Дело #{record_id}**\n{user.mention}: **{actual_duration:.1f}h** (x{multiplier})\n"
+                description=f"**Дело #{record_id}**\n{user.mention}: **{format_duration(actual_duration)}** (x{multiplier})\n"
                           f"Причина: {reason}\nБаллы: {current_points} → {new_points}",
                 color=0x2F3136
             )
@@ -973,7 +1033,7 @@ class RsnCog(commands.Cog):
 
             await self._log_action(
                 "Выдача мута",
-                f"**Дело #{record_id}** | {user.mention}: {reason}\nДлит: {actual_duration:.1f}h "
+                f"**Дело #{record_id}** | {user.mention}: {reason}\nДлит: {format_duration(actual_duration)} "
                 f"(x{multiplier})\nБаллы: {current_points} → {new_points}",
                 user.id,
                 interaction.user.id
@@ -987,7 +1047,7 @@ class RsnCog(commands.Cog):
                     f"⚠️ Вам выдан мут на сервере.\n"
                     f"**Дело:** #{record_id}\n"
                     f"**Причина:** {reason}\n"
-                    f"**Длительность:** {actual_duration:.1f} часов\n"
+                    f"**Длительность:** {format_duration(actual_duration)}\n"
                     f"**Баллы:** {current_points} → {new_points}"
                 )
             except Exception as dm_error:
@@ -1015,14 +1075,6 @@ class RsnCog(commands.Cog):
             if not await self._check_permissions(interaction):
                 return
 
-            member = interaction.guild.get_member(user.id)
-            if not member:
-                await interaction.response.send_message(
-                    f"❌ {user.mention} не найден на сервере.",
-                    ephemeral=True
-                )
-                return
-
             # Получить активное наказание
             punishment = self.db.get_active_punishment(user.id)
             if not punishment:
@@ -1032,44 +1084,8 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            # Снять роли
-            # OLD: mute_role_id = self.config.get_mute_role_id()
-            # OLD: full_mute_role_id = self.config.get_full_mute_role_id()
-            mute_role_id = MUTE_ROLE_ID
-            full_mute_role_id = FULL_MUTE_ROLE_ID
-
-            print(f"[RSN] Removing mute roles - User ID: {user.id}, Mute Role ID: {mute_role_id}, Full Mute Role ID: {full_mute_role_id}")
-            if mute_role_id:
-                mute_role = interaction.guild.get_role(mute_role_id)
-                print(f"[RSN] Mute role object retrieved: {mute_role} (found: {mute_role is not None})")
-                if mute_role and mute_role in member.roles:
-                    try:
-                        await member.remove_roles(mute_role)
-                        print(f"[RSN] ✓ Successfully removed mute role from user {user.id}")
-                    except Exception as role_error:
-                        print(f"[RSN] ✗ ERROR removing mute role from user {user.id}: {role_error}")
-                elif mute_role and mute_role not in member.roles:
-                    print(f"[RSN] User {user.id} does not have mute role, skipping removal")
-                else:
-                    print(f"[RSN] ✗ Mute role not found on guild. Role ID: {mute_role_id}")
-            else:
-                print(f"[RSN] ✗ Mute role ID not configured in config")
-
-            if full_mute_role_id:
-                full_mute_role = interaction.guild.get_role(full_mute_role_id)
-                print(f"[RSN] Full mute role object retrieved: {full_mute_role} (found: {full_mute_role is not None})")
-                if full_mute_role and full_mute_role in member.roles:
-                    try:
-                        await member.remove_roles(full_mute_role)
-                        print(f"[RSN] ✓ Successfully removed full mute role from user {user.id}")
-                    except Exception as role_error:
-                        print(f"[RSN] ✗ ERROR removing full mute role from user {user.id}: {role_error}")
-                elif full_mute_role and full_mute_role not in member.roles:
-                    print(f"[RSN] User {user.id} does not have full mute role, skipping removal")
-                else:
-                    print(f"[RSN] ✗ Full mute role not found on guild. Role ID: {full_mute_role_id}")
-            else:
-                print(f"[RSN] ✗ Full mute role ID not configured in config")
+            # Снять роль мута (best-effort)
+            removed = await self._remove_mute_role(user.id)
 
             # Удалить из активных наказаний (баллы НЕ меняются)
             self.db.delete_active_punishment(user.id)
@@ -1083,7 +1099,8 @@ class RsnCog(commands.Cog):
 
             await self._log_action(
                 "Снятие мута",
-                f"{user.mention} освобожден",
+                f"{user.mention} освобожден"
+                + ("" if removed else " (роль мута не была снята)"),
                 user.id,
                 interaction.user.id
             )
@@ -1105,6 +1122,65 @@ class RsnCog(commands.Cog):
                 ephemeral=True
             )
 
+    @app_commands.command(
+        name="rsn_unban",
+        description="Зафиксировать досрочное снятие бана (вручную)"
+    )
+    @app_commands.guilds(GUILD_ID)
+    async def unban(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User,
+        reset_points: bool = True
+    ):
+        """Досрочное снятие бана: убрать активное наказание из БД (без действий в Discord)."""
+        try:
+            if not await self._check_permissions(interaction):
+                return
+
+            punishment = self.db.get_active_punishment(user.id)
+            if not punishment or punishment['kind'] != 'ban':
+                await interaction.response.send_message(
+                    f"❌ У {user.mention} нет активного бана.",
+                    ephemeral=True
+                )
+                return
+
+            self.db.delete_active_punishment(user.id)
+
+            if reset_points:
+                self.db.set_points(user.id, RESET_POINTS_ON_RETURN)
+
+            description = f"{user.mention}: освобождён"
+            if reset_points:
+                description += " | Баллы восстановлены: **" + str(RESET_POINTS_ON_RETURN) + "**"
+
+            embed = discord.Embed(
+                title="✓ Бан снят",
+                description=description,
+                color=0x2F3136
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=False)
+
+            await self._log_action(
+                "Досрочное снятие бана",
+                f"{user.mention} освобождён",
+                user.id,
+                interaction.user.id
+            )
+
+            await self._send_dm(
+                user.id,
+                "✓ Ваш бан на сервере был снят."
+            )
+
+        except Exception:
+            print(f"[RSN] Error in unban: {traceback.format_exc()}")
+            await interaction.response.send_message(
+                "❌ Ошибка при снятии бана.",
+                ephemeral=True
+            )
+
     # ===== Commands: Manual Ban Recording =====
 
     @app_commands.command(
@@ -1117,7 +1193,7 @@ class RsnCog(commands.Cog):
         interaction: discord.Interaction,
         user_id: str,
         reason: str,
-        duration_hours: Optional[float] = None,
+        duration: Optional[str] = None,
         username: Optional[str] = None
     ):
         """Записать информацию о бане в БД (по ID пользователя)."""
@@ -1136,20 +1212,26 @@ class RsnCog(commands.Cog):
             # Преобразовать строку ID в число для БД
             user_id_int = int(user_id)
 
-            # Валидация времени наказания
-            if duration_hours is not None and duration_hours < 1.0:
-                await interaction.response.send_message(
-                    "❌ Минимальная длительность наказания — 1 час.",
-                    ephemeral=True
-                )
-                return
+            # Валидация времени наказания (минуты/часы, только положительные)
+            # duration = None означает перманентное наказание
+            duration_hours = None
+            total_minutes = None
+            if duration is not None:
+                total_minutes = parse_duration(duration)
+                if total_minutes is None:
+                    await interaction.response.send_message(
+                        DURATION_FORMAT_HINT,
+                        ephemeral=True
+                    )
+                    return
+                duration_hours = total_minutes / 60
 
             # Запись в БД
             self.db.ensure_score(user_id_int)
             self.db.set_active(user_id_int, 1)
 
-            if duration_hours:
-                expires_at = int(time.time()) + (int(duration_hours * 3600))
+            if total_minutes is not None:
+                expires_at = int(time.time()) + (total_minutes * 60)
             else:
                 expires_at = None
 
@@ -1169,9 +1251,7 @@ class RsnCog(commands.Cog):
                 record_id=record_id
             )
 
-            duration_str = (
-                f"{duration_hours}h" if duration_hours else "Перманент"
-            )
+            duration_str = format_duration(duration_hours)
             user_info = f"{username} ({user_id})" if username else user_id
             embed = discord.Embed(
                 title="✓ Бан записан в БД",
@@ -1194,7 +1274,7 @@ class RsnCog(commands.Cog):
             # Отправить ЛС пользователю (best-effort)
             try:
                 user = await self.bot.fetch_user(user_id_int)
-                dm = await dm_user.create_dm()
+                dm = await user.create_dm()
                 await dm.send(
                     f"🚫 На вас наложен бан на сервере.\n"
                     f"**Дело:** #{record_id}\n"
@@ -1202,7 +1282,7 @@ class RsnCog(commands.Cog):
                     f"**Длительность:** {duration_str}"
                 )
             except Exception as dm_error:
-                print(f"[RSN] Could not send DM to user {user.id}: {dm_error}")
+                print(f"[RSN] Could not send DM to user {user_id_int}: {dm_error}")
 
         except Exception as e:
             print(f"[RSN] Error in ban_record: {traceback.format_exc()}")
@@ -1380,129 +1460,25 @@ class RsnCog(commands.Cog):
 
     @tasks.loop(minutes=3)
     async def _check_expired_punishments_task(self):
-        """Проверка и снятие истёкших наказаний каждые 3 минуты.
-        
-        Примечания:
-        - Проверяет только наказания с expires_at <= now
-        - Перманентные наказания (expires_at = NULL) не удаляются автоматически
-        - При скасании мута НЕ сбрасываются баллы
-        - При разбане баллы сбрасываются на reset_points_on_return
+        """Проверка истёкших наказаний каждые 3 минуты.
+
+        Модерация выполняется вручную: бот снимает наказание только в БД,
+        уведомляет модераторов и отправляет ЛС пользователю.
+        Перманентные наказания (expires_at = NULL) не обрабатываются.
         """
         try:
             if not self.bot.is_ready():
                 return
-            expired = self.db.get_expired_punishments()
-            if expired:
-                print(f"[RSN] Found {len(expired)} expired punishments to process")
 
-            guild = self.bot.get_guild(GUILD_ID)
-            if not guild:
-                print("[RSN] Guild not found for expired punishments check")
+            expired = self.db.get_expired_punishments()
+            if not expired:
                 return
 
+            print(f"[RSN] Found {len(expired)} expired punishments to process")
             for punishment in expired:
-                user_id = punishment['user_id']
-                kind = punishment['kind']
+                await self._process_expired_punishment(punishment)
 
-                user = self.bot.get_user(user_id)
-                member = guild.get_member(user_id) if user else None
-
-                if kind == 'mute':
-                    # === СНЯТИЕ МУТА ===
-                    if member:
-                        # OLD: mute_role_id = self.config.get_mute_role_id()
-                        # OLD: full_mute_role_id = self.config.get_full_mute_role_id()
-                        mute_role_id = MUTE_ROLE_ID
-                        full_mute_role_id = FULL_MUTE_ROLE_ID
-                        print(f"[RSN] Removing mute roles from user {user_id} - Mute Role ID: {mute_role_id}, Full Mute Role ID: {full_mute_role_id}")
-
-                        if mute_role_id:
-                            mute_role = guild.get_role(mute_role_id)
-                            print(f"[RSN] Mute role object retrieved: {mute_role} (found: {mute_role is not None})")
-                            if mute_role and mute_role in member.roles:
-                                try:
-                                    await member.remove_roles(mute_role)
-                                    print(f"[RSN] ✓ Removed mute role from user {user_id}")
-                                except Exception as role_error:
-                                    print(f"[RSN] ✗ Failed to remove mute role from {user_id}: {role_error}")
-                            elif mute_role and mute_role not in member.roles:
-                                print(f"[RSN] User {user_id} does not have mute role")
-                            else:
-                                print(f"[RSN] ✗ Mute role not found on guild. Role ID: {mute_role_id}")
-                        else:
-                            print(f"[RSN] ✗ Mute role ID not configured in config")
-
-                        if full_mute_role_id:
-                            full_mute_role = guild.get_role(full_mute_role_id)
-                            print(f"[RSN] Full mute role object retrieved: {full_mute_role} (found: {full_mute_role is not None})")
-                            if full_mute_role and full_mute_role in member.roles:
-                                try:
-                                    await member.remove_roles(full_mute_role)
-                                    print(f"[RSN] ✓ Removed full mute role from user {user_id}")
-                                except Exception as role_error:
-                                    print(f"[RSN] ✗ Failed to remove full mute role from {user_id}: {role_error}")
-                            elif full_mute_role and full_mute_role not in member.roles:
-                                print(f"[RSN] User {user_id} does not have full mute role")
-                            else:
-                                print(f"[RSN] ✗ Full mute role not found on guild. Role ID: {full_mute_role_id}")
-                        else:
-                            print(f"[RSN] ✗ Full mute role ID not configured in config")
-                    else:
-                        print(f"[RSN] Member {user_id} not found in guild for mute removal")
-
-                    # НЕ сбрасываем баллы для мута - только удаляем наказание
-                    # Отправить ЛС (best-effort)
-                    if user:
-                        try:
-                            dm_user = await self.bot.fetch_user(user.id)
-                            dm = await dm_user.create_dm()
-                            await dm.send(
-                                f"✓ Ваш мут на сервере автоматически снят (время истекло)."
-                            )
-                            print(f"[RSN] Sent unmute DM to user {user_id}")
-                        except Exception as dm_error:
-                            print(f"[RSN] Failed to send DM to {user_id}: {dm_error}")
-                    else:
-                        print(f"[RSN] User object not found for {user_id}, DM not sent")
-
-                elif kind == 'ban':
-                    # Выполнить разбан
-                    try:
-                        await guild.unban(discord.Object(id=user_id))
-                        print(f"[RSN] Successfully unbanned user {user_id}")
-                    except Exception as unban_error:
-                        print(f"[RSN] Failed to unban user {user_id}: {unban_error}")
-
-                    # Сбросить баллы на 10 (только для бана)
-                    try:
-                        # OLD: reset_points = self.config.get_reset_points_on_return()
-                        reset_points = RESET_POINTS_ON_RETURN
-                        self.db.set_points(user_id, reset_points)
-                        print(f"[RSN] Reset points for user {user_id} to {reset_points}")
-                    except Exception as points_error:
-                        print(f"[RSN] Failed to reset points for {user_id}: {points_error}")
-
-                    # Отправить ЛС (best-effort)
-                    if user:
-                        try:
-                            dm_user = await self.bot.fetch_user(user.id)
-                            dm = await dm_user.create_dm()
-                            await dm.send(
-                                f"✓ Ваш бан на сервере автоматически снят.\n"
-                                f"Баллы честности восстановлены: {reset_points}"
-                            )
-                            print(f"[RSN] Sent unban DM to user {user_id}")
-                        except Exception as dm_error:
-                            print(f"[RSN] Failed to send DM to {user_id}: {dm_error}")
-                    else:
-                        print(f"[RSN] User object not found for {user_id}, DM not sent")
-
-                # === ФИНАЛИЗАЦИЯ ===
-                # Удалить из активных наказаний
-                self.db.delete_active_punishment(user_id)
-                print(f"[RSN] Deleted active {kind} punishment for user {user_id}")
-
-        except Exception as e:
+        except Exception:
             print(f"[RSN] Error in check_expired_punishments: {traceback.format_exc()}")
 
     @_check_expired_punishments_task.before_loop
