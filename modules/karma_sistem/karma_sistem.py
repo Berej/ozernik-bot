@@ -2244,7 +2244,9 @@ class SettingsLevelUpPage(Page):
                 if error.lineno is not None:
                     explanation += f"\nСтрока: {error.lineno}"
                     lines = text.splitlines()
-                    lines.insert(error.lineno, '^' * len(lines[error.lineno]))
+                    if 1 <= error.lineno <= len(lines):
+                        # Подчёркиваем строку с ошибкой.
+                        lines.insert(error.lineno, '^' * len(lines[error.lineno - 1]))
                     text = "\n".join(lines)
 
 
@@ -2694,7 +2696,7 @@ class SettingsCubesPage(Page):
                     ephemeral=True
                 )
 
-            SettingsSansaraPage.restore_task = asyncio.create_task(restore_roles())
+            SettingsCubesPage.restore_task = asyncio.create_task(restore_roles())
         except Exception as e:
             tb = traceback.format_exc()
             print(tb)
@@ -2720,7 +2722,7 @@ class SettingsCubesPage(Page):
             self.add_item(self.text_input)
 
         async def on_submit(self, interaction: discord.Interaction):
-            if interaction.user.id in config.OWNERS_IDS:
+            if interaction.user.id not in config.OWNERS_IDS:
                 await interaction.response.send_message(
                     "Доступно только <@512079329619083291>. Согласуйте это изменение с ним или другим разработчиком Бота если Габ исчез.",
                     ephemeral=True,
@@ -2921,15 +2923,16 @@ class KarmaSistem(commands.Cog):
 
     # --------- ВСПОМОГАТЕЛЬНО -----------
 
-    async def add_delay(self, user_id: int, delay: int) -> None:
-        self.delays.add(user_id)
+    async def remove_delay(self, user_id: int, delay: int) -> None:
         await asyncio.sleep(delay)
         self.delays.discard(user_id)
 
     def check_delay(self, user_id: int) -> bool:
         if user_id in self.delays:
             return True
-        asyncio.create_task(self.add_delay(user_id, data.karma_message_delay))
+        # Кулдаун ставится сразу, чтобы два сообщения подряд не прошли оба.
+        self.delays.add(user_id)
+        asyncio.create_task(self.remove_delay(user_id, data.karma_message_delay))
         return False
 
     # - ПРОВЕРКА БЛОКИРОВОК ВЫДАЧИ ОПЫТА -
@@ -3019,9 +3022,9 @@ class KarmaSistem(commands.Cog):
                 colour=role.colour
             )
 
-            embed.set_thumbnail(url=member.avatar.url)
+            embed.set_thumbnail(url=member.display_avatar.url)
 
-            embed.set_footer(text=role.guild.name, icon_url=role.guild.icon.url)
+            embed.set_footer(text=role.guild.name, icon_url=role.guild.icon.url if role.guild.icon else None)
 
             await channel.send(
                 member.mention,
@@ -3120,9 +3123,9 @@ class KarmaSistem(commands.Cog):
                 colour=role.colour
             )
 
-            embed.set_thumbnail(url=member.avatar.url)
+            embed.set_thumbnail(url=member.display_avatar.url)
 
-            embed.set_footer(text=role.guild.name, icon_url=role.guild.icon.url)
+            embed.set_footer(text=role.guild.name, icon_url=role.guild.icon.url if role.guild.icon else None)
 
             await channel.send(
                 member.mention,
@@ -3378,13 +3381,15 @@ class KarmaSistem(commands.Cog):
         leaderboard = db.get_top_karma()
         if not leaderboard:
             await interaction.response.send_message('Нет таблицы лидеров.', ephemeral=True)
+            return
 
         embed = discord.Embed(
             title='Таблица лидеров',
             colour=interaction.user.top_role.colour,
         )
 
-        embed.set_thumbnail(url=interaction.guild.icon.url)
+        if interaction.guild.icon:
+            embed.set_thumbnail(url=interaction.guild.icon.url)
 
         lines = ['*Ментальное здоровье и рыбалка.*']
 
@@ -3409,13 +3414,15 @@ class KarmaSistem(commands.Cog):
         leaderboard = db.get_top_weekly_karma()
         if not leaderboard:
             await interaction.response.send_message('Нет недельной таблицы лидеров.', ephemeral=True)
+            return
 
         embed = discord.Embed(
             title='Таблица лидеров',
             colour=interaction.user.top_role.colour,
         )
 
-        embed.set_thumbnail(url=interaction.guild.icon.url)
+        if interaction.guild.icon:
+            embed.set_thumbnail(url=interaction.guild.icon.url)
 
         lines = ['*Место для опустошения разума, \nразмышлений о прошлом и будущем.*']
 
