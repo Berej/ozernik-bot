@@ -7,15 +7,16 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from config import config as cfg
+import json
 import re
 import traceback
 import time
 import asyncio
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 
 from ._rsn_db import RsnDatabase
-from ._rsn_config import RsnConfig
 
 GUILD_ID = cfg.GUILD_ID
 
@@ -51,7 +52,7 @@ RESET_POINTS_ON_RETURN = 10  # Points reset on unban
 def get_multiplier_for_points(points: int) -> int:
     """
     Получить множитель длительности на основе текущих баллов.
-    OLD: Was using self.config.get_multiplier_for_points()
+    OLD: Was using get_multiplier_for_points()
     """
     if points >= SCALE_THRESHOLDS["isolator"][0]:
         return DURATION_MULTIPLIER["isolator"]
@@ -119,6 +120,42 @@ def format_duration(hours: Optional[float]) -> str:
 
 # ==================== END INITIALIZATION ====================
 
+
+# === RSN CONFIG (modules/rsn/rsn_data.json) ===
+RSN_CONFIG_PATH = Path(__file__).resolve().parent / "rsn_data.json"
+
+
+def load_rsn_config() -> dict:
+    # Прочитать modules/rsn/rsn_data.json напрямую (без внешнего config-модуля)
+    try:
+        with open(RSN_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("rsn_data.json must contain a JSON object")
+        return data
+    except FileNotFoundError:
+        print(f"[RSN] Config file not found: {RSN_CONFIG_PATH}")
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[RSN] Failed to parse rsn_data.json: {e}")
+    except OSError as e:
+        print(f"[RSN] Failed to read rsn_data.json: {e}")
+    return {}
+
+
+def save_rsn_config() -> None:
+    # Сохранить настройки обратно в rsn_data.json
+    try:
+        with open(RSN_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(RSN_DATA, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        print(f"[RSN] Failed to save rsn_data.json: {e}")
+
+
+RSN_DATA = load_rsn_config()
+
+for _required_key in ("mute_role_id", "log_channel_id", "admin_notify_channel_id", "admin_role_ids", "moderator_role_ids"):
+    if not RSN_DATA.get(_required_key):
+        print(f"[RSN] WARNING: {_required_key} is not set in rsn_data.json")
 
 
 class CaseViewPagination(discord.ui.View):
@@ -215,7 +252,6 @@ class RsnCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.db = RsnDatabase()
-        self.config = RsnConfig()
         
         # Запуск фоновых задач
         self._weekly_gain_task.start()
@@ -271,7 +307,7 @@ class RsnCog(commands.Cog):
 
     async def _notify_moderators(self, text: str):
         """Уведомить канал модерации/логов (best-effort)."""
-        channel_id = self.config.get_admin_notify_channel_id()
+        channel_id = RSN_DATA.get("admin_notify_channel_id", 0)
         if not channel_id:
             return
         channel = self.bot.get_channel(channel_id)
@@ -290,7 +326,7 @@ class RsnCog(commands.Cog):
 
     async def _remove_mute_role(self, user_id: int) -> bool:
         """Снять роль мута с участника (best-effort). Возвращает True при успехе."""
-        mute_role_id = self.config.get_mute_role_id()
+        mute_role_id = RSN_DATA.get("mute_role_id", 0)
         if not mute_role_id:
             print("[RSN] Mute role ID is not configured")
             return False
@@ -381,8 +417,8 @@ class RsnCog(commands.Cog):
         user_role_ids = {role.id for role in interaction.user.roles}
 
         allowed_role_ids = (
-            set(self.config.get_admin_role_ids())
-            | set(self.config.get_moderator_role_ids())
+            set(RSN_DATA.get("admin_role_ids", []))
+            | set(RSN_DATA.get("moderator_role_ids", []))
         )
 
         if not allowed_role_ids:
@@ -410,7 +446,7 @@ class RsnCog(commands.Cog):
         moderator_id: int
     ):
         """Логировать действие в log_channel_id."""
-        channel_id = self.config.get_log_channel_id()
+        channel_id = RSN_DATA.get("log_channel_id", 0)
         if not channel_id:
             return
 
@@ -466,7 +502,7 @@ class RsnCog(commands.Cog):
                 return
 
             points = score['points']
-            scale_max = self.config.get_scale_max()
+            scale_max = RSN_DATA.get("scale_max", SCALE_MAX)
             
             # Определить цвет по диапазону
             if points >= 32:
@@ -921,7 +957,7 @@ class RsnCog(commands.Cog):
                 return
 
             # Получить роль мута из конфига
-            mute_role_id = self.config.get_mute_role_id()
+            mute_role_id = RSN_DATA.get("mute_role_id", 0)
             if not mute_role_id:
                 await interaction.response.send_message(
                     "❌ Роль мута не настроена (mute_role_id в rsn_data.json).",
@@ -950,7 +986,7 @@ class RsnCog(commands.Cog):
             current_points = score['points']
 
             # Определить множитель по ТЕКУЩИМ баллам (перед списанием)
-            # OLD: multiplier = self.config.get_multiplier_for_points(current_points)
+            # OLD: multiplier = get_multiplier_for_points(current_points)
             multiplier = get_multiplier_for_points(current_points)
 
             # Итоговая длительность (целочисленная арифметика в минутах)
@@ -1000,7 +1036,7 @@ class RsnCog(commands.Cog):
                 )
 
                 # Отправить уведомление в admin_notify_channel_id
-                notify_channel_id = self.config.get_admin_notify_channel_id()
+                notify_channel_id = RSN_DATA.get("admin_notify_channel_id", 0)
                 if notify_channel_id:
                     notify_channel = self.bot.get_channel(notify_channel_id)
                     if notify_channel:
@@ -1353,7 +1389,7 @@ class RsnCog(commands.Cog):
             filename = f"rsn_export_{now_str}.csv"
 
             # Отправить файл в export_channel_id
-            export_channel_id = self.config.get_export_channel_id()
+            export_channel_id = RSN_DATA.get("export_channel_id", 0)
             if export_channel_id:
                 export_channel = self.bot.get_channel(export_channel_id)
                 if export_channel:
@@ -1403,7 +1439,7 @@ class RsnCog(commands.Cog):
                 return
             
             # Получить timestamp последнего выполнения
-            last_gain_ts = self.config.get_last_weekly_gain_timestamp()
+            last_gain_ts = RSN_DATA.get("last_weekly_gain_timestamp", 0)
             last_gain_dt = datetime.fromtimestamp(last_gain_ts, tz=moscow_tz)
             
             # Вычислить начало текущего понедельника в 00:00
@@ -1415,8 +1451,8 @@ class RsnCog(commands.Cog):
             
             # Выполнить начисление баллов
             active_users = self.db.get_all_active_users()
-            # OLD: scale_max = self.config.get_scale_max()
-            # OLD: weekly_gain = self.config.get_weekly_point_gain()
+            # scale_max = SCALE_MAX
+            # OLD: weekly_gain = WEEKLY_POINT_GAIN
             scale_max = SCALE_MAX
             weekly_gain = WEEKLY_POINT_GAIN
 
@@ -1447,7 +1483,8 @@ class RsnCog(commands.Cog):
                 processed_count += 1
 
             # Обновить timestamp последнего выполнения
-            self.config.set_last_weekly_gain_timestamp(int(now.timestamp()))
+            RSN_DATA["last_weekly_gain_timestamp"] = int(now.timestamp())
+            save_rsn_config()
             
             print(f"[RSN] Weekly gain executed: {processed_count} users updated at {now.strftime('%Y-%m-%d %H:%M:%S MSK')}")
 
@@ -1495,7 +1532,7 @@ class RsnCog(commands.Cog):
             if now.day != 1 or now.hour != 0:
                 return
 
-            notify_channel_id = self.config.get_admin_notify_channel_id()
+            notify_channel_id = RSN_DATA.get("admin_notify_channel_id", 0)
             if notify_channel_id:
                 notify_channel = self.bot.get_channel(notify_channel_id)
                 if notify_channel:
