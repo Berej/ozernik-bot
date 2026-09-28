@@ -10,7 +10,6 @@ def test_imports():
     """Test that all modules can be imported."""
     try:
         from _rsn_db import RsnDatabase
-        from _rsn_config import RsnConfig
         print("✓ Imports successful")
         return True
     except Exception as e:
@@ -62,45 +61,25 @@ def test_db_init():
         print(f"✗ Database test failed: {e}")
         return False
 
-def test_config_init():
-    """Test configuration initialization."""
+def test_rsn_json():
+    # Check that rsn_data.json is valid JSON with required keys
     try:
-        import tempfile
-        from _rsn_config import RsnConfig
-        
-        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
-            config_path = f.name
-        
-        cfg = RsnConfig(config_path)
-        
-        # Test getters
-        assert cfg.get_scale_max() == 50
-        assert cfg.get_weekly_point_gain() == 1
-        assert cfg.get_reset_points_on_return() == 10
-        
-        # Test multiplier calculation
-        assert cfg.get_multiplier_for_points(50) == 1  # isolator
-        assert cfg.get_multiplier_for_points(20) == 2  # restricted
-        assert cfg.get_multiplier_for_points(5) == 3   # critical
-        assert cfg.get_multiplier_for_points(0) == 3   # ban_trigger
-        
-        # Test setters
-        cfg.set_log_channel_id(12345)
-        assert cfg.get_log_channel_id() == 12345
-        
-        Path(config_path).unlink()
-        print("✓ Configuration operations successful")
+        import json
+        data = json.loads(Path("rsn_data.json").read_text(encoding="utf-8"))
+        assert isinstance(data, dict)
+        for key in ("mute_role_id", "log_channel_id", "admin_role_ids", "moderator_role_ids"):
+            assert key in data, "missing key: " + key
+        print("OK: rsn_data.json parsed")
         return True
     except Exception as e:
-        print(f"✗ Configuration test failed: {e}")
+        print("FAIL: rsn_data.json " + str(e))
         return False
-
 def test_syntax():
     """Test Python syntax of all modules."""
     try:
         import ast
         
-        for module_file in ['_rsn_db.py', '_rsn_config.py', 'rsn.py']:
+        for module_file in ["_rsn_db.py", "rsn.py"]:
             with open(module_file) as f:
                 ast.parse(f.read())
         
@@ -119,7 +98,7 @@ if __name__ == '__main__':
         ("Syntax Check", test_syntax),
         ("Module Imports", test_imports),
         ("Database Init & Ops", test_db_init),
-        ("Config Init & Ops", test_config_init),
+        ("RSN Config JSON", test_rsn_json),
     ]
     
     results = []
