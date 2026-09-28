@@ -8,6 +8,7 @@ base*
 *.db
 **.json
 **test.py
+!tests/conftest.py
 
 token.txt
 test/*

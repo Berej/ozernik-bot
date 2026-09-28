@@ -8,6 +8,7 @@ from threading import Lock
 from pathlib import Path
 from typing import Any, Literal
 import sqlite3
+import time
 from collections.abc import MutableMapping
 
 class JsonWorker:
@@ -302,6 +303,7 @@ class DataTypes:
             self.status = row['status']
             self.gift_karma = row['gift_karma']
             self.weekly_karma = row['weekly_karma']
+            self.karma_updated_at = row['karma_updated_at'] # Время последнего изменения кармы в мс
 
     class KarmicBind(OzernikDataType):
         def __init__(self, row: sqlite3.Row):
@@ -326,6 +328,10 @@ class DataTypes:
             self.telegram_message_id = row['telegram_message_id']
             self.text = row['text']
             self.repeater_id = row['repeater_id']
+
+def now_ms() -> int:
+    """Текущее время в миллисекундах (Unix)."""
+    return time.time_ns() // 1_000_000
 
 class OzernikNotfound(Exception):
     """Озёрник не найден в Discord"""
@@ -365,6 +371,7 @@ class Database:
                     karma INTEGER NOT NULL DEFAULT 0,
                     gift_karma INTEGER NOT NULL DEFAULT 0,
                     weekly_karma INTEGER NOT NULL DEFAULT 0,
+                    karma_updated_at INTEGER NOT NULL DEFAULT 0,
                 
                     CHECK (
                         status IS NULL
@@ -376,6 +383,15 @@ class Database:
                         ON DELETE CASCADE
                 );
             """)
+
+            # Миграция старых баз: время последнего изменения кармы
+            # (нужно для порядка в топе при равной карме).
+            karma_columns = {row['name'] for row in self.fetchall("PRAGMA table_info(karma)")}
+            if 'karma_updated_at' not in karma_columns:
+                self.execute("""
+                    ALTER TABLE karma
+                    ADD COLUMN karma_updated_at INTEGER NOT NULL DEFAULT 0
+                """)
 
             # Логи кармы
             self.execute("""
@@ -798,10 +814,11 @@ class KarmaDatabase(Database):
             new_row = self.fetchone("""
                 UPDATE karma
                 SET karma = karma + ?,
-                    weekly_karma = weekly_karma + ?
+                    weekly_karma = weekly_karma + ?,
+                    karma_updated_at = ?
                 WHERE user_id = ?
                 RETURNING *
-            """, (karma, karma if weekly else 0, user_id))
+            """, (karma, karma if weekly else 0, now_ms(), user_id))
 
         return DataTypes.Karma(old_row), DataTypes.Karma(new_row)
 
@@ -826,10 +843,11 @@ class KarmaDatabase(Database):
                     gift_karma = MIN(
                         gift_karma,
                         MAX(karma - ?, 0)
-                    )
+                    ),
+                    karma_updated_at = ?
                 WHERE user_id = ?
                 RETURNING *
-            """, (karma, karma, user_id))
+            """, (karma, karma, now_ms(), user_id))
 
         return DataTypes.Karma(row)
 
@@ -847,10 +865,14 @@ class KarmaDatabase(Database):
         with self.transaction():
             row = self.fetchone("""
                 UPDATE karma
-                SET karma = ?
+                SET karma_updated_at = CASE
+                        WHEN karma != ? THEN ?
+                        ELSE karma_updated_at
+                    END,
+                    karma = ?
                 WHERE user_id = ?
                 RETURNING *
-            """, (karma, user_id))
+            """, (karma, now_ms(), karma, user_id))
 
         return DataTypes.Karma(row)
 
@@ -877,10 +899,11 @@ class KarmaDatabase(Database):
                 UPDATE karma
                 SET karma = karma + ?,
                     gift_karma = gift_karma + ?,
-                    weekly_karma = weekly_karma + ?
+                    weekly_karma = weekly_karma + ?,
+                    karma_updated_at = ?
                 WHERE user_id = ?
                 RETURNING *
-            """,(karma, karma, karma if weekly else 0, user_id))
+            """,(karma, karma, karma if weekly else 0, now_ms(), user_id))
 
         return DataTypes.Karma(row)
 
@@ -904,7 +927,9 @@ class KarmaDatabase(Database):
 
         Место определяется по общей карме от наибольшей
         к наименьшей. При равной карме выше находится
-        пользователь с меньшим внутренним ID.
+        пользователь, который достиг её позже; если время
+        не известно (старые записи) — с большим внутренним ID.
+        Порядок совпадает с get_top_karma.
 
         :param user_id: Внутренний ID пользователя.
         :return: Место пользователя в топе, начиная с 1.
@@ -919,7 +944,8 @@ class KarmaDatabase(Database):
                 SELECT karma.user_id,
                        ROW_NUMBER() OVER (
                            ORDER BY karma.karma DESC,
-                                    karma.user_id ASC
+                                    karma.karma_updated_at DESC,
+                                    karma.user_id DESC
                        ) AS rank
                 FROM karma
             )
@@ -972,7 +998,9 @@ class KarmaDatabase(Database):
 
         Пользователи расположены от наибольшей кармы
         к наименьшей. При равной карме выше находится
-        пользователь большим внутренним ID.
+        пользователь, который достиг её позже; если время
+        не известно (старые записи) — с большим внутренним ID.
+        Порядок совпадает с get_karma_rank.
 
         :return: Список кортежей из объектов Ozernik и Karma
             в порядке занимаемых мест.
@@ -983,10 +1011,12 @@ class KarmaDatabase(Database):
                    karma.status,
                    karma.karma,
                    karma.gift_karma,
-                   karma.weekly_karma
+                   karma.weekly_karma,
+                   karma.karma_updated_at
             FROM users
             JOIN karma ON karma.user_id = users.id
             ORDER BY karma.karma DESC,
+                     karma.karma_updated_at DESC,
                      users.id DESC
         """)
 
@@ -1009,7 +1039,8 @@ class KarmaDatabase(Database):
                    karma.status,
                    karma.karma,
                    karma.gift_karma,
-                   karma.weekly_karma
+                   karma.weekly_karma,
+                   karma.karma_updated_at
             FROM users
             JOIN karma ON karma.user_id = users.id
             ORDER BY karma.weekly_karma DESC,
@@ -1043,7 +1074,7 @@ class KarmaDatabase(Database):
                     reason
                 )
                 VALUES (?, ?, ?, ?)
-                RETURNING id
+                RETURNING rowid AS id
             """, (user_id, added_karma, added_at_in_unix, reason))
 
         return row["id"]
@@ -1064,11 +1095,11 @@ class KarmaDatabase(Database):
             raise ValueError("start_time_in_unix не может быть больше end_time_in_unix.")
 
         rows = self.fetchall("""
-            SELECT *
+            SELECT rowid AS id, *
             FROM karma_logs
             WHERE added_at BETWEEN ? AND ?
             ORDER BY added_at ASC,
-                     id ASC
+                     rowid ASC
         """,(start_time_in_unix, end_time_in_unix))
 
         return [dict(row) for row in rows]
@@ -1089,12 +1120,12 @@ class KarmaDatabase(Database):
             raise ValueError("start_time_in_unix не может быть больше end_time_in_unix.")
 
         rows = self.fetchall("""
-            SELECT *
+            SELECT rowid AS id, *
             FROM karma_logs
             WHERE user_id = ?
               AND added_at BETWEEN ? AND ?
             ORDER BY added_at ASC,
-                     id ASC
+                     rowid ASC
         """, (user_id, start_time_in_unix, end_time_in_unix))
 
         return [dict(row) for row in rows]
@@ -1407,7 +1438,7 @@ class KarmaDatabase(Database):
                     reason
                 )
                 VALUES (?, ?, ?, ?, ?)
-                RETURNING id
+                RETURNING rowid AS id
             """, (*pair, added_karma, added_at_in_unix, reason))
 
         return row['id']
@@ -1428,14 +1459,14 @@ class KarmaDatabase(Database):
         pair = self._normalize_pair(user1_id, user2_id)
 
         rows = self.fetchall("""
-            SELECT *
+            SELECT rowid AS id, *
             FROM karmic_bind_logs
             WHERE user1_id = ?
               AND user2_id = ?
               AND added_at >= ?
               AND added_at < ?
             ORDER BY added_at ASC,
-                     id ASC
+                     rowid ASC
         """, (*pair, start_time_in_unix, end_time_in_unix))
 
         return [dict(row) for row in rows]
@@ -1453,13 +1484,13 @@ class KarmaDatabase(Database):
             raise ValueError("start_time_in_unix не может быть больше end_time_in_unix.")
 
         rows = self.fetchall("""
-            SELECT *
+            SELECT rowid AS id, *
             FROM karmic_bind_logs
             WHERE (user1_id = ? OR user2_id = ?)
               AND added_at >= ?
               AND added_at < ?
             ORDER BY added_at ASC,
-                     id ASC
+                     rowid ASC
         """, (user_id, user_id, start_time_in_unix, end_time_in_unix))
 
         return [dict(row) for row in rows]
@@ -1476,12 +1507,12 @@ class KarmaDatabase(Database):
             raise ValueError("start_time_in_unix не может быть больше end_time_in_unix.")
 
         rows = self.fetchall("""
-            SELECT *
+            SELECT rowid AS id, *
             FROM karmic_bind_logs
             WHERE added_at >= ?
               AND added_at < ?
             ORDER BY added_at ASC,
-                     id ASC
+                     rowid ASC
         """, (start_time_in_unix, end_time_in_unix))
 
         return [dict(row) for row in rows]
