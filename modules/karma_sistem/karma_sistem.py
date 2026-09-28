@@ -3144,6 +3144,9 @@ class KarmaSistem(commands.Cog):
         if message.guild is None:
             return
 
+        if message.author.bot: # Боты и вебхуки карму не получают
+            return
+
         member = self.bot.guild.get_member(message.author.id)
 
         if member is None:
@@ -3160,18 +3163,51 @@ class KarmaSistem(commands.Cog):
             await message.reply(file=file, allowed_mentions=discord.AllowedMentions(replied_user=False))
             return
 
-        if self.check_delay(ozernik.id): # Проверка кулдауна
-            return
-
         if self.check_blocked_channels(message.channel.id): # Проверка заблокирован ли канал
             return
 
-        if self.check_blocked_roles(message.author.roles):
+        if not self.can_get_karma(member):
+            return
+
+        # Кулдаун проверяется последним, чтобы сообщения без кармы его не запускали.
+        if self.check_delay(ozernik.id):
             return
 
         old_karma, new_karma = db.add_karma(ozernik.id, 1, True)
 
         await self.give_level_up_message(member, old_karma.karma, new_karma.karma)
+
+    def can_get_karma(self, member: discord.Member) -> bool:
+        """Бот, заблокированный пользователь или роль — карма не начисляется."""
+        if member.bot:
+            return False
+
+        if self.check_blocked_users(member.id):
+            return False
+
+        if self.check_blocked_roles(member.roles):
+            return False
+
+        return True
+
+    def get_voice_karma_members(self, channel: discord.VoiceChannel) -> list[discord.Member]:
+        """Участники канала, которые получают голосовую карму."""
+        if channel == self.bot.guild.afk_channel:
+            return []
+
+        members = []
+
+        for member in channel.members:
+            if not self.can_get_karma(member):
+                continue
+
+            # Заглушённые (сами или сервером) не участвуют в разговоре.
+            if member.voice and (member.voice.self_deaf or member.voice.deaf):
+                continue
+
+            members.append(member)
+
+        return members
 
     @tasks.loop(minutes=1)
     async def voice_karma_check(self):
@@ -3179,9 +3215,9 @@ class KarmaSistem(commands.Cog):
             if not self.bot.ready:
                 return
             for channel in self.bot.guild.voice_channels:
-                members = channel.members
+                members = self.get_voice_karma_members(channel)
 
-                if not members:
+                if len(members) < 2:
                     continue
 
                 for user_1, user_2 in combinations(members, 2):
@@ -3207,58 +3243,80 @@ class KarmaSistem(commands.Cog):
             print(f"Error in {func_name}: {tb}")
 
     @voice_karma_check.error
-    async def update_something_error(self, error):
-        log_error("update_something", error)
+    async def voice_karma_check_error(self, error):
+        self.bot.print_error("voice_karma_check", error)
 
-    @tasks.loop()
-    async def weekly_countdown(self):
+    def get_week_start(self) -> str:
+        """Дата понедельника текущей недели по Москве, например '2026-09-28'."""
         now = datetime.now(timezone.utc).astimezone(self.bot.moscow_tz)
+        return (now - timedelta(days=now.weekday())).date().isoformat()
 
-        next_week = (now + timedelta(days=7 - now.weekday())).replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
+    @tasks.loop(minutes=5)
+    async def weekly_countdown(self):
+        """
+        Раз в 5 минут сверяет неделю с датой последнего сброса.
 
-        remaining = next_week - now
+        Дата хранится в data.json, поэтому сброс не теряется,
+        если бот был выключен в момент смены недели.
+        """
+        try:
+            week_start = self.get_week_start()
 
-        print(
-            f"До конца недели осталось: "
-            f"{remaining.days} дн. "
-            f"{remaining.seconds // 3600} ч. "
-            f"{remaining.seconds % 3600 // 60} мин."
-        )
+            if data.weekly_reset_week is None:
+                # Первый запуск: не сбрасываем, просто запоминаем текущую неделю.
+                data.weekly_reset_week = week_start
+                return
 
-        await asyncio.sleep(remaining.total_seconds())
+            if data.weekly_reset_week == week_start:
+                return
 
-        leaderboard = db.get_top_weekly_karma()[:3]
+            await self.announce_weekly_winners()
 
-        winner_1 = leaderboard[0]
-        winner_2 = leaderboard[1]
-        winner_3 = leaderboard[2]
+            db.reset_weekly_karma()
+            data.weekly_reset_week = week_start
 
-        view = discord.ui.LayoutView()
+        except Exception as error:
+            self.bot.print_error("weekly_countdown", error)
 
-        container = discord.ui.Container()
+    @weekly_countdown.before_loop
+    async def before_weekly_countdown(self):
+        await self.bot.wait_until_ready()
 
-        container.add_item(discord.ui.TextDisplay(
-            f'# Победители Недели!\n'
-            f'## 1. <@{winner_1[0].discord_id}> — `{winner_1[1].weekly_karma}` к.\n'
-            f'## 2. <@{winner_2[0].discord_id}> — `{winner_2[1].weekly_karma}` к.\n'
-            f'## 3. <@{winner_3[0].discord_id}> — `{winner_3[1].weekly_karma}` к.\n'
-        ))
+    async def announce_weekly_winners(self) -> None:
+        leaderboard = [
+            (ozernik, karma)
+            for ozernik, karma in db.get_top_weekly_karma()[:3]
+            if karma.weekly_karma > 0
+        ]
 
-        view.add_item(container)
+        if not leaderboard:
+            return
 
         channel = self.bot.get_channel(data.karma_channel_id if data.karma_channel_id else 0)
 
         if not channel:
             return
 
-        await channel.send(view=view)
+        lines = [
+            f'## {n}. <@{ozernik.discord_id}> — `{karma.weekly_karma}` к.'
+            for n, (ozernik, karma) in enumerate(leaderboard, 1)
+        ]
 
-        db.reset_weekly_karma()
+        view = discord.ui.LayoutView()
+
+        container = discord.ui.Container()
+
+        container.add_item(discord.ui.TextDisplay(
+            '# Победители Недели!\n' + '\n'.join(lines)
+        ))
+
+        view.add_item(container)
+
+        try:
+            await channel.send(view=view)
+        except discord.HTTPException as error:
+            # Не удалось отправить — всё равно сбрасываем, иначе неделя зависнет.
+            self.bot.print_error("announce_weekly_winners", error)
 
 
     # ------------- КОМАНДЫ --------------
