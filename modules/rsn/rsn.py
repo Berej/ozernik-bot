@@ -118,6 +118,8 @@ def format_duration(hours: Optional[float]) -> str:
 
 
 # ==================== END INITIALIZATION ====================
+ADMIN_ROLE_ID = 725675581881974794
+MOD_ROLE_ID = 779015800555176006
 
 
 
