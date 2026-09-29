@@ -130,6 +130,50 @@ class TestGeneralPage:
 
         assert env.data.blocked_channels_id == [2]
 
+    async def test_blocked_users_toggle_and_confirm(self, env):
+        env.data.blocked_users_id = [5]
+        navigator, author = open_menu(env, env.karma.SettingsGeneralPage)
+        page = navigator.current_page
+        interaction = make_interaction(author, env.guild)
+
+        assert "### Заблокированные участники: <@5>" in texts(page.build())
+        assert page.confirm_button.disabled is True
+
+        # Повторный выбор снимает блокировку, новый — добавляет.
+        page.blocked_users_select._values = [SimpleNamespace(id=5), SimpleNamespace(id=7)]
+        await page.blocked_users_callback(interaction)
+
+        text = page.get_blocked_users_text()
+        assert "~~<@5>~~\\*" in text
+        assert "<@7>\\*" in text
+        assert page.confirm_button.disabled is False
+        assert env.data.blocked_users_id == [5]  # до подтверждения ничего не сохранено
+
+        await page.confirm_callback(interaction)
+
+        assert env.data.blocked_users_id == [7]
+        assert page.get_blocked_users_text() == "### Заблокированные участники: <@7>"
+
+    async def test_blocked_users_empty_text(self, env):
+        navigator, _ = open_menu(env, env.karma.SettingsGeneralPage)
+
+        assert "### Заблокированные участники: не выбраны" in texts(navigator.current_page.build())
+
+    async def test_blocked_user_from_menu_gets_no_karma(self, env):
+        member = env.guild.add_member(7)
+        navigator, author = open_menu(env, env.karma.SettingsGeneralPage)
+        page = navigator.current_page
+        interaction = make_interaction(author, env.guild)
+        page.blocked_users_select._values = [SimpleNamespace(id=7)]
+        await page.blocked_users_callback(interaction)
+        await page.confirm_callback(interaction)
+
+        from conftest import FakeChannel, make_message
+        await env.cog.on_message(make_message(member, FakeChannel(3000), env.guild))
+
+        ozernik = env.db.get_user_by_discord_id(7)
+        assert env.db.get_karma(ozernik.id).karma == 0
+
     async def test_blocked_roles_toggle(self, env):
         navigator, author = open_menu(env, env.karma.SettingsGeneralPage)
         page = navigator.current_page
@@ -302,6 +346,23 @@ class TestSansaraPage:
         assert [role.id for role in wrong.roles] == [roles["preta"]["role_id"]]
         assert [role.id for role in empty.roles] == [roles["naraka"]["role_id"]]
         interaction.followup.send.assert_awaited_with("Обновление ролей участников завершено.", ephemeral=True)
+
+    async def test_restore_edits_each_role_once_not_per_member(self, env):
+        """Раньше иконка перезаливалась для каждого участника — сотни запросов к Discord."""
+        create_all_roles(env)
+        for n in range(30):
+            env.guild.add_member(100 + n)
+        admin = env.guild.add_member(1)
+
+        navigator, author = open_menu(env, env.karma.SettingsSansaraPage, author=admin)
+
+        await navigator.current_page._restore_roles(make_interaction(author, env.guild))
+        await env.karma.SettingsSansaraPage.restore_task
+
+        for tag, role_data in env.data.karma_roles.items():
+            role = env.guild.get_role(role_data["role_id"])
+            # Одна правка названия/цвета и одна — иконки, независимо от числа участников.
+            assert role.edit.await_count == 2, tag
 
     async def test_restore_roles_skips_bots_and_removes_their_roles(self, env):
         create_all_roles(env)

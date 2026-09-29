@@ -102,3 +102,22 @@ def test_load_icon(env, tmp_path):
     path.write_bytes(PNG_BYTES)
 
     assert env.karma.load_icon(path, (32, 32)).size == (32, 32)
+
+
+@pytest.mark.parametrize("card", ["rank", "cube"])
+def test_cards_render_without_database(env, monkeypatch, card):
+    """Карточки рисуются в отдельном потоке — всё из базы должно прийти через stats."""
+    me = add_ozernik(env, 1)
+    env.db.set_karma(me, 1500)
+    env.db.add_bind_karma(me, add_ozernik(env, 2), 400)
+    ozernik = env.db.get_user(me)
+    stats = env.karma.get_card_stats(me)
+
+    monkeypatch.setattr(env.karma, "db", None)  # любое обращение к базе упадёт
+
+    if card == "rank":
+        buffer = env.karma.create_rank_card(ozernik, avatar(), "User", stats)
+    else:
+        buffer = env.karma.create_cube_cart(ozernik, avatar(), "User", [], stats)
+
+    assert_png(buffer)

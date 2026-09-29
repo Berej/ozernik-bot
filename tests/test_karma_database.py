@@ -118,7 +118,7 @@ class TestKarma:
 
         karma = env.db.get_karma(user_id)
 
-        assert (karma.karma, karma.gift_karma, karma.weekly_karma, karma.status) == (0, 0, 0, None)
+        assert (karma.karma, karma.weekly_karma, karma.status) == (0, 0, None)
 
     def test_add_karma_returns_old_and_new(self, env):
         user_id = add_ozernik(env, 111)
@@ -138,33 +138,13 @@ class TestKarma:
         assert new.karma == 8
         assert new.weekly_karma == 8
 
-    def test_add_gift_karma(self, env):
-        user_id = add_ozernik(env, 111)
-
-        karma = env.db.add_gift_karma(user_id, 7)
-        assert (karma.karma, karma.gift_karma, karma.weekly_karma) == (7, 7, 0)
-
-        karma = env.db.add_gift_karma(user_id, 3, weekly=True)
-        assert (karma.karma, karma.gift_karma, karma.weekly_karma) == (10, 10, 3)
-
-    def test_remove_karma_clamps_gift_karma(self, env):
-        user_id = add_ozernik(env, 111)
-        env.db.add_karma(user_id, 2)
-        env.db.add_gift_karma(user_id, 8)  # karma=10, gift=8
-
-        karma = env.db.remove_karma(user_id, 5)
-
-        assert karma.karma == 5
-        assert karma.gift_karma == 5
-
     def test_remove_karma_not_below_zero(self, env):
         user_id = add_ozernik(env, 111)
-        env.db.add_gift_karma(user_id, 3)
+        env.db.add_karma(user_id, 3)
 
         karma = env.db.remove_karma(user_id, 5)
 
         assert karma.karma == 0
-        assert karma.gift_karma == 0
 
     def test_remove_karma_requires_positive_amount(self, env):
         user_id = add_ozernik(env, 111)
@@ -202,15 +182,14 @@ class TestKarma:
         karma = env.db.set_karma(user_id, 0, weekly=True)
         assert (karma.karma, karma.weekly_karma) == (0, 0)
 
-    def test_set_karma_rejects_negative_and_clamps_gift(self, env):
+    def test_set_karma_rejects_negative(self, env):
         user_id = add_ozernik(env, 111)
-        env.db.add_gift_karma(user_id, 50)
+        env.db.add_karma(user_id, 50)
 
         with pytest.raises(ValueError):
             env.db.set_karma(user_id, -1)
 
-        karma = env.db.set_karma(user_id, 20)
-        assert (karma.karma, karma.gift_karma) == (20, 20)
+        assert env.db.set_karma(user_id, 20).karma == 20
 
     def test_set_karma_status(self, env):
         user_id = add_ozernik(env, 111)
@@ -287,7 +266,7 @@ class TestKarma:
         after_add = karma.karma_updated_at
         assert after_add > 0
 
-        karma = env.db.add_gift_karma(user_id, 1)
+        _, karma = env.db.add_karma(user_id, 1)
         assert karma.karma_updated_at > after_add
 
         karma = env.db.remove_karma(user_id, 1)
@@ -377,6 +356,10 @@ class TestKarmaLogs:
         with pytest.raises(ValueError):
             env.db._add_karma_log(user_id, 1, 0, reason="voice")
 
+        # Подарочной кармы нет.
+        with pytest.raises(ValueError):
+            env.db._add_karma_log(user_id, 1, 0, reason="gift")
+
     def test_karma_logs_period_validation(self, env):
         with pytest.raises(ValueError):
             env.db.get_karma_logs(10, 5)
@@ -395,14 +378,14 @@ class TestKarmaLogs:
         other = add_ozernik(env, 222)
 
         first_id = env.db._add_karma_log(user_id, 5, 100, reason="message")
-        second_id = env.db._add_karma_log(other, 2, 150, reason="gift")
+        second_id = env.db._add_karma_log(other, 2, 150)
         env.db._add_karma_log(user_id, 1, 300)
 
         assert second_id > first_id
         logs = env.db.get_karma_logs(0, 200)
         assert [(log["id"], log["user_id"], log["added_karma"], log["reason"]) for log in logs] == [
             (first_id, user_id, 5, "message"),
-            (second_id, other, 2, "gift"),
+            (second_id, other, 2, "n/a"),
         ]
         assert [log["added_at"] for log in env.db.get_user_karma_logs(user_id, 0, 1000)] == [100, 300]
 
@@ -410,8 +393,10 @@ class TestKarmaLogs:
         first = add_ozernik(env, 111)
         second = add_ozernik(env, 222)
 
-        with pytest.raises(ValueError):
-            env.db._add_karmic_bind_log(first, second, 1, 0, reason="message")
+        # Бывшие причины: 'reply' (Связь за ответы) и 'gift' (подарочная Связь) — механик нет.
+        for reason in ("message", "reply", "gift"):
+            with pytest.raises(ValueError):
+                env.db._add_karmic_bind_log(first, second, 1, 0, reason=reason)
 
     def test_bind_logs_period_validation(self, env):
         with pytest.raises(ValueError):
@@ -427,7 +412,7 @@ class TestKarmaLogs:
         third = add_ozernik(env, 333)
 
         log_id = env.db._add_karmic_bind_log(second, first, 1, 100, reason="voice")
-        env.db._add_karmic_bind_log(first, third, 2, 150, reason="reply")
+        env.db._add_karmic_bind_log(first, third, 2, 150)
 
         logs = env.db.get_karmic_bind_logs(0, 200)
         assert logs[0]["id"] == log_id
@@ -436,6 +421,151 @@ class TestKarmaLogs:
         assert len(env.db.get_user_karmic_bind_logs(first, 0, 200)) == 2
         # Конец периода для логов связей не включается.
         assert env.db.get_karmic_bind_logs(0, 100) == []
+
+
+class TestAppendixMigration:
+    """
+    Старые базы: вычищенные механики (недельная Связь, Связь за ответы, подарочная карма и Связь)
+    убираются из схемы, данные сохраняются.
+    """
+
+    def make_old_schema(self, env):
+        db = env.db
+        a, b, c = add_ozernik(env, 111), add_ozernik(env, 222), add_ozernik(env, 333)
+
+        db.execute("DROP TABLE karma")
+        db.execute("""
+            CREATE TABLE karma (
+                user_id INTEGER PRIMARY KEY,
+                status TEXT DEFAULT NULL,
+                karma INTEGER NOT NULL DEFAULT 0,
+                gift_karma INTEGER NOT NULL DEFAULT 0,
+                weekly_karma INTEGER NOT NULL DEFAULT 0,
+                karma_updated_at INTEGER NOT NULL DEFAULT 0,
+                CHECK (status IS NULL OR status IN ('asur', 'deva')),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        db.execute("INSERT INTO karma VALUES (?, 'asur', 6000, 300, 40, 123)", (a,))
+
+        db.execute("DROP TABLE karma_logs")
+        db.execute("""
+            CREATE TABLE karma_logs (
+                user_id INTEGER NOT NULL,
+                added_at INTEGER NOT NULL,
+                added_karma INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT 'n/a',
+                CHECK (reason IN ('message', 'gift', 'n/a')),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        db.execute("INSERT INTO karma_logs VALUES (?, 100, 1, 'message')", (a,))
+        db.execute("INSERT INTO karma_logs VALUES (?, 200, 50, 'gift')", (a,))
+
+        db.execute("DROP TABLE karmic_bind")
+        db.execute("""
+            CREATE TABLE karmic_bind (
+                user1_id INTEGER NOT NULL,
+                user2_id INTEGER NOT NULL,
+                bind_karma INTEGER NOT NULL DEFAULT 0,
+                gift_bind_karma INTEGER NOT NULL DEFAULT 0,
+                weekly_bind_karma INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user1_id, user2_id),
+                CHECK (user1_id < user2_id),
+                FOREIGN KEY (user1_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (user2_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        db.execute("INSERT INTO karmic_bind VALUES (?, ?, 500, 20, 7)", (a, b))
+        db.execute("INSERT INTO karmic_bind VALUES (?, ?, 60, 0, 1)", (b, c))
+
+        db.execute("DROP TABLE karmic_bind_logs")
+        db.execute("""
+            CREATE TABLE karmic_bind_logs (
+                user1_id INTEGER NOT NULL,
+                user2_id INTEGER NOT NULL,
+                added_at INTEGER NOT NULL,
+                added_karma INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT 'n/a',
+                CHECK (reason IN ('voice', 'reply', 'gift', 'n/a')),
+                CHECK (user1_id < user2_id),
+                FOREIGN KEY (user1_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (user2_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        db.execute("INSERT INTO karmic_bind_logs VALUES (?, ?, 100, 1, 'voice')", (a, b))
+        db.execute("INSERT INTO karmic_bind_logs VALUES (?, ?, 200, 1, 'reply')", (a, b))
+        db.execute("INSERT INTO karmic_bind_logs VALUES (?, ?, 300, 1, 'gift')", (a, b))
+        return a, b, c
+
+    def schema(self, env, table):
+        return env.db.fetchone("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,))["sql"]
+
+    def columns(self, env, table):
+        return {row["name"] for row in env.db.fetchall(f"PRAGMA table_info({table})")}
+
+    def test_migration_keeps_data_and_drops_appendices(self, env):
+        a, b, c = self.make_old_schema(env)
+
+        env.db._init_db()
+
+        # Карма и статус на месте, подарочной колонки нет.
+        karma = env.db.get_karma(a)
+        assert (karma.karma, karma.status, karma.weekly_karma, karma.karma_updated_at) == (6000, "asur", 40, 123)
+        assert "gift_karma" not in self.columns(env, "karma")
+
+        # Связи на месте, недельной и подарочной колонок нет.
+        assert env.db.get_karmic_bind(a, b).bind_karma == 500
+        assert env.db.get_karmic_bind(b, c).bind_karma == 60
+        assert {"weekly_bind_karma", "gift_bind_karma"} & self.columns(env, "karmic_bind") == set()
+
+        # Логи с вычищенными причинами удалены, остальные на месте.
+        assert [log["reason"] for log in env.db.get_karma_logs(0, 1000)] == ["message"]
+        assert [log["reason"] for log in env.db.get_karmic_bind_logs(0, 1000)] == ["voice"]
+        assert "'gift'" not in self.schema(env, "karma_logs")
+        assert "'reply'" not in self.schema(env, "karmic_bind_logs")
+        assert "'gift'" not in self.schema(env, "karmic_bind_logs")
+
+    def test_migrated_tables_still_work(self, env):
+        a, b, c = self.make_old_schema(env)
+        env.db._init_db()
+
+        assert env.db.add_bind_karma(a, b, 5).bind_karma == 505
+        _, karma = env.db.add_karma(a, 10, weekly=True)
+        assert (karma.karma, karma.weekly_karma) == (6010, 50)
+        env.db._add_karmic_bind_log(a, c, 1, 400, reason="voice")
+
+        # Ограничения новой схемы на месте.
+        with pytest.raises(sqlite3.IntegrityError):
+            env.db.execute("INSERT INTO karmic_bind_logs VALUES (?, ?, 1, 1, 'reply')", (a, b))
+        with pytest.raises(sqlite3.IntegrityError):
+            env.db.execute("INSERT INTO karma_logs VALUES (?, 1, 1, 'gift')", (a,))
+        with pytest.raises(sqlite3.IntegrityError):
+            env.db.execute("INSERT INTO karmic_bind VALUES (?, ?, 1)", (b, a))
+
+        # Каскадное удаление по-прежнему работает.
+        env.db.delete_user(a)
+        assert env.db.fetchone("SELECT * FROM karma WHERE user_id = ?", (a,)) is None
+        assert env.db.get_karmic_bind(b, c).bind_karma == 60
+
+    def test_migration_is_idempotent(self, env):
+        a, b, c = self.make_old_schema(env)
+
+        env.db._init_db()
+        env.db._init_db()
+
+        assert env.db.get_karmic_bind(a, b).bind_karma == 500
+        assert env.db.get_karma(a).karma == 6000
+        leftovers = env.db.fetchall("SELECT name FROM sqlite_master WHERE name LIKE '%_old'")
+        assert leftovers == []
+
+    def test_log_indexes_recreated(self, env):
+        self.make_old_schema(env)
+
+        env.db._init_db()
+
+        indexes = {row["name"] for row in env.db.fetchall("SELECT name FROM sqlite_master WHERE type = 'index'")}
+        assert {"idx_karma_logs_user_time", "idx_karmic_bind_logs_pair_time"} <= indexes
 
 
 # ---------- КАРМИЧЕСКИЕ СВЯЗИ -----------
@@ -464,26 +594,36 @@ class TestKarmicBinds:
         assert bind.bind_karma == 5
         assert env.db.get_karmic_bind(second, first).bind_karma == 5
 
-    def test_add_gift_bind_karma(self, env):
-        first = add_ozernik(env, 111)
-        second = add_ozernik(env, 222)
+    def test_add_bind_karma_many(self, env):
+        a, b, c = (add_ozernik(env, 111 * n) for n in (1, 2, 3))
+        env.db.add_bind_karma(a, b, 10)
 
-        bind = env.db.add_gift_bind_karma(first, second, 4)
+        binds = env.db.add_bind_karma_many([(b, a), (a, c), (c, b)], karma=2)
 
-        assert (bind.bind_karma, bind.gift_bind_karma) == (4, 4)
+        assert [(bind.ids, bind.bind_karma) for bind in binds] == [
+            ((a, b), 12),
+            ((a, c), 2),
+            ((b, c), 2),
+        ]
+        assert env.db.get_karmic_bind(c, a).bind_karma == 2
+
+    def test_add_bind_karma_many_rejects_self_pair_without_writing(self, env):
+        a, b = add_ozernik(env, 111), add_ozernik(env, 222)
 
         with pytest.raises(ValueError):
-            env.db.add_gift_bind_karma(first, second, 0)
+            env.db.add_bind_karma_many([(a, b), (a, a)], karma=1)
 
-    def test_remove_bind_karma_clamps_gift(self, env):
+        assert env.db.get_karmic_bind(a, b) is None
+
+    def test_add_bind_karma_many_empty(self, env):
+        assert env.db.add_bind_karma_many([], karma=1) == []
+
+    def test_remove_bind_karma(self, env):
         first = add_ozernik(env, 111)
         second = add_ozernik(env, 222)
-        env.db.add_bind_karma(first, second, 2)
-        env.db.add_gift_bind_karma(first, second, 8)  # 10 / 8
+        env.db.add_bind_karma(first, second, 10)
 
-        bind = env.db.remove_bind_karma(first, second, 5)
-
-        assert (bind.bind_karma, bind.gift_bind_karma) == (5, 5)
+        assert env.db.remove_bind_karma(first, second, 4).bind_karma == 6
 
         with pytest.raises(ValueError):
             env.db.remove_bind_karma(first, second, 0)
@@ -491,11 +631,9 @@ class TestKarmicBinds:
     def test_set_bind_karma(self, env):
         first = add_ozernik(env, 111)
         second = add_ozernik(env, 222)
-        env.db.add_gift_bind_karma(first, second, 8)
+        env.db.add_bind_karma(first, second, 8)
 
-        bind = env.db.set_bind_karma(first, second, 3)
-
-        assert (bind.bind_karma, bind.gift_bind_karma) == (3, 3)
+        assert env.db.set_bind_karma(first, second, 3).bind_karma == 3
 
         with pytest.raises(ValueError):
             env.db.set_bind_karma(first, second, -1)

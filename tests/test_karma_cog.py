@@ -145,6 +145,26 @@ class TestOnMessage:
         await env.cog.on_message(make_message(member, text_channel, env.guild))
         assert karma_of(env, member) == 1
 
+    async def test_thread_in_blocked_channel_gives_no_karma(self, env):
+        member = env.guild.add_member(1)
+        env.data.blocked_channels_id = [4000]
+        thread = FakeChannel(4001)
+        thread.parent_id = 4000
+
+        await env.cog.on_message(make_message(member, thread, env.guild))
+
+        assert karma_of(env, member) == 0
+
+    async def test_thread_in_normal_channel_gives_karma(self, env):
+        member = env.guild.add_member(1)
+        env.data.blocked_channels_id = [4000]
+        thread = FakeChannel(5001)
+        thread.parent_id = 5000
+
+        await env.cog.on_message(make_message(member, thread, env.guild))
+
+        assert karma_of(env, member) == 1
+
     async def test_blocked_role_gives_no_karma(self, env, text_channel):
         env.data.blocked_roles_id = [10]
         member = env.guild.add_member(1, roles=[FakeRole(10)])
@@ -182,7 +202,7 @@ class TestOnMessage:
         assert karma_of(env, member) == 100
         channel.send.assert_awaited_once()
         embed = channel.send.call_args.kwargs["embed"]
-        assert embed.title == f"**{member.display_name} достигает 1 уровня**"
+        assert embed.title == f"**{member.display_name} повышает уровень!**"
         # Выдана роль Преты (100 кармы).
         assert env.data.karma_roles["preta"]["role_id"] in [role.id for role in member.roles]
 
@@ -202,6 +222,46 @@ class TestVoiceKarma:
         channel = FakeChannel(channel_id, members=list(members))
         env.guild.voice_channels.append(channel)
         return channel
+
+    async def test_error_in_one_channel_does_not_stop_others(self, env, monkeypatch):
+        a, b, c, d = (env.guild.add_member(i) for i in (1, 2, 3, 4))
+        broken = self.voice(env, a, b, channel_id=6000)
+        self.voice(env, c, d, channel_id=6001)
+        original = env.cog.process_voice_channel
+
+        async def process(channel):
+            if channel is broken:
+                raise RuntimeError("сбой в первом канале")
+            await original(channel)
+
+        monkeypatch.setattr(env.cog, "process_voice_channel", process)
+
+        await env.cog.voice_karma_check()
+
+        assert bind_of(env, c, d) == 1
+
+    async def test_main_account_and_twink_are_one_person(self, env):
+        main = env.guild.add_member(1)
+        twink = env.guild.add_member(11)
+        friend = env.guild.add_member(2)
+        env.db.add_user(discord_id=1, discord_twink_id=11)
+        self.voice(env, main, twink, friend)
+
+        await env.cog.voice_karma_check()
+
+        # Связь основного аккаунта с другом одна (+1), связи «с самим собой» нет.
+        assert bind_of(env, main, friend) == 1
+        assert len(env.db.get_top_karmic_binds()) == 1
+
+    async def test_only_main_and_twink_in_voice(self, env):
+        main = env.guild.add_member(1)
+        twink = env.guild.add_member(11)
+        env.db.add_user(discord_id=1, discord_twink_id=11)
+        self.voice(env, main, twink)
+
+        await env.cog.voice_karma_check()
+
+        assert env.db.get_top_karmic_binds() == []
 
     async def test_pair_in_voice_gets_bind_karma(self, env):
         a, b = env.guild.add_member(1), env.guild.add_member(2)
@@ -295,6 +355,30 @@ class TestVoiceKarma:
         await env.cog.voice_karma_check()
 
         assert bind_of(env, a, b) == 0
+
+    async def test_one_cube_message_per_member_with_many_pairs(self, env):
+        channel = enable_karma_channel(env)
+        create_all_roles(env)
+        members = [env.guild.add_member(i) for i in (1, 2, 3, 4)]
+        self.voice(env, *members)
+
+        await env.cog.voice_karma_check()
+
+        # 6 пар, но каждый получил Черный Куб ровно один раз.
+        embeds = [call.kwargs["embed"] for call in channel.send.await_args_list if "embed" in call.kwargs]
+        assert len(embeds) == 4
+        assert {embed.title for embed in embeds} == {f"**User {i} получает новый Куб!**" for i in (1, 2, 3, 4)}
+
+    async def test_voice_loop_uses_single_batch_write(self, env, monkeypatch):
+        members = [env.guild.add_member(i) for i in range(1, 7)]
+        self.voice(env, *members)
+        calls = []
+        original = env.db.add_bind_karma_many
+        monkeypatch.setattr(env.db, "add_bind_karma_many", lambda pairs, karma: calls.append(len(pairs)) or original(pairs, karma))
+
+        await env.cog.voice_karma_check()
+
+        assert calls == [15]  # все 15 пар — одной записью
 
     async def test_first_bind_gives_black_cube_message(self, env):
         channel = enable_karma_channel(env)
@@ -450,15 +534,13 @@ class TestLevelUpMessages:
         assert channel.send.await_count == 3
         embeds = [call.kwargs["embed"] for call in channel.send.await_args_list]
         preta_id = env.data.karma_roles["preta"]["role_id"]
-        # На 1 уровне сменилась ступень (Нарака → Прета) — приписка «Теперь вы».
+        # Шаблон старой Сансары (Amari): текст уровня → «Вы достигаете N уровня.» → «Теперь вы …» при смене ступени.
         assert [embed.description for embed in embeds] == [
-            f"Первый <@&{preta_id}>\n\nТеперь вы <@&{preta_id}>",
-            "",
-            "Третий",
+            f"Первый <@&{preta_id}>\nВы достигаете 1 уровня.\nТеперь вы <@&{preta_id}>",
+            "Вы достигаете 2 уровня.",
+            "Третий\nВы достигаете 3 уровня.",
         ]
-        assert [embed.title for embed in embeds] == [
-            f"**{member.display_name} достигает {level} уровня**" for level in (1, 2, 3)
-        ]
+        assert [embed.title for embed in embeds] == [f"**{member.display_name} повышает уровень!**"] * 3
 
     @pytest.mark.parametrize(
         ("old_karma", "new_karma", "level", "stage"),
@@ -478,7 +560,7 @@ class TestLevelUpMessages:
         await env.cog.give_level_up_message(member, old_karma, new_karma)
 
         role_id = env.data.karma_roles[stage]["role_id"]
-        assert channel.send.call_args.kwargs["embed"].description == f"Текст администрации.\n\nТеперь вы <@&{role_id}>"
+        assert channel.send.call_args.kwargs["embed"].description == f"Текст администрации.\nВы достигаете {level} уровня.\nТеперь вы <@&{role_id}>"
 
     async def test_threshold_without_admin_text(self, env):
         channel = enable_karma_channel(env)
@@ -489,7 +571,7 @@ class TestLevelUpMessages:
         await env.cog.give_level_up_message(member, 4999, 5000)
 
         human_id = env.data.karma_roles["human"]["role_id"]
-        assert channel.send.call_args.kwargs["embed"].description == f"Теперь вы <@&{human_id}>"
+        assert channel.send.call_args.kwargs["embed"].description == f"Вы достигаете 25 уровня.\nТеперь вы <@&{human_id}>"
 
     async def test_not_threshold_level_has_no_stage_text(self, env):
         channel = enable_karma_channel(env)
@@ -500,7 +582,7 @@ class TestLevelUpMessages:
 
         await env.cog.give_level_up_message(member, 1199, 1200)
 
-        assert channel.send.call_args.kwargs["embed"].description == "Одиннадцатый"
+        assert channel.send.call_args.kwargs["embed"].description == "Одиннадцатый\nВы достигаете 11 уровня."
 
     async def test_only_last_mentions_stage_change_across_range(self, env):
         """Админская правка 0 → 4999: одно сообщение о 24 уровне, но ступень сменилась (Нарака → Зверь)."""
@@ -513,7 +595,7 @@ class TestLevelUpMessages:
 
         animal_id = env.data.karma_roles["animal"]["role_id"]
         channel.send.assert_awaited_once()
-        assert channel.send.call_args.kwargs["embed"].description == f"Теперь вы <@&{animal_id}>"
+        assert channel.send.call_args.kwargs["embed"].description == f"Вы достигаете 24 уровня.\nТеперь вы <@&{animal_id}>"
 
     async def test_only_last_same_stage_no_text(self, env):
         channel = enable_karma_channel(env)
@@ -523,7 +605,7 @@ class TestLevelUpMessages:
 
         await env.cog.give_level_up_message(member, 1000, 4000, only_last=True)
 
-        assert channel.send.call_args.kwargs["embed"].description == ""
+        assert channel.send.call_args.kwargs["embed"].description == "Вы достигаете 22 уровня."
 
     async def test_member_without_avatar_and_guild_without_icon(self, env):
         channel = enable_karma_channel(env)
@@ -568,7 +650,7 @@ class TestLevelUpMessages:
         await env.cog.give_cube_up_message(member, None, env.karma.get_cube_status(me))
 
         embed = channel.send.call_args.kwargs["embed"]
-        assert embed.title == f"**{member.display_name} получил новый Куб!**"
+        assert embed.title == f"**{member.display_name} получает новый Куб!**"
         assert quote in embed.description
 
     async def test_bind_up_only_on_cube_change(self, env):
@@ -590,7 +672,42 @@ class TestRoles:
 
         assert role.id == env.data.karma_roles["preta"]["role_id"]
         env.guild.create_role.assert_not_awaited()
-        role.edit.assert_awaited_once()  # выставляется иконка
+        role.edit.assert_not_awaited()  # обычное обращение роль не правит
+
+    async def test_created_role_gets_icon(self, env):
+        role = await env.cog.roles.get_sansara_role("naraka")
+
+        role.edit.assert_awaited_once()
+        assert "display_icon" in role.edit.call_args.kwargs
+
+    async def test_restore_resets_name_colour_and_icon(self, env):
+        create_all_roles(env)
+        role = env.guild.get_role(env.data.cube_roles["gold_cube"]["role_id"])
+
+        await env.cog.roles.get_cube_role("gold_cube", restore=True)
+
+        edits = [call.kwargs for call in role.edit.await_args_list]
+        assert edits[0]["name"] == "Золотой Куб"
+        assert edits[0]["colour"] == discord.Colour.from_str("#FFAB33")
+        assert "display_icon" in edits[1]
+
+    async def test_restore_survives_edit_errors(self, env):
+        create_all_roles(env)
+        role = env.guild.get_role(env.data.karma_roles["deva"]["role_id"])
+        role.edit.side_effect = discord.HTTPException(AsyncMock(status=403), "нет прав")
+
+        assert await env.cog.roles.get_sansara_role("deva", restore=True) is role
+
+    async def test_level_up_does_not_edit_roles(self, env):
+        """Раньше каждое повышение перезаливало иконки всех 6 ролей Сансары и нужной роли."""
+        enable_karma_channel(env)
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        env.db.set_karma(env.bot.db_ensure_user(member).id, 300)
+
+        await env.cog.give_level_up_message(member, 99, 300)
+
+        assert all(role.edit.await_count == 0 for role in env.guild.roles.values())
 
     async def test_fetch_role_when_not_cached(self, env):
         fetched = FakeRole(555)
