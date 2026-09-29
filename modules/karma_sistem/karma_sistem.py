@@ -586,10 +586,9 @@ def collapse_value(value) -> str:
 def expand_dict(text: str) -> dict:
     return ast.literal_eval("{" + text + "}")
 
-def get_role_id_by_level(level: int) -> str:
-    karma = get_karma(level)
-
-    status = max(
+def get_stage_by_karma(karma: int) -> dict:
+    """Обычная ступень Сансары (без Асура/Дэвы) для количества кармы."""
+    return max(
         (
             stage
             for stage in data.karma_roles.values()
@@ -600,7 +599,19 @@ def get_role_id_by_level(level: int) -> str:
         ),
         key=lambda stage: stage["required_karma"],
     )
-    return status['role_id']
+
+def get_role_id_by_level(level: int) -> str:
+    return get_stage_by_karma(get_karma(level))['role_id']
+
+def get_new_stage_text(old_karma: int, new_karma: int) -> str:
+    """Приписка «Теперь вы [роль]», если между old_karma и new_karma сменилась ступень Сансары."""
+    old_stage = get_stage_by_karma(old_karma)
+    new_stage = get_stage_by_karma(new_karma)
+
+    if old_stage['tag_name'] == new_stage['tag_name']:
+        return ''
+
+    return f"Теперь вы <@&{new_stage['role_id']}>"
 
 def get_level_up_text(level: int) -> str:
     text: str = levels_data[f'{level}']
@@ -3084,11 +3095,21 @@ class KarmaSistem(commands.Cog):
         if only_last:
             levels = levels[-1:]
 
+        # С какой кармы считается переход для каждого сообщения
+        # (для only_last — с исходной, чтобы не потерять смену ступени).
+        previous_karma = old_karma
+
         for level in levels:
             role = await self.update_sansara_roles(member)
 
+            level_karma = get_karma(level)
             description = get_level_up_text(level)
-            print(description)
+
+            stage_text = get_new_stage_text(previous_karma, level_karma)
+            if stage_text:
+                description = f'{description}\n\n{stage_text}' if description else stage_text
+
+            previous_karma = level_karma
 
             embed = discord.Embed(
                 title=f"**{member.display_name} {get_level_up_verb(level)} {level} уровня**",
