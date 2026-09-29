@@ -759,16 +759,26 @@ def get_level_up_text(level: int) -> str:
 
     return text
 
-def get_level_up_verb(level: int) -> str:
-    # Заглушка: глагол в строке «Вы … N уровня». Позже — разные глаголы для разных уровней/этапов.
-    return 'достигаете'
+def get_level_up_line(level: int) -> str:
+    """
+    Строка «Вы … N уровня.» — глагол зависит от уровня, как в старой Сансаре (решение Alium и Габа):
+    1–40 — «достигли», 41–80 — «добились», 81+ — «доползли до».
+
+    Строка собирается целиком, а не подстановкой одного глагола: у «доползли»
+    нужен предлог «до», и одна схема «Вы {глагол} N уровня» не подходит.
+    """
+    if level <= 40:
+        return f'Вы достигли {level} уровня.'
+    if level <= 80:
+        return f'Вы добились {level} уровня.'
+    return f'Вы доползли до {level} уровня.'
 
 def build_level_up_description(level: int, previous_karma: int) -> str:
     """
     Текст сообщения о повышении, по шаблону старой Сансары (Amari):
 
         [текст уровня от администрации]
-        Вы достигаете N уровня.
+        Вы достигли N уровня.  ← глагол по уровню, см. get_level_up_line
         Теперь вы @Роль          ← только при смене ступени Сансары
 
     :param previous_karma: Карма, от которой считается переход (для смены ступени).
@@ -779,7 +789,7 @@ def build_level_up_description(level: int, previous_karma: int) -> str:
     if text:
         lines.append(text)
 
-    lines.append(f'Вы {get_level_up_verb(level)} {level} уровня.')
+    lines.append(get_level_up_line(level))
 
     stage_text = get_new_stage_text(previous_karma, get_karma(level))
     if stage_text:
