@@ -534,11 +534,11 @@ class TestLevelUpMessages:
         assert channel.send.await_count == 3
         embeds = [call.kwargs["embed"] for call in channel.send.await_args_list]
         preta_id = env.data.karma_roles["preta"]["role_id"]
-        # Шаблон старой Сансары (Amari): текст уровня → «Вы достигаете N уровня.» → «Теперь вы …» при смене ступени.
+        # Шаблон старой Сансары (Amari): текст уровня → «Вы достигли N уровня.» → «Теперь вы …» при смене ступени.
         assert [embed.description for embed in embeds] == [
-            f"Первый <@&{preta_id}>\nВы достигаете 1 уровня.\nТеперь вы <@&{preta_id}>",
-            "Вы достигаете 2 уровня.",
-            "Третий\nВы достигаете 3 уровня.",
+            f"Первый <@&{preta_id}>\nВы достигли 1 уровня.\nТеперь вы <@&{preta_id}>",
+            "Вы достигли 2 уровня.",
+            "Третий\nВы достигли 3 уровня.",
         ]
         assert [embed.title for embed in embeds] == [f"**{member.display_name} повышает уровень!**"] * 3
 
@@ -560,7 +560,7 @@ class TestLevelUpMessages:
         await env.cog.give_level_up_message(member, old_karma, new_karma)
 
         role_id = env.data.karma_roles[stage]["role_id"]
-        assert channel.send.call_args.kwargs["embed"].description == f"Текст администрации.\nВы достигаете {level} уровня.\nТеперь вы <@&{role_id}>"
+        assert channel.send.call_args.kwargs["embed"].description == f"Текст администрации.\nВы достигли {level} уровня.\nТеперь вы <@&{role_id}>"
 
     async def test_threshold_without_admin_text(self, env):
         channel = enable_karma_channel(env)
@@ -571,7 +571,7 @@ class TestLevelUpMessages:
         await env.cog.give_level_up_message(member, 4999, 5000)
 
         human_id = env.data.karma_roles["human"]["role_id"]
-        assert channel.send.call_args.kwargs["embed"].description == f"Вы достигаете 25 уровня.\nТеперь вы <@&{human_id}>"
+        assert channel.send.call_args.kwargs["embed"].description == f"Вы достигли 25 уровня.\nТеперь вы <@&{human_id}>"
 
     async def test_not_threshold_level_has_no_stage_text(self, env):
         channel = enable_karma_channel(env)
@@ -582,7 +582,7 @@ class TestLevelUpMessages:
 
         await env.cog.give_level_up_message(member, 1199, 1200)
 
-        assert channel.send.call_args.kwargs["embed"].description == "Одиннадцатый\nВы достигаете 11 уровня."
+        assert channel.send.call_args.kwargs["embed"].description == "Одиннадцатый\nВы достигли 11 уровня."
 
     async def test_only_last_mentions_stage_change_across_range(self, env):
         """Админская правка 0 → 4999: одно сообщение о 24 уровне, но ступень сменилась (Нарака → Зверь)."""
@@ -595,7 +595,7 @@ class TestLevelUpMessages:
 
         animal_id = env.data.karma_roles["animal"]["role_id"]
         channel.send.assert_awaited_once()
-        assert channel.send.call_args.kwargs["embed"].description == f"Вы достигаете 24 уровня.\nТеперь вы <@&{animal_id}>"
+        assert channel.send.call_args.kwargs["embed"].description == f"Вы достигли 24 уровня.\nТеперь вы <@&{animal_id}>"
 
     async def test_only_last_same_stage_no_text(self, env):
         channel = enable_karma_channel(env)
@@ -605,7 +605,7 @@ class TestLevelUpMessages:
 
         await env.cog.give_level_up_message(member, 1000, 4000, only_last=True)
 
-        assert channel.send.call_args.kwargs["embed"].description == "Вы достигаете 22 уровня."
+        assert channel.send.call_args.kwargs["embed"].description == "Вы достигли 22 уровня."
 
     async def test_member_without_avatar_and_guild_without_icon(self, env):
         channel = enable_karma_channel(env)
@@ -895,3 +895,90 @@ def test_admin_commands_hidden_from_non_admins(env):
     for command in env.cog.get_app_commands():
         if command.name.startswith("karma_"):
             assert command.default_permissions.administrator is True
+
+
+# ---------- РОЛИ ПРИ ВХОДЕ НА СЕРВЕР -----------
+
+class TestJoinRoles:
+    def role_ids(self, member):
+        return [role.id for role in member.roles]
+
+    async def test_newcomer_gets_naraka(self, env):
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+
+        await env.cog.on_member_join(member)
+
+        assert self.role_ids(member) == [env.data.karma_roles["naraka"]["role_id"]]
+        assert env.db.get_user_by_discord_id(1) is not None
+
+    async def test_bot_gets_nothing(self, env):
+        create_all_roles(env)
+        bot_member = env.guild.add_member(1, bot=True)
+
+        await env.cog.on_member_join(bot_member)
+
+        assert bot_member.roles == []
+        assert env.db.get_user_by_discord_id(1) is None
+
+    async def test_returning_member_gets_stage_and_cube(self, env):
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        me = env.bot.db_ensure_user(member).id
+        env.db.set_karma(me, 6000)
+        for n in range(10):
+            env.db.add_bind_karma(me, add_ozernik(env, 100 + n), 400)
+
+        await env.cog.on_member_join(member)
+
+        assert set(self.role_ids(member)) == {
+            env.data.karma_roles["human"]["role_id"],
+            env.data.cube_roles["white_cube"]["role_id"],
+        }
+
+    async def test_returning_asur_keeps_status_role(self, env):
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        me = env.bot.db_ensure_user(member).id
+        env.db.set_karma(me, 6000)
+        env.db.set_karma_status(me, "asur")
+
+        await env.cog.on_member_join(member)
+
+        assert self.role_ids(member) == [env.data.karma_roles["asur"]["role_id"]]
+
+    async def test_waits_for_membership_screening(self, env):
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        member.pending = True
+
+        await env.cog.on_member_join(member)
+        assert member.roles == []  # правила ещё не приняты
+
+        passed = env.guild.get_member(1)
+        before = type("Before", (), {"pending": True})()
+        passed.pending = False
+        await env.cog.on_member_update(before, passed)
+
+        assert self.role_ids(passed) == [env.data.karma_roles["naraka"]["role_id"]]
+
+    async def test_other_member_updates_ignored(self, env):
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        before = type("Before", (), {"pending": False})()
+
+        await env.cog.on_member_update(before, member)  # например, сменил ник
+
+        assert member.roles == []
+
+    async def test_role_error_does_not_crash(self, env, monkeypatch):
+        member = env.guild.add_member(1)
+
+        async def broken(member):
+            raise RuntimeError("нет прав на роли")
+
+        monkeypatch.setattr(env.cog, "update_sansara_roles", broken)
+
+        await env.cog.on_member_join(member)  # не падает
+
+        assert env.db.get_user_by_discord_id(1) is not None
