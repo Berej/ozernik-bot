@@ -3252,13 +3252,8 @@ class KarmaSistem(commands.Cog):
 
         ozernik = self.bot.db_ensure_user(member)
 
-        if message.content.startswith(',r'):
-            avatar = await get_discord_avatar(member)
-
-            rank_card_bytes = create_rank_card(ozernik, avatar, member.display_name)
-
-            file = discord.File(rank_card_bytes, filename=f"{member.name}_sansara_rank.png")
-            await message.reply(file=file, allowed_mentions=discord.AllowedMentions(replied_user=False))
+        # Сокращения команд (,rs, ,lb, ...) карму не дают.
+        if await self.handle_shortcut(message, member):
             return
 
         if self.check_blocked_channels(message.channel.id): # Проверка заблокирован ли канал
@@ -3433,141 +3428,214 @@ class KarmaSistem(commands.Cog):
 
         await navigator.send(interaction)
 
-    @app_commands.command(name='rank_sansara', description='Просмотр ранга Сансары.')
-    @app_commands.guilds(config.GUILD_ID)
-    async def rank_sansara(self, interaction: Interaction, user: discord.Member = None):
-        if user is None:
-            user = interaction.user
-        ozernik = db.get_user_by_discord_id(user.id)
+    # ---- КАРТОЧКИ И ТАБЛИЦЫ ЛИДЕРОВ ----
+    # Общие для slash-команд и сокращений (,rs, ,lb и т.д.).
 
-        avatar = await get_discord_avatar(user)
+    async def build_rank_sansara_file(self, member: discord.Member) -> discord.File:
+        ozernik = self.bot.db_ensure_user(member)
+        avatar = await get_discord_avatar(member)
 
-        rank_card_bytes = create_rank_card(ozernik, avatar, user.display_name)
+        rank_card_bytes = create_rank_card(ozernik, avatar, member.display_name)
 
-        file = discord.File(rank_card_bytes, filename=f"{user.name}_sansara_rank.png")
+        return discord.File(rank_card_bytes, filename=f"{member.name}_sansara_rank.png")
 
-        await interaction.response.send_message(file=file)
-
-    @app_commands.command(name='rank_cube', description='Просмотр ранга Куба.')
-    @app_commands.guilds(config.GUILD_ID)
-    async def rank_cube(self, interaction: Interaction, user: discord.Member = None):
-        await interaction.response.defer()
-        if user is None:
-            user = interaction.user
-        ozernik = db.get_user_by_discord_id(user.id)
-
-        avatar = await get_discord_avatar(user)
-        full_binds = await get_full_binds(user, self.bot)
+    async def build_rank_cube_file(self, member: discord.Member) -> discord.File:
+        ozernik = self.bot.db_ensure_user(member)
+        avatar = await get_discord_avatar(member)
+        full_binds = await get_full_binds(member, self.bot)
 
         rank_card_bytes = create_cube_cart(
             ozernik,
             avatar,
-            user.display_name,
+            member.display_name,
             full_binds,
         )
 
-        file = discord.File(rank_card_bytes, filename=f"{user.name}_cube_rank.png")
+        return discord.File(rank_card_bytes, filename=f"{member.name}_cube_rank.png")
+
+    @staticmethod
+    def build_leaderboard_embed(
+            title: str,
+            subtitle: str,
+            rows: list[tuple[int, str]],
+            viewer: discord.Member,
+            guild: discord.Guild,
+    ) -> discord.Embed:
+        """rows — (discord_id, строки под именем) для первых 10 мест."""
+        embed = discord.Embed(
+            title=title,
+            colour=viewer.top_role.colour,
+        )
+
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        lines = [subtitle]
+
+        for n, (discord_id, body) in enumerate(rows[:10], 1):
+            lines.append('')
+            lines.append(f'**#{n} <:cigar:1208007437639225415> <@{discord_id}>**\n{body}')
+
+        embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
+
+        return embed
+
+    def build_leaderboard(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
+        leaderboard = db.get_top_karma()
+        if not leaderboard:
+            return None
+
+        rows = []
+        for ozernik, karma in leaderboard[:10]:
+            level = get_level(karma.karma)
+            rows.append((
+                ozernik.discord_id,
+                f'ㅤ  Уровень: `{level}`\n'
+                f'ㅤ  Карма: `{karma.karma}/{get_karma(level + 1)}`'
+            ))
+
+        return self.build_leaderboard_embed('Таблица лидеров', '*Ментальное здоровье и рыбалка.*', rows, viewer, guild)
+
+    def build_leaderboard_weekly(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
+        leaderboard = db.get_top_weekly_karma()
+        if not leaderboard:
+            return None
+
+        rows = []
+        for ozernik, karma in leaderboard[:10]:
+            level = get_level(karma.karma)
+            rows.append((
+                ozernik.discord_id,
+                f'ㅤ  Уровень: `{level}`\n'
+                f'ㅤ  Карма: `{karma.weekly_karma}/{get_karma(level + 1)}`'
+            ))
+
+        return self.build_leaderboard_embed(
+            'Таблица лидеров',
+            '*Место для опустошения разума, \nразмышлений о прошлом и будущем.*',
+            rows, viewer, guild,
+        )
+
+    def build_leaderboard_cubes(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
+        leaderboard = get_cube_leaderboard()
+        if not leaderboard:
+            return None
+
+        rows = []
+        for row in leaderboard[:10]:
+            cube_binds = row['cube_binds']
+            total = row['total_bind_karma']
+            rows.append((
+                row['ozernik'].discord_id,
+                f'ㅤ  Куб: `{row["cube"]["name"]}` ({cube_binds} {plural_ru(cube_binds, ("связь", "связи", "связей"))})\n'
+                f'ㅤ  Связь: `{total}` ед. с. ({format_duration_minutes(total) or "0 минут"})'
+            ))
+
+        return self.build_leaderboard_embed('Таблица лидеров Кубов', '*Время, проведённое вместе.*', rows, viewer, guild)
+
+    # Таблицы лидеров: (сборщик, ответ при пустой таблице).
+    LEADERBOARDS = {
+        'leaderboard': ('build_leaderboard', 'Нет таблицы лидеров.'),
+        'leaderboard_weekly': ('build_leaderboard_weekly', 'Нет недельной таблицы лидеров.'),
+        'leaderboard_cubes': ('build_leaderboard_cubes', 'Нет таблицы лидеров Кубов.'),
+    }
+
+    async def send_leaderboard(self, interaction: Interaction, name: str) -> None:
+        builder, empty_text = self.LEADERBOARDS[name]
+        embed = getattr(self, builder)(interaction.user, interaction.guild)
+
+        if embed is None:
+            await interaction.response.send_message(empty_text, ephemeral=True)
+            return
+
+        await interaction.response.send_message(embed=embed)
+
+    # ------------ СОКРАЩЕНИЯ ------------
+
+    # Первое слово сообщения → команда. ,r оставлен как старое сокращение ,rs.
+    SHORTCUTS = {
+        ',rs': 'rank_sansara',
+        ',r': 'rank_sansara',
+        ',rc': 'rank_cube',
+        ',lb': 'leaderboard',
+        ',lbw': 'leaderboard_weekly',
+        ',lbc': 'leaderboard_cubes',
+    }
+
+    async def handle_shortcut(self, message: discord.Message, member: discord.Member) -> bool:
+        """
+        Выполняет сокращение, если сообщение с него начинается (отдельным словом).
+        Для карточек можно упомянуть другого участника: ,rs @участник.
+
+        :return: True, если сообщение было сокращением.
+        """
+        words = message.content.split()
+
+        if not words:
+            return False
+
+        name = self.SHORTCUTS.get(words[0].lower())
+
+        if name is None:
+            return False
+
+        no_ping = discord.AllowedMentions(replied_user=False)
+
+        if name in ('rank_sansara', 'rank_cube'):
+            # Первый упомянутый участник сервера, иначе автор.
+            mentioned = (message.guild.get_member(user.id) for user in getattr(message, 'mentions', []))
+            target = next((user for user in mentioned if user is not None), member)
+
+            if name == 'rank_sansara':
+                file = await self.build_rank_sansara_file(target)
+            else:
+                file = await self.build_rank_cube_file(target)
+
+            await message.reply(file=file, allowed_mentions=no_ping)
+            return True
+
+        builder, empty_text = self.LEADERBOARDS[name]
+        embed = getattr(self, builder)(member, message.guild)
+
+        if embed is None:
+            await message.reply(empty_text, allowed_mentions=no_ping)
+        else:
+            await message.reply(embed=embed, allowed_mentions=no_ping)
+
+        return True
+
+    # ------ КОМАНДЫ УЧАСТНИКОВ ------
+
+    @app_commands.command(name='rank_sansara', description='Просмотр ранга Сансары. Сокращение: ,rs')
+    @app_commands.guilds(config.GUILD_ID)
+    async def rank_sansara(self, interaction: Interaction, user: discord.Member = None):
+        file = await self.build_rank_sansara_file(user or interaction.user)
+
+        await interaction.response.send_message(file=file)
+
+    @app_commands.command(name='rank_cube', description='Просмотр ранга Куба. Сокращение: ,rc')
+    @app_commands.guilds(config.GUILD_ID)
+    async def rank_cube(self, interaction: Interaction, user: discord.Member = None):
+        await interaction.response.defer()
+
+        file = await self.build_rank_cube_file(user or interaction.user)
 
         await interaction.followup.send(file=file)
 
-    @app_commands.command(name='leaderboard', description='Таблица лидеров по карме.')
+    @app_commands.command(name='leaderboard', description='Таблица лидеров по карме. Сокращение: ,lb')
     @app_commands.guilds(config.GUILD_ID)
     async def leaderboard(self, interaction: Interaction):
-        leaderboard = db.get_top_karma()
-        if not leaderboard:
-            await interaction.response.send_message('Нет таблицы лидеров.', ephemeral=True)
-            return
+        await self.send_leaderboard(interaction, 'leaderboard')
 
-        embed = discord.Embed(
-            title='Таблица лидеров',
-            colour=interaction.user.top_role.colour,
-        )
-
-        if interaction.guild.icon:
-            embed.set_thumbnail(url=interaction.guild.icon.url)
-
-        lines = ['*Ментальное здоровье и рыбалка.*']
-
-        for n, (ozernik, karma) in enumerate(leaderboard[:10], 1):
-            level = get_level(karma.karma)
-            next_level_karma = get_karma(level + 1)
-
-            lines.append('')
-            lines.append(f'**#{n} <:cigar:1208007437639225415> <@{ozernik.discord_id}>**\n'
-                         f'ㅤ  Уровень: `{level}`\n'
-                         f'ㅤ  Карма: `{karma.karma}/{next_level_karma}`')
-
-        embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
-
-        await interaction.response.send_message(
-            embed=embed
-        )
-
-    @app_commands.command(name='leaderboard_weekly', description='Недельная таблица лидеров по карме.')
+    @app_commands.command(name='leaderboard_weekly', description='Недельная таблица лидеров по карме. Сокращение: ,lbw')
     @app_commands.guilds(config.GUILD_ID)
     async def leaderboard_weekly(self, interaction: Interaction):
-        leaderboard = db.get_top_weekly_karma()
-        if not leaderboard:
-            await interaction.response.send_message('Нет недельной таблицы лидеров.', ephemeral=True)
-            return
+        await self.send_leaderboard(interaction, 'leaderboard_weekly')
 
-        embed = discord.Embed(
-            title='Таблица лидеров',
-            colour=interaction.user.top_role.colour,
-        )
-
-        if interaction.guild.icon:
-            embed.set_thumbnail(url=interaction.guild.icon.url)
-
-        lines = ['*Место для опустошения разума, \nразмышлений о прошлом и будущем.*']
-
-        for n, (ozernik, karma) in enumerate(leaderboard[:10], 1):
-            level = get_level(karma.karma)
-            next_level_karma = get_karma(level + 1)
-
-            lines.append('')
-            lines.append(f'**#{n} <:cigar:1208007437639225415> <@{ozernik.discord_id}>**\n'
-                         f'ㅤ  Уровень: `{level}`\n'
-                         f'ㅤ  Карма: `{karma.weekly_karma}/{next_level_karma}`')
-
-        embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
-
-        await interaction.response.send_message(
-            embed=embed
-        )
-
-    @app_commands.command(name='leaderboard_cubes', description='Таблица лидеров Кубов.')
+    @app_commands.command(name='leaderboard_cubes', description='Таблица лидеров Кубов. Сокращение: ,lbc')
     @app_commands.guilds(config.GUILD_ID)
     async def leaderboard_cubes(self, interaction: Interaction):
-        leaderboard = get_cube_leaderboard()
-        if not leaderboard:
-            await interaction.response.send_message('Нет таблицы лидеров Кубов.', ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title='Таблица лидеров Кубов',
-            colour=interaction.user.top_role.colour,
-        )
-
-        if interaction.guild.icon:
-            embed.set_thumbnail(url=interaction.guild.icon.url)
-
-        lines = ['*Время, проведённое вместе.*']
-
-        for n, row in enumerate(leaderboard[:10], 1):
-            cube_binds = row['cube_binds']
-            total = row['total_bind_karma']
-
-            lines.append('')
-            lines.append(f'**#{n} <:cigar:1208007437639225415> <@{row["ozernik"].discord_id}>**\n'
-                         f'ㅤ  Куб: `{row["cube"]["name"]}` ({cube_binds} {plural_ru(cube_binds, ("связь", "связи", "связей"))})\n'
-                         f'ㅤ  Связь: `{total}` ед. с. ({format_duration_minutes(total) or "0 минут"})')
-
-        embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
-
-        await interaction.response.send_message(
-            embed=embed
-        )
+        await self.send_leaderboard(interaction, 'leaderboard_cubes')
 
     # ------ АДМИНИСТРИРОВАНИЕ КАРМЫ ------
 
