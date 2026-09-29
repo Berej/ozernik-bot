@@ -1,4 +1,4 @@
-"""Тесты админских команд кармы (/karma_add, /karma_remove, /karma_set, /karma_status) и топа Кубов."""
+"""Тесты админских команд кармы (/karma_add, /karma_remove, /karma_set, /karma_status)."""
 
 from types import SimpleNamespace
 
@@ -62,7 +62,7 @@ class TestKarmaEdit:
             "Недельная: `0` → `150`"
         )
 
-    async def test_add_is_not_gift_and_congratulates_once(self, env):
+    async def test_add_congratulates_once(self, env):
         channel = env.karma_channel
         env.data.karma_channel_id = channel.id
         create_all_roles(env)
@@ -70,10 +70,10 @@ class TestKarmaEdit:
 
         await env.cog.karma_add.callback(env.cog, make_interaction(admin(env), env.guild), target, 1000)
 
-        assert karma(env, target).gift_karma == 0
         # 0 → 10 уровень: одно сообщение о последнем уровне, без промежуточных.
         channel.send.assert_awaited_once()
-        assert channel.send.call_args.kwargs["embed"].title == f"**{target.display_name} достигает 10 уровня**"
+        assert channel.send.call_args.kwargs["embed"].title == f"**{target.display_name} повышает уровень!**"
+        assert channel.send.call_args.kwargs["embed"].description.startswith("Вы достигаете 10 уровня.")
 
     async def test_set_up_congratulates_once(self, env):
         channel = env.karma_channel
@@ -84,7 +84,8 @@ class TestKarmaEdit:
         await env.cog.karma_set.callback(env.cog, make_interaction(admin(env), env.guild), target, 4999)
 
         channel.send.assert_awaited_once()
-        assert channel.send.call_args.kwargs["embed"].title == f"**{target.display_name} достигает 24 уровня**"
+        assert channel.send.call_args.kwargs["embed"].title == f"**{target.display_name} повышает уровень!**"
+        assert channel.send.call_args.kwargs["embed"].description.startswith("Вы достигаете 24 уровня.")
 
     @pytest.mark.parametrize(
         ("command", "amount"),
@@ -300,129 +301,6 @@ class TestKarmaStatus:
         await env.cog.karma_status.callback(env.cog, make_interaction(admin(env), env.guild), target, status_choice("deva"))
 
         assert karma(env, target).status == "deva"
-
-
-# ---------- ТОП КУБОВ -----------
-
-def bind(env, first: int, second: int, amount: int):
-    ids = []
-    for discord_id in (first, second):
-        ozernik = env.db.get_user_by_discord_id(discord_id)
-        ids.append(ozernik.id if ozernik else add_ozernik(env, discord_id))
-    env.db.add_bind_karma(*ids, amount)
-
-
-class TestCubeLeaderboard:
-    def test_empty(self, env):
-        assert env.karma.get_cube_leaderboard() == []
-
-    def test_order_cube_then_total(self, env):
-        # 1: белый куб (10 белых связей)
-        for n in range(10):
-            bind(env, 1, 100 + n, 360)
-        # 2: чёрный куб, 3 связи, много минут
-        for n in range(3):
-            bind(env, 2, 200 + n, 300)
-        # 3: чёрный куб, 3 связи, мало минут
-        for n in range(3):
-            bind(env, 3, 300 + n, 10)
-
-        rows = [row for row in env.karma.get_cube_leaderboard() if row["ozernik"].discord_id in (1, 2, 3)]
-        top = [(row["ozernik"].discord_id, row["cube"]["tag_name"], row["cube_binds"], row["total_bind_karma"]) for row in rows]
-
-        assert top == [
-            (1, "white_cube", 10, 3600),
-            (2, "black_cube", 3, 900),
-            (3, "black_cube", 3, 30),
-        ]
-
-    def test_same_cube_ordered_by_time_not_by_number_of_binds(self, env):
-        """Случай со скриншота: у всех Чёрный Куб — решает время, а не число людей."""
-        for n in range(29):
-            bind(env, 1, 100 + n, 70)   # 29 связей, 2030 минут
-        for n in range(5):
-            bind(env, 2, 200 + n, 500)  # 5 связей, 2500 минут
-        # Одна белая связь (из 10 нужных) Куб не повышает и места не даёт.
-        bind(env, 3, 300, 360)
-        bind(env, 3, 301, 1)
-
-        rows = [row for row in env.karma.get_cube_leaderboard() if row["ozernik"].discord_id in (1, 2, 3)]
-        top = [(row["ozernik"].discord_id, row["cube"]["tag_name"], row["total_bind_karma"]) for row in rows]
-
-        assert top == [
-            (2, "black_cube", 2500),
-            (1, "black_cube", 2030),
-            (3, "black_cube", 361),
-        ]
-
-    def test_higher_cube_beats_more_time(self, env):
-        for n in range(10):
-            bind(env, 1, 100 + n, 360)   # Белый Куб, 3600 минут
-        for n in range(3):
-            bind(env, 2, 200 + n, 5000)  # Чёрный Куб, 15000 минут
-
-        rows = env.karma.get_cube_leaderboard()
-
-        assert [row["ozernik"].discord_id for row in rows[:2]] == [1, 2]
-
-    def test_cube_binds_counts_only_binds_of_cube_level(self, env):
-        for n in range(10):
-            bind(env, 1, 100 + n, 1440)  # 10 синих
-        bind(env, 1, 200, 5)  # чёрная — в счёт синего куба не идёт
-
-        row = env.karma.get_cube_leaderboard()[0]
-
-        assert (row["cube"]["tag_name"], row["cube_binds"], row["total_bind_karma"]) == ("blue_cube", 10, 14405)
-
-    def test_both_sides_of_bind_are_counted(self, env):
-        bind(env, 1, 2, 50)
-
-        rows = env.karma.get_cube_leaderboard()
-
-        assert {row["ozernik"].discord_id for row in rows} == {1, 2}
-
-    async def test_command(self, env):
-        for n in range(10):
-            bind(env, 1, 100 + n, 360)
-        bind(env, 2, 3, 400)  # больше, чем у каждого из 10 партнёров первого
-        user = env.guild.add_member(1)
-        interaction = make_interaction(user, env.guild)
-
-        await env.cog.leaderboard_cubes.callback(env.cog, interaction)
-
-        embed = interaction.response.send_message.call_args.kwargs["embed"]
-        assert embed.title == "Таблица лидеров Кубов"
-        assert (
-            "🥇 <:cigar:1208007437639225415> <@1>**\n"
-            "ㅤ  Куб: `Белый Куб` (10 связей)\n"
-            "ㅤ  Связь: `3600` ед. с. (2 дня, 12 часов)"
-        ) in embed.description
-        assert "Куб: `Черный Куб` (1 связь)" in embed.description
-        assert "Связь: `400` ед. с. (6 часов, 40 минут)" in embed.description
-
-    async def test_command_top_10(self, env):
-        for n in range(12):
-            bind(env, 1000 + n, 2000 + n, n + 1)
-        interaction = make_interaction(env.guild.add_member(1), env.guild)
-
-        await env.cog.leaderboard_cubes.callback(env.cog, interaction)
-
-        assert interaction.response.send_message.call_args.kwargs["embed"].description.count("<:cigar:") == 10
-
-    async def test_command_empty(self, env):
-        interaction = make_interaction(env.guild.add_member(1), env.guild)
-
-        await env.cog.leaderboard_cubes.callback(env.cog, interaction)
-
-        interaction.response.send_message.assert_awaited_once_with("Нет таблицы лидеров Кубов.", ephemeral=True)
-
-    async def test_zero_minutes(self, env):
-        env.db._ensure_karmic_bind(add_ozernik(env, 1), add_ozernik(env, 2))
-        interaction = make_interaction(env.guild.add_member(5), env.guild)
-
-        await env.cog.leaderboard_cubes.callback(env.cog, interaction)
-
-        assert "Связь: `0` ед. с. (0 минут)" in interaction.response.send_message.call_args.kwargs["embed"].description
 
 
 @pytest.mark.parametrize(

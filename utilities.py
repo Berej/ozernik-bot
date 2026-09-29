@@ -10,6 +10,7 @@ from typing import Any, Literal
 import sqlite3
 import time
 from collections.abc import MutableMapping
+from copy import deepcopy
 
 class JsonWorker:
     def __init__(self, path: str):
@@ -24,13 +25,25 @@ class JsonWorker:
             with open(self.json_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except FileNotFoundError:
-            with open(self.json_path, "w", encoding="utf-8") as f:
-                json.dump({}, f, ensure_ascii=False, indent=4)
+            self._write_json({})
             return {}
 
+    def _write_json(self, data: dict[str, Any]) -> None:
+        """
+        Безопасная запись: сначала во временный файл рядом, потом подмена старого.
+
+        Если бота выключат посреди записи, на диске останется старый целый файл,
+        а не обрезанный наполовину (os.replace подменяет файл одним действием).
+        """
+        tmp_path = self.json_path.with_name(self.json_path.name + ".tmp")
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+
+        os.replace(tmp_path, self.json_path)
+
     def _commit_data(self) -> None:
-        with open(self.json_path, "w", encoding="utf-8") as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=4)
+        self._write_json(self._data)
 
 class DataWorker(JsonWorker):
     def __init__(self, path: str, setup: dict | None = None):
@@ -52,8 +65,23 @@ class DataWorker(JsonWorker):
         self._commit_data()
 
 class NewDataWorker(JsonWorker, MutableMapping):
+    """
+    JSON-словарь, который пишет на диск фоновой задачей (чтобы запись не тормозила бота).
+
+    Правила, выученные на потере текстов уровней (2026-09-29):
+    - ошибка записи не должна убивать задачу-писатель: раньше после первой же ошибки
+      правки жили только в памяти и молча пропадали при перезапуске;
+    - при закрытии — последняя запись: иначе правка за долю секунды до выключения терялась.
+    """
+
+    # Пауза перед повтором после ошибки записи (секунды).
+    RETRY_DELAY = 10
+
     def __init__(self, path: str, setup: dict | None = None):
         super().__init__(path)
+
+        # Есть правки, ещё не дошедшие до диска.
+        self._dirty = False
 
         self._commit_event = asyncio.Event()
         self._commit_task = asyncio.create_task(
@@ -65,17 +93,32 @@ class NewDataWorker(JsonWorker, MutableMapping):
             self._commit()
 
     async def _commit_worker(self):
-        try:
-            while True:
-                await self._commit_event.wait()
-                self._commit_event.clear()
+        while True:
+            await self._commit_event.wait()
+            self._commit_event.clear()
 
-                await asyncio.to_thread(self._commit_data)
+            # Снимок в основном потоке: пока файл пишется в другом потоке,
+            # словарь могут менять — json.dump по живому словарю может упасть.
+            snapshot = deepcopy(self._data)
 
-        except asyncio.CancelledError:
-            raise
+            try:
+                await asyncio.to_thread(self._write_json, snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                print(
+                    f"[NewDataWorker] Не удалось записать {self.json_path}, "
+                    f"повтор через {self.RETRY_DELAY} с:\n{traceback.format_exc()}"
+                )
+                await asyncio.sleep(self.RETRY_DELAY)
+                self._commit_event.set()
+                continue
+
+            # Если за время записи пришла новая правка — событие снова взведено.
+            self._dirty = self._commit_event.is_set()
 
     def _commit(self):
+        self._dirty = True
         self._commit_event.set()
 
     async def close(self):
@@ -85,6 +128,14 @@ class NewDataWorker(JsonWorker, MutableMapping):
             await self._commit_task
         except asyncio.CancelledError:
             pass
+
+        # Последняя запись того, что не успело дойти до диска.
+        if self._dirty:
+            try:
+                self._write_json(self._data)
+                self._dirty = False
+            except Exception:
+                print(f"[NewDataWorker] Не удалось записать {self.json_path} при закрытии:\n{traceback.format_exc()}")
 
     def __getitem__(self, key):
         return self._data[key]
@@ -279,29 +330,11 @@ class DataTypes:
             self.telegram_id = user_row['telegram_id']
             self.telegram_bot_id = user_row['telegram_bot_id']
 
-            # self.karmic_binds = []
-            # for karmic_bind_row in karmic_bind_rows:
-            #     if karmic_bind_row['user1_id'] == self.id:
-            #         bound_id = karmic_bind_row['user1_id']
-            #     elif karmic_bind_row['user2_id'] == self.id:
-            #         bound_id = karmic_bind_row['user2_id']
-            #     else:
-            #         continue
-            #
-            #     self.karmic_binds.append({
-            #         'bound_id': bound_id,
-            #         'bind_karma': bind_karma,
-            #         'gift_bind_karma': gift_bind_karma,
-            #         'weekly_bind_karma': weekly_bind_karma,
-            #         'weekly_gift_bind_karma': weekly_gift_bind_karma,
-            #     })
-
     class Karma(OzernikDataType):
         def __init__(self, row: sqlite3.Row):
             self.user_id = row['user_id']
             self.karma = row['karma']
             self.status = row['status']
-            self.gift_karma = row['gift_karma']
             self.weekly_karma = row['weekly_karma']
             self.karma_updated_at = row['karma_updated_at'] # Время последнего изменения кармы в мс
 
@@ -309,8 +342,6 @@ class DataTypes:
         def __init__(self, row: sqlite3.Row):
             self.ids = (row['user1_id'], row['user2_id'])
             self.bind_karma = row['bind_karma']
-            self.gift_bind_karma = row['gift_bind_karma']
-            self.weekly_bind_karma = row['weekly_bind_karma']
 
     class ChatLink(OzernikDataType):
         def __init__(self, row: sqlite3.Row):
@@ -332,6 +363,87 @@ class DataTypes:
 def now_ms() -> int:
     """Текущее время в миллисекундах (Unix)."""
     return time.time_ns() // 1_000_000
+
+# Аппендиксы, вычищенные по решению Alium (2026-09-29), — механик не будет:
+# недельная Связь (weekly_bind_karma), Связь за ответы в чате (причина 'reply'),
+# подарочная карма и Связь (gift_karma, gift_bind_karma, причина 'gift' —
+# «подарками» Габ называл начисления от администрации, их делает /karma_add).
+# Старые базы пересобираются миграцией Database._migrate_appendices.
+
+KARMA_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS karma (
+        user_id INTEGER PRIMARY KEY,
+        status TEXT DEFAULT NULL,
+        karma INTEGER NOT NULL DEFAULT 0,
+        weekly_karma INTEGER NOT NULL DEFAULT 0,
+        karma_updated_at INTEGER NOT NULL DEFAULT 0,
+
+        CHECK (
+            status IS NULL
+            OR status IN ('asur', 'deva')
+        ),
+
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE
+    );
+"""
+
+KARMA_LOGS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS karma_logs (
+        user_id INTEGER NOT NULL,
+        added_at INTEGER NOT NULL,
+        added_karma INTEGER NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL DEFAULT 'n/a',
+
+        CHECK (reason IN ('message', 'n/a')),
+
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+"""
+
+KARMIC_BIND_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS karmic_bind (
+        user1_id INTEGER NOT NULL,
+        user2_id INTEGER NOT NULL,
+        bind_karma INTEGER NOT NULL DEFAULT 0,
+
+        PRIMARY KEY (user1_id, user2_id),
+        CHECK (user1_id < user2_id),
+
+        FOREIGN KEY (user1_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (user2_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+"""
+
+KARMIC_BIND_LOGS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS karmic_bind_logs (
+        user1_id INTEGER NOT NULL,
+        user2_id INTEGER NOT NULL,
+        added_at INTEGER NOT NULL,
+        added_karma INTEGER NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL DEFAULT 'n/a',
+
+        CHECK (reason IN ('voice', 'n/a')),
+        CHECK (user1_id < user2_id),
+
+        FOREIGN KEY (user1_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (user2_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+"""
+
+# Тексты повышений уровней Сансары (редактируются в /settings_karma → «Текст повышений»).
+# Раньше жили в modules/karma_sistem/levels.json: файл не в git, лежал в папке с кодом,
+# писался фоновой задачей — и однажды пропал при обновлении бота (2026-09-29).
+# В базе они переживают обновления вместе с кармой.
+KARMA_LEVEL_TEXTS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS karma_level_texts (
+        level INTEGER PRIMARY KEY,
+        text TEXT NOT NULL DEFAULT '',
+
+        CHECK (level BETWEEN 1 AND 100)
+    );
+"""
 
 class OzernikNotfound(Exception):
     """Озёрник не найден в Discord"""
@@ -364,25 +476,7 @@ class Database:
             """)
 
             # Таблица кармы
-            self.execute("""
-                CREATE TABLE IF NOT EXISTS karma (
-                    user_id INTEGER PRIMARY KEY,
-                    status TEXT DEFAULT NULL,
-                    karma INTEGER NOT NULL DEFAULT 0,
-                    gift_karma INTEGER NOT NULL DEFAULT 0,
-                    weekly_karma INTEGER NOT NULL DEFAULT 0,
-                    karma_updated_at INTEGER NOT NULL DEFAULT 0,
-                
-                    CHECK (
-                        status IS NULL
-                        OR status IN ('asur', 'deva')
-                    ),
-                
-                    FOREIGN KEY (user_id)
-                        REFERENCES users(id)
-                        ON DELETE CASCADE
-                );
-            """)
+            self.execute(KARMA_TABLE_SQL)
 
             # Миграция старых баз: время последнего изменения кармы
             # (нужно для порядка в топе при равной карме).
@@ -394,57 +488,25 @@ class Database:
                 """)
 
             # Логи кармы
-            self.execute("""
-                CREATE TABLE IF NOT EXISTS karma_logs (
-                    user_id INTEGER NOT NULL,
-                    added_at INTEGER NOT NULL,
-                    added_karma INTEGER NOT NULL DEFAULT 0,
-                    reason TEXT NOT NULL DEFAULT 'n/a',
-                    
-                    CHECK (reason IN ('message', 'gift', 'n/a')),
-    
-                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-                );
-            """)
+            self.execute(KARMA_LOGS_TABLE_SQL)
+
+            # Тексты повышений уровней
+            self.execute(KARMA_LEVEL_TEXTS_TABLE_SQL)
+
+            # Таблица кармической связи
+            self.execute(KARMIC_BIND_TABLE_SQL)
+
+            # Логи кармической связи
+            self.execute(KARMIC_BIND_LOGS_TABLE_SQL)
+
+            # Миграция старых баз: вычистить аппендиксы (см. комментарий у констант схемы).
+            # Индексы создаются после — пересборка таблицы удаляет её индексы.
+            self._migrate_appendices()
 
             # Индексы логов кармы для быстрого поиска
             self.execute("""
                 CREATE INDEX IF NOT EXISTS idx_karma_logs_user_time
                 ON karma_logs(user_id, added_at);
-            """)
-
-            # Таблица кармической связи
-            self.execute("""
-                CREATE TABLE IF NOT EXISTS karmic_bind (
-                    user1_id INTEGER NOT NULL,
-                    user2_id INTEGER NOT NULL,
-                    bind_karma INTEGER NOT NULL DEFAULT 0,
-                    gift_bind_karma INTEGER NOT NULL DEFAULT 0,
-                    weekly_bind_karma INTEGER NOT NULL DEFAULT 0,
-    
-                    PRIMARY KEY (user1_id, user2_id),
-                    CHECK (user1_id < user2_id),
-    
-                    FOREIGN KEY (user1_id) REFERENCES users(id) ON DELETE CASCADE,
-                    FOREIGN KEY (user2_id) REFERENCES users(id) ON DELETE CASCADE
-                );
-            """)
-
-            # Логи кармической связи
-            self.execute("""
-                CREATE TABLE IF NOT EXISTS karmic_bind_logs (
-                    user1_id INTEGER NOT NULL,
-                    user2_id INTEGER NOT NULL,
-                    added_at INTEGER NOT NULL,
-                    added_karma INTEGER NOT NULL DEFAULT 0,
-                    reason TEXT NOT NULL DEFAULT 'n/a',
-                    
-                    CHECK (reason IN ('voice', 'reply', 'gift', 'n/a')),
-                    CHECK (user1_id < user2_id),
-                    
-                    FOREIGN KEY (user1_id) REFERENCES users(id) ON DELETE CASCADE,
-                    FOREIGN KEY (user2_id) REFERENCES users(id) ON DELETE CASCADE
-                );
             """)
 
             # Индексы логов кармической связи для быстрого поиска
@@ -479,6 +541,60 @@ class Database:
                     FOREIGN KEY (link_chat_id) REFERENCES chat_links(id)
                 );
             """)
+
+    def _rebuild_table(self, name: str, create_sql: str, columns: str, where: str = '') -> None:
+        """
+        Пересоздаёт таблицу по новой схеме с сохранением данных.
+
+        SQLite не умеет менять CHECK у существующей таблицы, а DROP COLUMN
+        есть только с версии 3.35 — поэтому стандартный путь: переименовать
+        старую, создать новую, перенести строки, удалить старую.
+        """
+        self.execute(f"ALTER TABLE {name} RENAME TO {name}_old")
+        self.execute(create_sql)
+        self.execute(f"INSERT INTO {name} ({columns}) SELECT {columns} FROM {name}_old {where}")
+        self.execute(f"DROP TABLE {name}_old")
+
+    def _table_columns(self, name: str) -> set[str]:
+        return {row['name'] for row in self.fetchall(f"PRAGMA table_info({name})")}
+
+    def _table_sql(self, name: str) -> str:
+        return self.fetchone(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        )['sql']
+
+    def _migrate_appendices(self) -> None:
+        """Пересобирает таблицы старых баз без вычищенных колонок и причин логов. Данные сохраняются."""
+        if 'gift_karma' in self._table_columns('karma'):
+            self._rebuild_table(
+                'karma',
+                KARMA_TABLE_SQL,
+                'user_id, status, karma, weekly_karma, karma_updated_at',
+            )
+
+        if {'weekly_bind_karma', 'gift_bind_karma'} & self._table_columns('karmic_bind'):
+            self._rebuild_table(
+                'karmic_bind',
+                KARMIC_BIND_TABLE_SQL,
+                'user1_id, user2_id, bind_karma',
+            )
+
+        if "'gift'" in self._table_sql('karma_logs'):
+            self._rebuild_table(
+                'karma_logs',
+                KARMA_LOGS_TABLE_SQL,
+                'user_id, added_at, added_karma, reason',
+                where="WHERE reason IN ('message', 'n/a')",
+            )
+
+        logs_sql = self._table_sql('karmic_bind_logs')
+        if "'reply'" in logs_sql or "'gift'" in logs_sql:
+            self._rebuild_table(
+                'karmic_bind_logs',
+                KARMIC_BIND_LOGS_TABLE_SQL,
+                'user1_id, user2_id, added_at, added_karma, reason',
+                where="WHERE reason IN ('voice', 'n/a')",
+            )
 
     def close_(self) -> None:
         self._con.close()
@@ -826,7 +942,6 @@ class KarmaDatabase(Database):
         """
         Уменьшает обычную карму пользователя. Ниже нуля карма не опускается.
 
-        Подарочная карма урезается, если стала больше обычной.
         Если weekly=True, на то же количество уменьшается weekly_karma
         (тоже не ниже нуля).
 
@@ -845,15 +960,11 @@ class KarmaDatabase(Database):
             row = self.fetchone("""
                 UPDATE karma
                 SET karma = MAX(karma - ?, 0),
-                    gift_karma = MIN(
-                        gift_karma,
-                        MAX(karma - ?, 0)
-                    ),
                     weekly_karma = MAX(weekly_karma - ?, 0),
                     karma_updated_at = ?
                 WHERE user_id = ?
                 RETURNING *
-            """, (karma, karma, karma if weekly else 0, now_ms(), user_id))
+            """, (karma, karma if weekly else 0, now_ms(), user_id))
 
         return DataTypes.Karma(row)
 
@@ -861,7 +972,6 @@ class KarmaDatabase(Database):
         """
         Устанавливает точное значение обычной кармы пользователя.
 
-        Подарочная карма урезается, если стала больше обычной.
         Если weekly=True, недельная карма меняется на ту же разницу
         (не ниже нуля); установка 0 обнуляет и её.
 
@@ -887,11 +997,10 @@ class KarmaDatabase(Database):
                         WHEN ? THEN MAX(weekly_karma + (? - karma), 0)
                         ELSE weekly_karma
                     END,
-                    gift_karma = MIN(gift_karma, ?),
                     karma = ?
                 WHERE user_id = ?
                 RETURNING *
-            """, (karma, now_ms(), weekly, karma, karma, karma, user_id))
+            """, (karma, now_ms(), weekly, karma, karma, user_id))
 
         return DataTypes.Karma(row)
 
@@ -921,36 +1030,57 @@ class KarmaDatabase(Database):
 
         return DataTypes.Karma(row)
 
-    def add_gift_karma(self, user_id: int, karma: int, weekly: bool = False) -> DataTypes.Karma:
+    # Тексты повышений уровней
+
+    def get_level_texts(self) -> dict[int, str]:
         """
-        Добавляет пользователю подарочную карму.
+        Все сохранённые тексты повышений.
 
-        Увеличивает общую карму пользователя и отдельно учитывает её
-        как подарочную в gift_karma. Если weekly=True, также увеличивает
-        weekly_karma.
-
-        gift_karma нужна для учёта того, какая часть общей кармы была
-        получена в подарок.
-
-        :param user_id: Внутренний ID пользователя из таблицы users.
-        :param karma: Количество добавляемой подарочной кармы.
-        :param weekly: Учитывать ли изменение в недельной карме.
-        :return: Обновлённый объект ``Karma``.
+        :return: Словарь уровень → текст. Уровней без текста в словаре нет.
         """
-        self._ensure_karma_row(user_id)
+        rows = self.fetchall("""
+            SELECT level, text
+            FROM karma_level_texts
+            ORDER BY level
+        """)
+
+        return {row['level']: row['text'] for row in rows}
+
+    def get_level_text(self, level: int) -> str:
+        """
+        Текст повышения на уровень.
+
+        :param level: Уровень Сансары.
+        :return: Текст или пустая строка, если текст не задан.
+        """
+        row = self.fetchone("""
+            SELECT text
+            FROM karma_level_texts
+            WHERE level = ?
+        """, (level,))
+
+        return row['text'] if row else ''
+
+    def set_level_texts(self, texts: dict[int, str]) -> None:
+        """
+        Сохраняет тексты повышений одной транзакцией. Не переданные уровни не меняются.
+
+        :param texts: Словарь уровень → текст.
+        :raises ValueError: Если уровень не от 1 до 100 или текст не строка.
+        """
+        for level, text in texts.items():
+            if not isinstance(level, int) or not 1 <= level <= 100:
+                raise ValueError(f"Уровень должен быть числом от 1 до 100, а не {level!r}.")
+            if not isinstance(text, str):
+                raise ValueError(f"Текст уровня {level} должен быть строкой.")
 
         with self.transaction():
-            row = self.fetchone("""
-                UPDATE karma
-                SET karma = karma + ?,
-                    gift_karma = gift_karma + ?,
-                    weekly_karma = weekly_karma + ?,
-                    karma_updated_at = ?
-                WHERE user_id = ?
-                RETURNING *
-            """,(karma, karma, karma if weekly else 0, now_ms(), user_id))
-
-        return DataTypes.Karma(row)
+            for level, text in texts.items():
+                self.execute("""
+                    INSERT INTO karma_level_texts (level, text)
+                    VALUES (?, ?)
+                    ON CONFLICT(level) DO UPDATE SET text = excluded.text
+                """, (level, text))
 
     def reset_weekly_karma(self) -> None:
         """
@@ -1055,7 +1185,6 @@ class KarmaDatabase(Database):
                    karma.user_id,
                    karma.status,
                    karma.karma,
-                   karma.gift_karma,
                    karma.weekly_karma,
                    karma.karma_updated_at
             FROM users
@@ -1083,7 +1212,6 @@ class KarmaDatabase(Database):
                    karma.user_id,
                    karma.status,
                    karma.karma,
-                   karma.gift_karma,
                    karma.weekly_karma,
                    karma.karma_updated_at
             FROM users
@@ -1096,7 +1224,7 @@ class KarmaDatabase(Database):
         return [(DataTypes.Ozernik(row), DataTypes.Karma(row)) for row in rows]
 
     # Функции логов кармы
-    def _add_karma_log(self, user_id: int, added_karma: int, added_at_in_unix: int, reason: Literal['message', 'gift', 'n/a']='n/a') -> int:
+    def _add_karma_log(self, user_id: int, added_karma: int, added_at_in_unix: int, reason: Literal['message', 'n/a']='n/a') -> int:
         """
         Добавляет запись в лог изменения кармы пользователя.
 
@@ -1104,11 +1232,11 @@ class KarmaDatabase(Database):
         :param added_karma: Количество добавленной или убранной кармы.
         :param added_at_in_unix: Время изменения в Unix timestamp.
         :param reason: Причина изменения кармы:
-            message, gift или n/a.
+            message или n/a.
         :return: ID созданной записи в karma_logs.
         """
-        if reason not in ("message", "gift", "n/a"):
-            raise ValueError('reason должен быть равен "message", "gift" или "n/a".')
+        if reason not in ("message", "n/a"):
+            raise ValueError('reason должен быть равен "message" или "n/a".')
 
         with self.transaction():
             row = self.fetchone("""
@@ -1261,40 +1389,47 @@ class KarmaDatabase(Database):
 
         return DataTypes.KarmicBind(row)
 
-    def add_gift_bind_karma(self, user1_id, user2_id, karma: int) -> DataTypes.KarmicBind:
+    def add_bind_karma_many(self, pairs: list[tuple[int, int]], karma: int) -> list[DataTypes.KarmicBind]:
         """
-        Добавляет подарочную карму к кармической связи двух пользователей.
+        То же, что add_bind_karma, но для многих пар одной транзакцией.
 
-        :param user1_id: Внутренний ID первого пользователя.
-        :param user2_id: Внутренний ID второго пользователя.
-        :param karma: Количество добавляемой подарочной кармы связи.
-        :return: Обновлённый объект KarmicBind.
-        :raises ValueError: Если karma меньше или равна нулю.
+        Запись на диск (коммит) — самая дорогая часть: ~15 мс. Голосовой цикл
+        раньше делал по два коммита на каждую пару и останавливал бота на секунды.
+
+        :param pairs: Пары внутренних ID пользователей.
+        :param karma: Сколько кармы связи добавить каждой паре.
+        :return: Обновлённые связи в том же порядке, что и pairs.
+        :raises ValueError: Если в паре один и тот же пользователь.
         """
-        if karma <= 0:
-            raise ValueError("karma должна быть больше нуля.")
-
-        pair = self._normalize_pair(user1_id, user2_id)
-        self._ensure_karmic_bind(*pair)
+        normalized = [self._normalize_pair(user1_id, user2_id) for user1_id, user2_id in pairs]
+        binds = []
 
         with self.transaction():
-            row = self.fetchone("""
-                UPDATE karmic_bind
-                SET bind_karma = bind_karma + ?,
-                    gift_bind_karma = gift_bind_karma + ?
-                WHERE user1_id = ?
-                  AND user2_id = ?
-                RETURNING *
-            """, (karma, karma, *pair))
+            for pair in normalized:
+                self.execute("""
+                    INSERT INTO karmic_bind (
+                        user1_id,
+                        user2_id
+                    )
+                    VALUES (?, ?)
+                    ON CONFLICT(user1_id, user2_id) DO NOTHING
+                """, pair)
 
-        return DataTypes.KarmicBind(row)
+                row = self.fetchone("""
+                    UPDATE karmic_bind
+                    SET bind_karma = bind_karma + ?
+                    WHERE user1_id = ?
+                      AND user2_id = ?
+                    RETURNING *
+                """, (karma, *pair))
+
+                binds.append(DataTypes.KarmicBind(row))
+
+        return binds
 
     def remove_bind_karma(self, user1_id, user2_id, karma: int) -> DataTypes.KarmicBind:
         """
-        Уменьшает обычную карму кармической связи двух пользователей.
-
-        При необходимости также должна уменьшать gift_binding_karma, если подарочная
-        карма связи стала больше обычной кармы связи.
+        Уменьшает карму кармической связи двух пользователей.
 
         :param user1_id: Внутренний ID первого пользователя.
         :param user2_id: Внутренний ID второго пользователя.
@@ -1311,15 +1446,11 @@ class KarmaDatabase(Database):
         with self.transaction():
             row = self.fetchone("""
                 UPDATE karmic_bind
-                SET bind_karma = bind_karma - ?,
-                    gift_bind_karma = MIN(
-                        gift_bind_karma,
-                        MAX(bind_karma - ?, 0)
-                    )
+                SET bind_karma = bind_karma - ?
                 WHERE user1_id = ?
                   AND user2_id = ?
                 RETURNING *
-            """, (karma, karma, *pair))
+            """, (karma, *pair))
 
         return DataTypes.KarmicBind(row)
 
@@ -1342,15 +1473,11 @@ class KarmaDatabase(Database):
         with self.transaction():
             row = self.fetchone("""
                 UPDATE karmic_bind
-                SET bind_karma = ?,
-                    gift_bind_karma = MIN(
-                        gift_bind_karma,
-                        ?
-                    )
+                SET bind_karma = ?
                 WHERE user1_id = ?
                   AND user2_id = ?
                 RETURNING *
-            """, (karma, karma, *pair))
+            """, (karma, *pair))
 
         return DataTypes.KarmicBind(row)
 
@@ -1368,9 +1495,7 @@ class KarmaDatabase(Database):
             SELECT users.*,
                    karmic_bind.user1_id,
                    karmic_bind.user2_id,
-                   karmic_bind.bind_karma,
-                   karmic_bind.gift_bind_karma,
-                   karmic_bind.weekly_bind_karma
+                   karmic_bind.bind_karma
             FROM karmic_bind
             JOIN users
               ON users.id = CASE
@@ -1456,7 +1581,7 @@ class KarmaDatabase(Database):
         return result
 
     # Функции логов кармическиих уз
-    def _add_karmic_bind_log(self, user1_id: int, user2_id: int, added_karma: int, added_at_in_unix: int, reason: Literal['voice', 'reply', 'gift', 'n/a']='n/a') -> int:
+    def _add_karmic_bind_log(self, user1_id: int, user2_id: int, added_karma: int, added_at_in_unix: int, reason: Literal['voice', 'n/a']='n/a') -> int:
         """
         Добавляет запись в лог изменения кармической связи.
 
@@ -1464,12 +1589,12 @@ class KarmaDatabase(Database):
         :param user2_id: Внутренний ID второго пользователя.
         :param added_karma: Количество добавленной или убранной кармы связи.
         :param added_at_in_unix: Время изменения в Unix timestamp.
-        :param reason: Причина изменения связи: ``voice``, ``reply``, ``gift`` или ``n/a``.
+        :param reason: Причина изменения связи: ``voice`` или ``n/a``.
         :return: ID созданной записи в karmic_bind_logs.
         :raises ValueError: Если параметр ``reason`` имеет недопустимое значение.
         """
-        if reason not in ('voice', 'reply', 'gift', 'n/a'):
-            raise ValueError('reason должен быть равен "voice", "reply", "gift" или "n/a".')
+        if reason not in ('voice', 'n/a'):
+            raise ValueError('reason должен быть равен "voice" или "n/a".')
 
         pair = self._normalize_pair(user1_id, user2_id)
 
