@@ -234,3 +234,31 @@ class TestNewDataWorker:
 
         assert dict(worker) == {"a": "было", "b": ""}
         await worker.close()
+
+
+# ---------- ПЕРЕЖИВАЕТ ПЕРЕЗАПУСК -----------
+
+def test_level_texts_survive_restart(tmp_path):
+    """
+    Тексты пишутся в файл базы сразу при сохранении: после «выключения»
+    (закрытия соединения) и «запуска» (нового соединения к тому же файлу) они на месте.
+    """
+    import sqlite3
+
+    path = tmp_path / "database.db"
+
+    def open_db():
+        db = utilities.KarmaDatabase.__new__(utilities.KarmaDatabase)
+        db._con = sqlite3.connect(path)
+        db._con.row_factory = sqlite3.Row
+        db._con.execute("PRAGMA foreign_keys = ON")
+        db._init_db()
+        return db
+
+    db = open_db()
+    db.set_level_texts({1: "Первый", 10: "Десятый"})
+    db._con.close()  # бот выключен — без какой-либо «последней записи»
+
+    db = open_db()   # бот запущен снова, в т.ч. с повторной миграцией схемы
+    assert db.get_level_texts() == {1: "Первый", 10: "Десятый"}
+    db._con.close()

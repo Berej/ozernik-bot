@@ -759,16 +759,26 @@ def get_level_up_text(level: int) -> str:
 
     return text
 
-def get_level_up_verb(level: int) -> str:
-    # Заглушка: глагол в строке «Вы … N уровня». Позже — разные глаголы для разных уровней/этапов.
-    return 'достигаете'
+def get_level_up_line(level: int) -> str:
+    """
+    Строка «Вы … N уровня.» — глагол зависит от уровня, как в старой Сансаре (решение Alium и Габа):
+    1–40 — «достигли», 41–80 — «добились», 81+ — «доползли до».
+
+    Строка собирается целиком, а не подстановкой одного глагола: у «доползли»
+    нужен предлог «до», и одна схема «Вы {глагол} N уровня» не подходит.
+    """
+    if level <= 40:
+        return f'Вы достигли {level} уровня.'
+    if level <= 80:
+        return f'Вы добились {level} уровня.'
+    return f'Вы доползли до {level} уровня.'
 
 def build_level_up_description(level: int, previous_karma: int) -> str:
     """
     Текст сообщения о повышении, по шаблону старой Сансары (Amari):
 
         [текст уровня от администрации]
-        Вы достигаете N уровня.
+        Вы достигли N уровня.  ← глагол по уровню, см. get_level_up_line
         Теперь вы @Роль          ← только при смене ступени Сансары
 
     :param previous_karma: Карма, от которой считается переход (для смены ступени).
@@ -779,7 +789,7 @@ def build_level_up_description(level: int, previous_karma: int) -> str:
     if text:
         lines.append(text)
 
-    lines.append(f'Вы {get_level_up_verb(level)} {level} уровня.')
+    lines.append(get_level_up_line(level))
 
     stage_text = get_new_stage_text(previous_karma, get_karma(level))
     if stage_text:
@@ -3546,6 +3556,42 @@ class KarmaSistem(commands.Cog):
             print(f"Error in {func_name}: {tb}")
 
     # ------------- СОБЫТИЯ --------------
+
+    async def give_join_roles(self, member: discord.Member) -> None:
+        """
+        Роли для зашедшего на сервер: ступень Сансары по карме (новичку — Нарака)
+        и Куб, если связи уже есть (вернувшийся участник). Ботам — ничего.
+
+        Раньше роль выдавалась только при повышении уровня, и новички
+        до 1 уровня ходили без роли.
+        """
+        if member.bot or member.guild != self.bot.guild:
+            return
+
+        try:
+            ozernik = self.bot.db_ensure_user(member)
+
+            await self.update_sansara_roles(member)
+
+            if get_cube_status(ozernik.id) is not None:
+                await self.update_cube_roles(member)
+        except Exception as error:
+            self.bot.print_error("give_join_roles", error)
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        # С проверкой участника (правила сервера) — ждём, пока её пройдут:
+        # роль могла бы открыть каналы в обход проверки. См. on_member_update.
+        if getattr(member, 'pending', False):
+            return
+
+        await self.give_join_roles(member)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        # Прошёл проверку участника — теперь можно выдать роли.
+        if getattr(before, 'pending', False) and not getattr(after, 'pending', False):
+            await self.give_join_roles(after)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

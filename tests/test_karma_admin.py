@@ -73,7 +73,7 @@ class TestKarmaEdit:
         # 0 → 10 уровень: одно сообщение о последнем уровне, без промежуточных.
         channel.send.assert_awaited_once()
         assert channel.send.call_args.kwargs["embed"].title == f"**{target.display_name} повышает уровень!**"
-        assert channel.send.call_args.kwargs["embed"].description.startswith("Вы достигаете 10 уровня.")
+        assert channel.send.call_args.kwargs["embed"].description.startswith("Вы достигли 10 уровня.")
 
     async def test_set_up_congratulates_once(self, env):
         channel = env.karma_channel
@@ -85,7 +85,7 @@ class TestKarmaEdit:
 
         channel.send.assert_awaited_once()
         assert channel.send.call_args.kwargs["embed"].title == f"**{target.display_name} повышает уровень!**"
-        assert channel.send.call_args.kwargs["embed"].description.startswith("Вы достигаете 24 уровня.")
+        assert channel.send.call_args.kwargs["embed"].description.startswith("Вы достигли 24 уровня.")
 
     @pytest.mark.parametrize(
         ("command", "amount"),

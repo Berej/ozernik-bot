@@ -293,3 +293,19 @@ class TestFormatting:
     def test_expand_invalid_raises_syntax_error(self, env):
         with pytest.raises(SyntaxError):
             env.karma.expand_dict("'1': 'не закрыто")
+
+
+@pytest.mark.parametrize(
+    ("level", "line"),
+    [
+        (1, "Вы достигли 1 уровня."),
+        (40, "Вы достигли 40 уровня."),
+        (41, "Вы добились 41 уровня."),
+        (80, "Вы добились 80 уровня."),
+        (81, "Вы доползли до 81 уровня."),
+        (100, "Вы доползли до 100 уровня."),
+    ],
+)
+def test_level_up_line(env, level, line):
+    """Глагол по уровню, как в старой Сансаре: достигли → добились → доползли до."""
+    assert env.karma.get_level_up_line(level) == line
