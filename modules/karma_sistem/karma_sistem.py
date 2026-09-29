@@ -2414,6 +2414,18 @@ class SettingsSansaraPage(Page):
                             content=f'Обновление ролей участников: {n}/{len(guild.members)}'
                         )
 
+                    if member.bot:
+                        # Ботам роли Сансары не положены — снимаем, если были выданы.
+                        bot_sansara_roles = [role for role in member.roles if role.id in sansara_role_ids]
+
+                        if bot_sansara_roles:
+                            await member.remove_roles(
+                                *bot_sansara_roles,
+                                reason="Ботам роли Сансары не выдаются",
+                            )
+
+                        continue
+
                     ozernik = self.bot.db_ensure_user(member)
 
                     karma = db.get_karma(ozernik.id)
@@ -2724,6 +2736,18 @@ class SettingsCubesPage(Page):
                                 f'{n}/{len(guild.members)}'
                             )
                         )
+
+                    if member.bot:
+                        # Ботам роли Кубов не положены — снимаем, если были выданы.
+                        bot_cube_roles = [role for role in member.roles if role in cube_roles]
+
+                        if bot_cube_roles:
+                            await member.remove_roles(
+                                *bot_cube_roles,
+                                reason="Ботам роли Кубов не выдаются",
+                            )
+
+                        continue
 
                     ozernik = self.bot.db_ensure_user(member)
 
