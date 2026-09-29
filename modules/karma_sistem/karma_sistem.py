@@ -209,10 +209,14 @@ def get_cubes(ozernik_id: int) -> tuple[dict, dict, dict, dict]:
 def get_cube_status(ozernik_id: int) -> dict | None:
     binds = db.get_user_top_karmic_binds(ozernik_id)
 
+    return get_cube_status_by_binds([bind.bind_karma for _, bind in binds])
+
+def get_cube_status_by_binds(bind_karmas: list[int]) -> dict | None:
+    """Текущий Куб по списку значений кармы связей пользователя."""
     cubes_count: dict[str, int] = {}
 
-    for ozernik, bind in binds:
-        bind_cube = get_cube(bind.bind_karma)
+    for bind_karma in bind_karmas:
+        bind_cube = get_cube(bind_karma)
 
         for cube in data.cube_roles.values():
             if cube["place"] <= bind_cube["place"]:
@@ -234,6 +238,63 @@ def get_cube_status(ozernik_id: int) -> dict | None:
         available_cubes,
         key=lambda _cube: _cube["required_karma"],
     )
+
+def get_cube_leaderboard() -> list[dict]:
+    """
+    Топ по Кубам.
+
+    Порядок: выше Куб → больше связей уровня этого Куба или выше →
+    больше суммарная карма связей. Пользователи без Куба не попадают.
+
+    :return: Список словарей с ключами ozernik, cube, cube_binds, total_bind_karma.
+    """
+    ozerniks: dict[int, DataTypes.Ozernik] = {}
+    bind_karmas: dict[int, list[int]] = {}
+
+    for first, second, bind in db.get_top_karmic_binds():
+        for ozernik in (first, second):
+            ozerniks[ozernik.id] = ozernik
+            bind_karmas.setdefault(ozernik.id, []).append(bind.bind_karma)
+
+    leaderboard = []
+
+    for ozernik_id, karmas in bind_karmas.items():
+        cube = get_cube_status_by_binds(karmas)
+
+        if cube is None:
+            continue
+
+        leaderboard.append({
+            'ozernik': ozerniks[ozernik_id],
+            'cube': cube,
+            'cube_binds': sum(1 for karma in karmas if get_cube(karma)['place'] >= cube['place']),
+            'total_bind_karma': sum(karmas),
+        })
+
+    leaderboard.sort(key=lambda row: (
+        -row['cube']['place'],
+        -row['cube_binds'],
+        -row['total_bind_karma'],
+        row['ozernik'].id,
+    ))
+
+    return leaderboard
+
+def plural_ru(number: int, forms: tuple[str, str, str]) -> str:
+    """Форма слова для числа: ('связь', 'связи', 'связей')."""
+    n = number % 100
+
+    if 11 <= n <= 14:
+        return forms[2]
+
+    n %= 10
+
+    if n == 1:
+        return forms[0]
+    if 2 <= n <= 4:
+        return forms[1]
+
+    return forms[2]
 
 def load_icon(path: str | Path, size: tuple[int, int]) -> Image.Image:
     """Загружает PNG-иконку и изменяет её размер."""
@@ -525,10 +586,9 @@ def collapse_value(value) -> str:
 def expand_dict(text: str) -> dict:
     return ast.literal_eval("{" + text + "}")
 
-def get_role_id_by_level(level: int) -> str:
-    karma = get_karma(level)
-
-    status = max(
+def get_stage_by_karma(karma: int) -> dict:
+    """Обычная ступень Сансары (без Асура/Дэвы) для количества кармы."""
+    return max(
         (
             stage
             for stage in data.karma_roles.values()
@@ -539,7 +599,19 @@ def get_role_id_by_level(level: int) -> str:
         ),
         key=lambda stage: stage["required_karma"],
     )
-    return status['role_id']
+
+def get_role_id_by_level(level: int) -> str:
+    return get_stage_by_karma(get_karma(level))['role_id']
+
+def get_new_stage_text(old_karma: int, new_karma: int) -> str:
+    """Приписка «Теперь вы [роль]», если между old_karma и new_karma сменилась ступень Сансары."""
+    old_stage = get_stage_by_karma(old_karma)
+    new_stage = get_stage_by_karma(new_karma)
+
+    if old_stage['tag_name'] == new_stage['tag_name']:
+        return ''
+
+    return f"Теперь вы <@&{new_stage['role_id']}>"
 
 def get_level_up_text(level: int) -> str:
     text: str = levels_data[f'{level}']
@@ -548,6 +620,10 @@ def get_level_up_text(level: int) -> str:
     text = text.replace('{role}', f'<@&{role_id}>')
 
     return text
+
+def get_level_up_verb(level: int) -> str:
+    # Заглушка: глагол в заголовке повышения. Позже — разные глаголы для разных уровней/этапов.
+    return 'достигает'
 
 # Функции PIL
 def create_rank_card(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, username: str):
@@ -2338,6 +2414,18 @@ class SettingsSansaraPage(Page):
                             content=f'Обновление ролей участников: {n}/{len(guild.members)}'
                         )
 
+                    if member.bot:
+                        # Ботам роли Сансары не положены — снимаем, если были выданы.
+                        bot_sansara_roles = [role for role in member.roles if role.id in sansara_role_ids]
+
+                        if bot_sansara_roles:
+                            await member.remove_roles(
+                                *bot_sansara_roles,
+                                reason="Ботам роли Сансары не выдаются",
+                            )
+
+                        continue
+
                     ozernik = self.bot.db_ensure_user(member)
 
                     karma = db.get_karma(ozernik.id)
@@ -2648,6 +2736,18 @@ class SettingsCubesPage(Page):
                                 f'{n}/{len(guild.members)}'
                             )
                         )
+
+                    if member.bot:
+                        # Ботам роли Кубов не положены — снимаем, если были выданы.
+                        bot_cube_roles = [role for role in member.roles if role in cube_roles]
+
+                        if bot_cube_roles:
+                            await member.remove_roles(
+                                *bot_cube_roles,
+                                reason="Ботам роли Кубов не выдаются",
+                            )
+
+                        continue
 
                     ozernik = self.bot.db_ensure_user(member)
 
@@ -2998,7 +3098,11 @@ class KarmaSistem(commands.Cog):
 
     # ------------ СООБЩЕНИЯ -------------
 
-    async def give_level_up_message(self, member: discord.Member, old_karma: int, new_karma: int) -> None:
+    async def give_level_up_message(self, member: discord.Member, old_karma: int, new_karma: int, only_last: bool = False) -> None:
+        """
+        Поздравляет с новыми уровнями: по сообщению на каждый уровень.
+        only_last=True — одно сообщение о последнем достигнутом уровне (для админских правок).
+        """
         channel = self.bot.get_channel(data.karma_channel_id if data.karma_channel_id else 0)
 
         if not channel:
@@ -3010,14 +3114,29 @@ class KarmaSistem(commands.Cog):
         old_level = get_level(old_karma)
         new_level = get_level(new_karma)
 
-        for level in range(old_level + 1, new_level + 1):
+        levels = range(old_level + 1, new_level + 1)
+
+        if only_last:
+            levels = levels[-1:]
+
+        # С какой кармы считается переход для каждого сообщения
+        # (для only_last — с исходной, чтобы не потерять смену ступени).
+        previous_karma = old_karma
+
+        for level in levels:
             role = await self.update_sansara_roles(member)
 
+            level_karma = get_karma(level)
             description = get_level_up_text(level)
-            print(description)
+
+            stage_text = get_new_stage_text(previous_karma, level_karma)
+            if stage_text:
+                description = f'{description}\n\n{stage_text}' if description else stage_text
+
+            previous_karma = level_karma
 
             embed = discord.Embed(
-                title=f"**{member.display_name} повысил уровень!**",
+                title=f"**{member.display_name} {get_level_up_verb(level)} {level} уровня**",
                 description=description,
                 colour=role.colour
             )
@@ -3157,13 +3276,8 @@ class KarmaSistem(commands.Cog):
 
         ozernik = self.bot.db_ensure_user(member)
 
-        if message.content.startswith(',r'):
-            avatar = await get_discord_avatar(member)
-
-            rank_card_bytes = create_rank_card(ozernik, avatar, member.display_name)
-
-            file = discord.File(rank_card_bytes, filename=f"{member.name}_sansara_rank.png")
-            await message.reply(file=file, allowed_mentions=discord.AllowedMentions(replied_user=False))
+        # Сокращения команд (,rs, ,lb, ...) карму не дают.
+        if await self.handle_shortcut(message, member):
             return
 
         if self.check_blocked_channels(message.channel.id): # Проверка заблокирован ли канал
@@ -3338,107 +3452,385 @@ class KarmaSistem(commands.Cog):
 
         await navigator.send(interaction)
 
-    @app_commands.command(name='rank_sansara', description='Просмотр ранга Сансары.')
-    @app_commands.guilds(config.GUILD_ID)
-    async def rank_sansara(self, interaction: Interaction, user: discord.Member = None):
-        if user is None:
-            user = interaction.user
-        ozernik = db.get_user_by_discord_id(user.id)
+    # ---- КАРТОЧКИ И ТАБЛИЦЫ ЛИДЕРОВ ----
+    # Общие для slash-команд и сокращений (,rs, ,lb и т.д.).
 
-        avatar = await get_discord_avatar(user)
+    async def build_rank_sansara_file(self, member: discord.Member) -> discord.File:
+        ozernik = self.bot.db_ensure_user(member)
+        avatar = await get_discord_avatar(member)
 
-        rank_card_bytes = create_rank_card(ozernik, avatar, user.display_name)
+        rank_card_bytes = create_rank_card(ozernik, avatar, member.display_name)
 
-        file = discord.File(rank_card_bytes, filename=f"{user.name}_sansara_rank.png")
+        return discord.File(rank_card_bytes, filename=f"{member.name}_sansara_rank.png")
 
-        await interaction.response.send_message(file=file)
-
-    @app_commands.command(name='rank_cube', description='Просмотр ранга Куба.')
-    @app_commands.guilds(config.GUILD_ID)
-    async def rank_cube(self, interaction: Interaction, user: discord.Member = None):
-        await interaction.response.defer()
-        if user is None:
-            user = interaction.user
-        ozernik = db.get_user_by_discord_id(user.id)
-
-        avatar = await get_discord_avatar(user)
-        full_binds = await get_full_binds(user, self.bot)
+    async def build_rank_cube_file(self, member: discord.Member) -> discord.File:
+        ozernik = self.bot.db_ensure_user(member)
+        avatar = await get_discord_avatar(member)
+        full_binds = await get_full_binds(member, self.bot)
 
         rank_card_bytes = create_cube_cart(
             ozernik,
             avatar,
-            user.display_name,
+            member.display_name,
             full_binds,
         )
 
-        file = discord.File(rank_card_bytes, filename=f"{user.name}_cube_rank.png")
+        return discord.File(rank_card_bytes, filename=f"{member.name}_cube_rank.png")
+
+    @staticmethod
+    def build_leaderboard_embed(
+            title: str,
+            subtitle: str,
+            rows: list[tuple[int, str]],
+            viewer: discord.Member,
+            guild: discord.Guild,
+    ) -> discord.Embed:
+        """rows — (discord_id, строки под именем) для первых 10 мест."""
+        embed = discord.Embed(
+            title=title,
+            colour=viewer.top_role.colour,
+        )
+
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+
+        lines = [subtitle]
+
+        for n, (discord_id, body) in enumerate(rows[:10], 1):
+            lines.append('')
+            lines.append(f'**#{n} <:cigar:1208007437639225415> <@{discord_id}>**\n{body}')
+
+        embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
+
+        return embed
+
+    def build_leaderboard(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
+        leaderboard = db.get_top_karma()
+        if not leaderboard:
+            return None
+
+        rows = []
+        for ozernik, karma in leaderboard[:10]:
+            level = get_level(karma.karma)
+            rows.append((
+                ozernik.discord_id,
+                f'ㅤ  Уровень: `{level}`\n'
+                f'ㅤ  Карма: `{karma.karma}/{get_karma(level + 1)}`'
+            ))
+
+        return self.build_leaderboard_embed('Таблица лидеров', '*Ментальное здоровье и рыбалка.*', rows, viewer, guild)
+
+    def build_leaderboard_weekly(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
+        leaderboard = db.get_top_weekly_karma()
+        if not leaderboard:
+            return None
+
+        rows = []
+        for ozernik, karma in leaderboard[:10]:
+            level = get_level(karma.karma)
+            rows.append((
+                ozernik.discord_id,
+                f'ㅤ  Уровень: `{level}`\n'
+                f'ㅤ  Карма: `{karma.weekly_karma}/{get_karma(level + 1)}`'
+            ))
+
+        return self.build_leaderboard_embed(
+            'Таблица лидеров',
+            '*Место для опустошения разума, \nразмышлений о прошлом и будущем.*',
+            rows, viewer, guild,
+        )
+
+    def build_leaderboard_cubes(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
+        leaderboard = get_cube_leaderboard()
+        if not leaderboard:
+            return None
+
+        rows = []
+        for row in leaderboard[:10]:
+            cube_binds = row['cube_binds']
+            total = row['total_bind_karma']
+            rows.append((
+                row['ozernik'].discord_id,
+                f'ㅤ  Куб: `{row["cube"]["name"]}` ({cube_binds} {plural_ru(cube_binds, ("связь", "связи", "связей"))})\n'
+                f'ㅤ  Связь: `{total}` ед. с. ({format_duration_minutes(total) or "0 минут"})'
+            ))
+
+        return self.build_leaderboard_embed('Таблица лидеров Кубов', '*Время, проведённое вместе.*', rows, viewer, guild)
+
+    # Таблицы лидеров: (сборщик, ответ при пустой таблице).
+    LEADERBOARDS = {
+        'leaderboard': ('build_leaderboard', 'Нет таблицы лидеров.'),
+        'leaderboard_weekly': ('build_leaderboard_weekly', 'Нет недельной таблицы лидеров.'),
+        'leaderboard_cubes': ('build_leaderboard_cubes', 'Нет таблицы лидеров Кубов.'),
+    }
+
+    async def send_leaderboard(self, interaction: Interaction, name: str) -> None:
+        builder, empty_text = self.LEADERBOARDS[name]
+        embed = getattr(self, builder)(interaction.user, interaction.guild)
+
+        if embed is None:
+            await interaction.response.send_message(empty_text, ephemeral=True)
+            return
+
+        await interaction.response.send_message(embed=embed)
+
+    # ------------ СОКРАЩЕНИЯ ------------
+
+    # Первое слово сообщения → команда. ,r оставлен как старое сокращение ,rs.
+    SHORTCUTS = {
+        ',rs': 'rank_sansara',
+        ',r': 'rank_sansara',
+        ',rc': 'rank_cube',
+        ',lb': 'leaderboard',
+        ',lbw': 'leaderboard_weekly',
+        ',lbc': 'leaderboard_cubes',
+    }
+
+    async def handle_shortcut(self, message: discord.Message, member: discord.Member) -> bool:
+        """
+        Выполняет сокращение, если сообщение с него начинается (отдельным словом).
+        Для карточек можно упомянуть другого участника: ,rs @участник.
+
+        :return: True, если сообщение было сокращением.
+        """
+        words = message.content.split()
+
+        if not words:
+            return False
+
+        name = self.SHORTCUTS.get(words[0].lower())
+
+        if name is None:
+            return False
+
+        no_ping = discord.AllowedMentions(replied_user=False)
+
+        if name in ('rank_sansara', 'rank_cube'):
+            # Первый упомянутый участник сервера, иначе автор.
+            mentioned = (message.guild.get_member(user.id) for user in getattr(message, 'mentions', []))
+            target = next((user for user in mentioned if user is not None), member)
+
+            if name == 'rank_sansara':
+                file = await self.build_rank_sansara_file(target)
+            else:
+                file = await self.build_rank_cube_file(target)
+
+            await message.reply(file=file, allowed_mentions=no_ping)
+            return True
+
+        builder, empty_text = self.LEADERBOARDS[name]
+        embed = getattr(self, builder)(member, message.guild)
+
+        if embed is None:
+            await message.reply(empty_text, allowed_mentions=no_ping)
+        else:
+            await message.reply(embed=embed, allowed_mentions=no_ping)
+
+        return True
+
+    # ------ КОМАНДЫ УЧАСТНИКОВ ------
+
+    @app_commands.command(name='rank_sansara', description='Просмотр ранга Сансары. Сокращение: ,rs')
+    @app_commands.guilds(config.GUILD_ID)
+    async def rank_sansara(self, interaction: Interaction, user: discord.Member = None):
+        file = await self.build_rank_sansara_file(user or interaction.user)
+
+        await interaction.response.send_message(file=file)
+
+    @app_commands.command(name='rank_cube', description='Просмотр ранга Куба. Сокращение: ,rc')
+    @app_commands.guilds(config.GUILD_ID)
+    async def rank_cube(self, interaction: Interaction, user: discord.Member = None):
+        await interaction.response.defer()
+
+        file = await self.build_rank_cube_file(user or interaction.user)
 
         await interaction.followup.send(file=file)
 
-    @app_commands.command(name='leaderboard', description='Просмотр ранга Куба.')
+    @app_commands.command(name='leaderboard', description='Таблица лидеров по карме. Сокращение: ,lb')
     @app_commands.guilds(config.GUILD_ID)
     async def leaderboard(self, interaction: Interaction):
-        leaderboard = db.get_top_karma()
-        if not leaderboard:
-            await interaction.response.send_message('Нет таблицы лидеров.', ephemeral=True)
-            return
+        await self.send_leaderboard(interaction, 'leaderboard')
 
-        embed = discord.Embed(
-            title='Таблица лидеров',
-            colour=interaction.user.top_role.colour,
-        )
-
-        if interaction.guild.icon:
-            embed.set_thumbnail(url=interaction.guild.icon.url)
-
-        lines = ['*Ментальное здоровье и рыбалка.*']
-
-        for n, (ozernik, karma) in enumerate(leaderboard[:10], 1):
-            level = get_level(karma.karma)
-            next_level_karma = get_karma(level + 1)
-
-            lines.append('')
-            lines.append(f'**#{n} <:cigar:1208007437639225415> <@{ozernik.discord_id}>**\n'
-                         f'ㅤ  Уровень: `{level}`\n'
-                         f'ㅤ  Карма: `{karma.karma}/{next_level_karma}`')
-
-        embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
-
-        await interaction.response.send_message(
-            embed=embed
-        )
-
-    @app_commands.command(name='leaderboard_weekly', description='Просмотр ранга Куба.')
+    @app_commands.command(name='leaderboard_weekly', description='Недельная таблица лидеров по карме. Сокращение: ,lbw')
     @app_commands.guilds(config.GUILD_ID)
     async def leaderboard_weekly(self, interaction: Interaction):
-        leaderboard = db.get_top_weekly_karma()
-        if not leaderboard:
-            await interaction.response.send_message('Нет недельной таблицы лидеров.', ephemeral=True)
-            return
+        await self.send_leaderboard(interaction, 'leaderboard_weekly')
 
-        embed = discord.Embed(
-            title='Таблица лидеров',
-            colour=interaction.user.top_role.colour,
-        )
+    @app_commands.command(name='leaderboard_cubes', description='Таблица лидеров Кубов. Сокращение: ,lbc')
+    @app_commands.guilds(config.GUILD_ID)
+    async def leaderboard_cubes(self, interaction: Interaction):
+        await self.send_leaderboard(interaction, 'leaderboard_cubes')
 
-        if interaction.guild.icon:
-            embed.set_thumbnail(url=interaction.guild.icon.url)
+    # ------ АДМИНИСТРИРОВАНИЕ КАРМЫ ------
 
-        lines = ['*Место для опустошения разума, \nразмышлений о прошлом и будущем.*']
-
-        for n, (ozernik, karma) in enumerate(leaderboard[:10], 1):
-            level = get_level(karma.karma)
-            next_level_karma = get_karma(level + 1)
-
-            lines.append('')
-            lines.append(f'**#{n} <:cigar:1208007437639225415> <@{ozernik.discord_id}>**\n'
-                         f'ㅤ  Уровень: `{level}`\n'
-                         f'ㅤ  Карма: `{karma.weekly_karma}/{next_level_karma}`')
-
-        embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
+    @staticmethod
+    async def check_admin(interaction: Interaction) -> bool:
+        if interaction.user.guild_permissions.administrator:
+            return True
 
         await interaction.response.send_message(
-            embed=embed
+            "Только для Администраторов.",
+            ephemeral=True
+        )
+        return False
+
+    async def send_log(self, text: str) -> None:
+        """Пишет в канал логов из настроек кармы, если он задан."""
+        channel = self.bot.get_channel(data.log_channel_id if data.log_channel_id else 0)
+
+        if not channel:
+            return
+
+        try:
+            await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as error:
+            self.bot.print_error("send_log", error)
+
+    async def finish_admin_edit(
+            self,
+            interaction: Interaction,
+            member: discord.Member,
+            text: str,
+            old: DataTypes.Karma | None = None,
+            new: DataTypes.Karma | None = None,
+    ) -> None:
+        """
+        Пересчитывает роль Сансары, отвечает админу и пишет лог.
+        Если уровень вырос — одно поздравление о новом уровне (без промежуточных).
+        """
+        if not member.bot:
+            try:
+                await self.update_sansara_roles(member)
+
+                if old is not None and new is not None:
+                    await self.give_level_up_message(member, old.karma, new.karma, only_last=True)
+            except Exception as error:
+                self.bot.print_error("finish_admin_edit", error)
+                text += '\n-# Не удалось обновить роль Сансары, см. консоль.'
+
+        await interaction.followup.send(text, ephemeral=True)
+        await self.send_log(f'{interaction.user.mention} → {text}')
+
+    @staticmethod
+    def drop_status_if_not_human(karma: DataTypes.Karma) -> tuple[DataTypes.Karma, str]:
+        """
+        Асур и Дэва требуют достигнутого Человека: если карма упала ниже порога,
+        статус снимается. Возвращает обновлённую карму и пометку для ответа админу.
+        """
+        human_karma = data.karma_roles['human']['required_karma']
+
+        if karma.status is None or karma.karma >= human_karma:
+            return karma, ''
+
+        status_name = data.karma_roles[karma.status]['name']
+        karma = db.set_karma_status(karma.user_id, None)
+
+        return karma, f'\nСтатус `{status_name}` снят: карма ниже Человека (`{human_karma}`).'
+
+    @staticmethod
+    def karma_change_text(action: str, member: discord.Member, old: DataTypes.Karma, new: DataTypes.Karma) -> str:
+        return (
+            f'**{action}:** {member.mention}\n'
+            f'Карма: `{old.karma}` → `{new.karma}` (уровень {get_level(old.karma)} → {get_level(new.karma)})\n'
+            f'Недельная: `{old.weekly_karma}` → `{new.weekly_karma}`'
+        )
+
+    @app_commands.command(name='karma_add', description='Добавить карму участнику (и недельную).')
+    @app_commands.guilds(config.GUILD_ID)
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(user='Участник', amount='Сколько кармы добавить')
+    async def karma_add(self, interaction: Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 1_000_000]):
+        if not await self.check_admin(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ozernik = self.bot.db_ensure_user(user)
+        old, new = db.add_karma(ozernik.id, amount, weekly=True)
+
+        await self.finish_admin_edit(interaction, user, self.karma_change_text('Карма добавлена', user, old, new), old, new)
+
+    @app_commands.command(name='karma_remove', description='Отнять карму у участника (и недельную). Ниже нуля не опускается.')
+    @app_commands.guilds(config.GUILD_ID)
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(user='Участник', amount='Сколько кармы отнять')
+    async def karma_remove(self, interaction: Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 1_000_000]):
+        if not await self.check_admin(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ozernik = self.bot.db_ensure_user(user)
+        old = db.get_karma(ozernik.id)
+        new = db.remove_karma(ozernik.id, amount, weekly=True)
+        new, status_note = self.drop_status_if_not_human(new)
+
+        text = self.karma_change_text('Карма отнята', user, old, new) + status_note
+        await self.finish_admin_edit(interaction, user, text, old, new)
+
+    @app_commands.command(name='karma_set', description='Установить карму участнику. 0 — обнулить (вместе с недельной).')
+    @app_commands.guilds(config.GUILD_ID)
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(user='Участник', amount='Новое значение кармы')
+    async def karma_set(self, interaction: Interaction, user: discord.Member, amount: app_commands.Range[int, 0, 1_000_000]):
+        if not await self.check_admin(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ozernik = self.bot.db_ensure_user(user)
+        old = db.get_karma(ozernik.id)
+        new = db.set_karma(ozernik.id, amount, weekly=True)
+        new, status_note = self.drop_status_if_not_human(new)
+
+        action = 'Карма обнулена' if amount == 0 else 'Карма установлена'
+        text = self.karma_change_text(action, user, old, new) + status_note
+        await self.finish_admin_edit(interaction, user, text, old, new)
+
+    @app_commands.command(name='karma_status', description='Выдать или снять статус Асура/Дэвы (нужен достигнутый Человек).')
+    @app_commands.guilds(config.GUILD_ID)
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(user='Участник', status='Статус')
+    @app_commands.choices(status=[
+        app_commands.Choice(name='Асур', value='asur'),
+        app_commands.Choice(name='Дэва', value='deva'),
+        app_commands.Choice(name='Снять статус', value='none'),
+    ])
+    async def karma_status(self, interaction: Interaction, user: discord.Member, status: app_commands.Choice[str]):
+        if not await self.check_admin(interaction):
+            return
+
+        new_status = None if status.value == 'none' else status.value
+
+        ozernik = self.bot.db_ensure_user(user)
+        old = db.get_karma(ozernik.id)
+
+        if old.status == new_status:
+            await interaction.response.send_message(
+                f'У {user.mention} уже статус `{get_status(old)["name"]}`.',
+                ephemeral=True
+            )
+            return
+
+        human_karma = data.karma_roles['human']['required_karma']
+
+        if new_status is not None and old.karma < human_karma:
+            await interaction.response.send_message(
+                f'Статус можно выдать только достигшему Человека (`{human_karma}` кармы). '
+                f'У {user.mention} `{old.karma}`.',
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        new = db.set_karma_status(ozernik.id, new_status)
+
+        await self.finish_admin_edit(
+            interaction,
+            user,
+            f'**Статус изменён:** {user.mention}\n'
+            f'`{get_status(old)["name"]}` → `{get_status(new)["name"]}`'
         )
 
 async def setup(bot):

@@ -822,44 +822,58 @@ class KarmaDatabase(Database):
 
         return DataTypes.Karma(old_row), DataTypes.Karma(new_row)
 
-    def remove_karma(self, user_id: int, karma: int) -> DataTypes.Karma:
+    def remove_karma(self, user_id: int, karma: int, weekly: bool = False) -> DataTypes.Karma:
         """
-        Уменьшает обычную карму пользователя.
+        Уменьшает обычную карму пользователя. Ниже нуля карма не опускается.
 
-        При необходимости также должна уменьшать gift_karma, если подарочная карма
-        стала больше обычной кармы.
+        Подарочная карма урезается, если стала больше обычной.
+        Если weekly=True, на то же количество уменьшается weekly_karma
+        (тоже не ниже нуля).
 
         :param user_id: Внутренний ID пользователя из таблицы users.
         :param karma: Количество убираемой кармы.
+        :param weekly: Уменьшать ли также недельную карму.
         :return: Обновлённый объект ``Karma``.
-        :raises ValueError:
+        :raises ValueError: Если karma меньше или равна нулю.
         """
+        if karma <= 0:
+            raise ValueError("karma должна быть больше нуля.")
+
         self._ensure_karma_row(user_id)
 
         with self.transaction():
             row = self.fetchone("""
                 UPDATE karma
-                SET karma = karma - ?,
+                SET karma = MAX(karma - ?, 0),
                     gift_karma = MIN(
                         gift_karma,
                         MAX(karma - ?, 0)
                     ),
+                    weekly_karma = MAX(weekly_karma - ?, 0),
                     karma_updated_at = ?
                 WHERE user_id = ?
                 RETURNING *
-            """, (karma, karma, now_ms(), user_id))
+            """, (karma, karma, karma if weekly else 0, now_ms(), user_id))
 
         return DataTypes.Karma(row)
 
-    def set_karma(self, user_id: int, karma: int) -> DataTypes.Karma:
+    def set_karma(self, user_id: int, karma: int, weekly: bool = False) -> DataTypes.Karma:
         """
         Устанавливает точное значение обычной кармы пользователя.
 
+        Подарочная карма урезается, если стала больше обычной.
+        Если weekly=True, недельная карма меняется на ту же разницу
+        (не ниже нуля); установка 0 обнуляет и её.
+
         :param user_id: Внутренний ID пользователя из таблицы users.
         :param karma: Новое значение обычной кармы.
+        :param weekly: Менять ли также недельную карму.
         :return: Обновлённый объект ``Karma``.
-        :raises ValueError:
+        :raises ValueError: Если karma меньше нуля.
         """
+        if karma < 0:
+            raise ValueError("karma не может быть меньше нуля.")
+
         self._ensure_karma_row(user_id)
 
         with self.transaction():
@@ -869,10 +883,41 @@ class KarmaDatabase(Database):
                         WHEN karma != ? THEN ?
                         ELSE karma_updated_at
                     END,
+                    weekly_karma = CASE
+                        WHEN ? THEN MAX(weekly_karma + (? - karma), 0)
+                        ELSE weekly_karma
+                    END,
+                    gift_karma = MIN(gift_karma, ?),
                     karma = ?
                 WHERE user_id = ?
                 RETURNING *
-            """, (karma, now_ms(), karma, user_id))
+            """, (karma, now_ms(), weekly, karma, karma, karma, user_id))
+
+        return DataTypes.Karma(row)
+
+    def set_karma_status(self, user_id: int, status: Literal['asur', 'deva'] | None) -> DataTypes.Karma:
+        """
+        Выдаёт или снимает особый статус Сансары (Асур, Дэва).
+
+        Условия выдачи (например, достигнутый Человек) проверяет вызывающий код.
+
+        :param user_id: Внутренний ID пользователя из таблицы users.
+        :param status: 'asur', 'deva' или None, чтобы снять статус.
+        :return: Обновлённый объект ``Karma``.
+        :raises ValueError: Если статус недопустим.
+        """
+        if status not in ('asur', 'deva', None):
+            raise ValueError('status должен быть "asur", "deva" или None.')
+
+        self._ensure_karma_row(user_id)
+
+        with self.transaction():
+            row = self.fetchone("""
+                UPDATE karma
+                SET status = ?
+                WHERE user_id = ?
+                RETURNING *
+            """, (status, user_id))
 
         return DataTypes.Karma(row)
 
