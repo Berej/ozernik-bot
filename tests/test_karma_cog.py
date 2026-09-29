@@ -697,4 +697,14 @@ async def test_setup_registers_cog(env):
 def test_cog_commands(env):
     names = {command.name for command in env.cog.get_app_commands()}
 
-    assert names == {"settings_karma", "rank_sansara", "rank_cube", "leaderboard", "leaderboard_weekly"}
+    assert names == {
+        "settings_karma", "rank_sansara", "rank_cube",
+        "leaderboard", "leaderboard_weekly", "leaderboard_cubes",
+        "karma_add", "karma_remove", "karma_set", "karma_status",
+    }
+
+
+def test_admin_commands_hidden_from_non_admins(env):
+    for command in env.cog.get_app_commands():
+        if command.name.startswith("karma_"):
+            assert command.default_permissions.administrator is True
