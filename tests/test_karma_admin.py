@@ -316,7 +316,7 @@ class TestCubeLeaderboard:
     def test_empty(self, env):
         assert env.karma.get_cube_leaderboard() == []
 
-    def test_order_cube_then_count_then_total(self, env):
+    def test_order_cube_then_total(self, env):
         # 1: белый куб (10 белых связей)
         for n in range(10):
             bind(env, 1, 100 + n, 360)
@@ -327,14 +327,43 @@ class TestCubeLeaderboard:
         for n in range(3):
             bind(env, 3, 300 + n, 10)
 
-        rows = env.karma.get_cube_leaderboard()
-        top = [(row["ozernik"].discord_id, row["cube"]["tag_name"], row["cube_binds"], row["total_bind_karma"]) for row in rows[:3]]
+        rows = [row for row in env.karma.get_cube_leaderboard() if row["ozernik"].discord_id in (1, 2, 3)]
+        top = [(row["ozernik"].discord_id, row["cube"]["tag_name"], row["cube_binds"], row["total_bind_karma"]) for row in rows]
 
         assert top == [
             (1, "white_cube", 10, 3600),
             (2, "black_cube", 3, 900),
             (3, "black_cube", 3, 30),
         ]
+
+    def test_same_cube_ordered_by_time_not_by_number_of_binds(self, env):
+        """Случай со скриншота: у всех Чёрный Куб — решает время, а не число людей."""
+        for n in range(29):
+            bind(env, 1, 100 + n, 70)   # 29 связей, 2030 минут
+        for n in range(5):
+            bind(env, 2, 200 + n, 500)  # 5 связей, 2500 минут
+        # Одна белая связь (из 10 нужных) Куб не повышает и места не даёт.
+        bind(env, 3, 300, 360)
+        bind(env, 3, 301, 1)
+
+        rows = [row for row in env.karma.get_cube_leaderboard() if row["ozernik"].discord_id in (1, 2, 3)]
+        top = [(row["ozernik"].discord_id, row["cube"]["tag_name"], row["total_bind_karma"]) for row in rows]
+
+        assert top == [
+            (2, "black_cube", 2500),
+            (1, "black_cube", 2030),
+            (3, "black_cube", 361),
+        ]
+
+    def test_higher_cube_beats_more_time(self, env):
+        for n in range(10):
+            bind(env, 1, 100 + n, 360)   # Белый Куб, 3600 минут
+        for n in range(3):
+            bind(env, 2, 200 + n, 5000)  # Чёрный Куб, 15000 минут
+
+        rows = env.karma.get_cube_leaderboard()
+
+        assert [row["ozernik"].discord_id for row in rows[:2]] == [1, 2]
 
     def test_cube_binds_counts_only_binds_of_cube_level(self, env):
         for n in range(10):
