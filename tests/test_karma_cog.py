@@ -895,3 +895,90 @@ def test_admin_commands_hidden_from_non_admins(env):
     for command in env.cog.get_app_commands():
         if command.name.startswith("karma_"):
             assert command.default_permissions.administrator is True
+
+
+# ---------- РОЛИ ПРИ ВХОДЕ НА СЕРВЕР -----------
+
+class TestJoinRoles:
+    def role_ids(self, member):
+        return [role.id for role in member.roles]
+
+    async def test_newcomer_gets_naraka(self, env):
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+
+        await env.cog.on_member_join(member)
+
+        assert self.role_ids(member) == [env.data.karma_roles["naraka"]["role_id"]]
+        assert env.db.get_user_by_discord_id(1) is not None
+
+    async def test_bot_gets_nothing(self, env):
+        create_all_roles(env)
+        bot_member = env.guild.add_member(1, bot=True)
+
+        await env.cog.on_member_join(bot_member)
+
+        assert bot_member.roles == []
+        assert env.db.get_user_by_discord_id(1) is None
+
+    async def test_returning_member_gets_stage_and_cube(self, env):
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        me = env.bot.db_ensure_user(member).id
+        env.db.set_karma(me, 6000)
+        for n in range(10):
+            env.db.add_bind_karma(me, add_ozernik(env, 100 + n), 400)
+
+        await env.cog.on_member_join(member)
+
+        assert set(self.role_ids(member)) == {
+            env.data.karma_roles["human"]["role_id"],
+            env.data.cube_roles["white_cube"]["role_id"],
+        }
+
+    async def test_returning_asur_keeps_status_role(self, env):
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        me = env.bot.db_ensure_user(member).id
+        env.db.set_karma(me, 6000)
+        env.db.set_karma_status(me, "asur")
+
+        await env.cog.on_member_join(member)
+
+        assert self.role_ids(member) == [env.data.karma_roles["asur"]["role_id"]]
+
+    async def test_waits_for_membership_screening(self, env):
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        member.pending = True
+
+        await env.cog.on_member_join(member)
+        assert member.roles == []  # правила ещё не приняты
+
+        passed = env.guild.get_member(1)
+        before = type("Before", (), {"pending": True})()
+        passed.pending = False
+        await env.cog.on_member_update(before, passed)
+
+        assert self.role_ids(passed) == [env.data.karma_roles["naraka"]["role_id"]]
+
+    async def test_other_member_updates_ignored(self, env):
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        before = type("Before", (), {"pending": False})()
+
+        await env.cog.on_member_update(before, member)  # например, сменил ник
+
+        assert member.roles == []
+
+    async def test_role_error_does_not_crash(self, env, monkeypatch):
+        member = env.guild.add_member(1)
+
+        async def broken(member):
+            raise RuntimeError("нет прав на роли")
+
+        monkeypatch.setattr(env.cog, "update_sansara_roles", broken)
+
+        await env.cog.on_member_join(member)  # не падает
+
+        assert env.db.get_user_by_discord_id(1) is not None

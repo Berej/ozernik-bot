@@ -3557,6 +3557,42 @@ class KarmaSistem(commands.Cog):
 
     # ------------- СОБЫТИЯ --------------
 
+    async def give_join_roles(self, member: discord.Member) -> None:
+        """
+        Роли для зашедшего на сервер: ступень Сансары по карме (новичку — Нарака)
+        и Куб, если связи уже есть (вернувшийся участник). Ботам — ничего.
+
+        Раньше роль выдавалась только при повышении уровня, и новички
+        до 1 уровня ходили без роли.
+        """
+        if member.bot or member.guild != self.bot.guild:
+            return
+
+        try:
+            ozernik = self.bot.db_ensure_user(member)
+
+            await self.update_sansara_roles(member)
+
+            if get_cube_status(ozernik.id) is not None:
+                await self.update_cube_roles(member)
+        except Exception as error:
+            self.bot.print_error("give_join_roles", error)
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        # С проверкой участника (правила сервера) — ждём, пока её пройдут:
+        # роль могла бы открыть каналы в обход проверки. См. on_member_update.
+        if getattr(member, 'pending', False):
+            return
+
+        await self.give_join_roles(member)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        # Прошёл проверку участника — теперь можно выдать роли.
+        if getattr(before, 'pending', False) and not getattr(after, 'pending', False):
+            await self.give_join_roles(after)
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.guild is None:
