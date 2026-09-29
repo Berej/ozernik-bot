@@ -7,6 +7,8 @@ base*
 
 *.db
 **.json
+*.json.imported
+*.json.tmp
 **test.py
 !tests/conftest.py
 

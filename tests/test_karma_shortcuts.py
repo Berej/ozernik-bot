@@ -50,7 +50,7 @@ async def test_card_shortcuts(env, channel, shortcut, filename):
     [
         (",lb", "Таблица лидеров"),
         (",lbw", "Таблица лидеров"),
-        (",lbc", "Таблица лидеров Кубов"),
+        (",lbc", "Пары"),
     ],
 )
 async def test_leaderboard_shortcuts(env, channel, shortcut, title):
@@ -87,7 +87,7 @@ async def test_leaderboard_shortcut_matches_slash_command(env, channel):
     [
         (",lb", "Нет таблицы лидеров."),
         (",lbw", "Нет недельной таблицы лидеров."),
-        (",lbc", "Нет таблицы лидеров Кубов."),
+        (",lbc", "Нет таблиц лидеров Связи."),
     ],
 )
 async def test_empty_leaderboards(env, channel, shortcut, text):

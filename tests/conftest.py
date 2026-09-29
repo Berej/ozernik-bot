@@ -2,12 +2,12 @@
 Общая подготовка тестов.
 
 Модуль кармы при импорте трогает боевые файлы (database.db, data.json,
-levels.json, config.json, .env), поэтому здесь всё это подменяется:
+config.json, .env), поэтому здесь всё это подменяется:
 
 - ``config`` — заглушка без .env и без запроса токенов;
 - ``Database`` — SQLite в памяти;
 - JSON-хранилища — временная папка;
-- ``NewDataWorker`` — синхронная версия (оригинал требует запущенный event loop).
+- старый ``levels.json`` (перенос текстов в базу) — путь во временной папке.
 
 Боевой код при этом не меняется.
 """
@@ -63,25 +63,6 @@ def _memory_database_init(self) -> None:
 
 utilities.Database.__init__ = _memory_database_init
 
-
-class SyncNewDataWorker(utilities.NewDataWorker):
-    """NewDataWorker без фоновой задачи: пишет на диск сразу."""
-
-    def __init__(self, path, setup: dict | None = None):
-        utilities.JsonWorker.__init__(self, path)
-
-        if setup:
-            self._data.update({**setup, **self._data})
-            self._commit()
-
-    def _commit(self):
-        self._commit_data()
-
-    async def close(self):
-        pass
-
-
-utilities.NewDataWorker = SyncNewDataWorker
 
 _IMPORT_TMP = Path(tempfile.mkdtemp(prefix="ozernik_tests_"))
 _original_json_init = utilities.JsonWorker.__init__
@@ -280,20 +261,34 @@ def make_message(author, channel: FakeChannel, guild, content: str = "приве
 
 # ---------- ФИКСТУРЫ -----------
 
+class LevelTexts:
+    """Доступ к текстам повышений в базе как к словарю: env.levels["5"] = "текст"."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def __getitem__(self, level):
+        return self.db.get_level_text(int(level))
+
+    def __setitem__(self, level, text):
+        self.db.set_level_texts({int(level): text})
+
+
 @pytest.fixture
 def env(monkeypatch, tmp_path):
     """
     Чистое окружение модуля кармы на каждый тест:
-    новая БД в памяти, новые data.json/levels.json во временной папке,
+    новая БД в памяти, новый data.json во временной папке,
     фейковые бот и сервер, готовый Cog.
     """
     db = karma.KarmaDatabase()
     data = utilities.DataWorker(tmp_path / "data.json", setup=copy.deepcopy(karma.data_setup))
-    levels = SyncNewDataWorker(tmp_path / "levels.json", setup=dict(karma.levels_setup))
+    levels = LevelTexts(db)
 
     monkeypatch.setattr(karma, "db", db)
     monkeypatch.setattr(karma, "data", data)
-    monkeypatch.setattr(karma, "levels_data", levels)
+    # Реальный levels.json тестового бота не трогаем.
+    monkeypatch.setattr(karma, "LEGACY_LEVELS_PATH", tmp_path / "levels.json")
     monkeypatch.setattr(karma.SettingsSansaraPage, "restore_task", None)
     monkeypatch.setattr(karma.SettingsCubesPage, "restore_task", None)
 

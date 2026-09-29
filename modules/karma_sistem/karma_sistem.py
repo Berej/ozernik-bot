@@ -4,6 +4,7 @@ import random
 import traceback # noqa
 import typing # noqa
 import ast
+import json
 import math
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -24,12 +25,17 @@ from discord.ui import Item, Button, View, LayoutView # noqa
 from bot import OzernikiBot
 from config import config
 from utilities import *
-from utilities import NewDataWorker
 
 PROJECT_DIR = Path(__file__).resolve().parents[0]
 TEMP_DIR = PROJECT_DIR / "temp"
 DATA_DIR = PROJECT_DIR / "data.json"
-LEVELS_DATA_DIR = PROJECT_DIR / "levels.json"
+
+# Старое хранилище текстов повышений. Тексты теперь в базе (таблица karma_level_texts);
+# файл читается один раз при запуске для переноса — см. import_legacy_level_texts.
+LEGACY_LEVELS_PATH = PROJECT_DIR / "levels.json"
+
+# Сколько уровней можно подписать текстом в /settings_karma → «Текст повышений».
+LEVEL_TEXTS_COUNT = 100
 
 data_setup = {
     'log_channel_id': 0,
@@ -122,8 +128,63 @@ data_setup = {
 data = DataWorker(DATA_DIR, setup=data_setup)
 db = KarmaDatabase()
 
-levels_setup = {str(i): '' for i in range(1, 101)}
-levels_data = NewDataWorker(LEVELS_DATA_DIR, setup=levels_setup)
+def import_legacy_level_texts(path: Path) -> int:
+    """
+    Переносит тексты повышений из старого levels.json в базу (один раз).
+
+    Тексты переносятся, только если в базе их ещё нет — чтобы старый файл
+    не затёр уже отредактированное. Файл после этого переименовывается
+    в levels.json.imported: остаётся резервной копией и больше не читается.
+
+    :return: Сколько непустых текстов перенесено.
+    """
+    if not path.exists():
+        return 0
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"[Карма] Не удалось прочитать {path}: {error}")
+        return 0
+
+    texts = {
+        int(level): text
+        for level, text in raw.items()
+        if str(level).isdigit()
+        and 1 <= int(level) <= LEVEL_TEXTS_COUNT
+        and isinstance(text, str)
+        and text
+    }
+
+    imported = 0
+
+    if texts and not db.get_level_texts():
+        db.set_level_texts(texts)
+        imported = len(texts)
+        print(f"[Карма] Тексты повышений перенесены из {path.name} в базу: {imported} шт.")
+
+    path.replace(path.with_name(path.name + ".imported"))
+
+    return imported
+
+def parse_level_texts(raw: dict) -> dict[int, str]:
+    """
+    Проверяет тексты из окна «Текст повышений».
+
+    :raises ValueError: С понятным админу объяснением, что не так.
+    """
+    texts = {}
+
+    for level, text in raw.items():
+        if not str(level).isdigit() or not 1 <= int(level) <= LEVEL_TEXTS_COUNT:
+            raise ValueError(f"Уровень {level!r}: нужен номер от 1 до {LEVEL_TEXTS_COUNT}.")
+        if not isinstance(text, str):
+            raise ValueError(f"Уровень {level}: текст должен быть в кавычках.")
+
+        texts[int(level)] = text
+
+    return texts
 
 # Вспомогательные функции
 def get_status(karma: DataTypes.Karma) -> dict:
@@ -239,16 +300,25 @@ def get_cube_status_by_binds(bind_karmas: list[int]) -> dict | None:
         key=lambda _cube: _cube["required_karma"],
     )
 
-def get_cube_leaderboard() -> list[dict]:
-    """
-    Топ по Кубам.
+# ---------- Таблицы лидеров Связи (/leaderboard_cubes, ,lbc) ----------
 
-    Порядок: выше Куб → больше суммарная карма связей (время в войсе).
-    Число связей на место не влияет: подняться может только новый Куб.
-    Пользователи без Куба не попадают.
+# Уровень отдельной связи (не путать с Кубом — ступенью самого человека).
+BIND_LEVEL_NAMES = {
+    'black_cube': 'Чёрная',
+    'white_cube': 'Белая',
+    'blue_cube': 'Синяя',
+    'gold_cube': 'Золотая',
+}
 
-    :return: Список словарей с ключами ozernik, cube, cube_binds, total_bind_karma.
-    """
+BIND_LEVEL_EMOJI = {
+    'black_cube': '⚫',
+    'white_cube': '⚪',
+    'blue_cube': '🔵',
+    'gold_cube': '🟡',
+}
+
+def get_binds_by_user() -> tuple[dict[int, DataTypes.Ozernik], dict[int, list[int]]]:
+    """Все связи, разложенные по пользователям: (озерники по ID, карма каждой его связи)."""
     ozerniks: dict[int, DataTypes.Ozernik] = {}
     bind_karmas: dict[int, list[int]] = {}
 
@@ -257,28 +327,96 @@ def get_cube_leaderboard() -> list[dict]:
             ozerniks[ozernik.id] = ozernik
             bind_karmas.setdefault(ozernik.id, []).append(bind.bind_karma)
 
+    return ozerniks, bind_karmas
+
+def get_pairs_leaderboard() -> list[dict]:
+    """
+    Сильнейшие пары: кто больше всех времени провёл в войсе друг с другом.
+
+    :return: Словари с ключами first, second, bind, level (название уровня связи), level_emoji.
+    """
+    return [
+        {
+            'first': first,
+            'second': second,
+            'bind': bind,
+            'level': BIND_LEVEL_NAMES[get_cube(bind.bind_karma)['tag_name']],
+            'level_emoji': BIND_LEVEL_EMOJI[get_cube(bind.bind_karma)['tag_name']],
+        }
+        for first, second, bind in db.get_top_karmic_binds()
+    ]
+
+def get_together_leaderboard() -> list[dict]:
+    """
+    Связь «со всеми вместе»: сумма всех связей человека.
+
+    Это не время в войсе, а время с каждым собеседником, сложенное:
+    час втроём даёт по часу с каждым из двух — всего 2 часа.
+
+    :return: Словари с ключами ozernik, total_bind_karma, binds.
+    """
+    ozerniks, bind_karmas = get_binds_by_user()
+
+    leaderboard = [
+        {
+            'ozernik': ozerniks[ozernik_id],
+            'total_bind_karma': sum(karmas),
+            'binds': len(karmas),
+        }
+        for ozernik_id, karmas in bind_karmas.items()
+    ]
+
+    leaderboard.sort(key=lambda row: (-row['total_bind_karma'], row['ozernik'].id))
+
+    return leaderboard
+
+def get_colored_leaderboard() -> list[dict]:
+    """
+    Цветные связи (выше Чёрной).
+
+    Порядок (решение Alium): золотые → синие → белые → связь со всеми вместе.
+    Считается точно: золотая связь — только золотая, в синие/белые не идёт.
+    Люди без цветных связей не попадают.
+
+    :return: Словари с ключами ozernik, gold, blue, white, total_bind_karma.
+    """
+    ozerniks, bind_karmas = get_binds_by_user()
+
     leaderboard = []
 
     for ozernik_id, karmas in bind_karmas.items():
-        cube = get_cube_status_by_binds(karmas)
+        levels = [get_cube(karma)['tag_name'] for karma in karmas]
 
-        if cube is None:
-            continue
-
-        leaderboard.append({
+        row = {
             'ozernik': ozerniks[ozernik_id],
-            'cube': cube,
-            'cube_binds': sum(1 for karma in karmas if get_cube(karma)['place'] >= cube['place']),
+            'gold': levels.count('gold_cube'),
+            'blue': levels.count('blue_cube'),
+            'white': levels.count('white_cube'),
             'total_bind_karma': sum(karmas),
-        })
+        }
+
+        if row['gold'] or row['blue'] or row['white']:
+            leaderboard.append(row)
 
     leaderboard.sort(key=lambda row: (
-        -row['cube']['place'],
+        -row['gold'],
+        -row['blue'],
+        -row['white'],
         -row['total_bind_karma'],
         row['ozernik'].id,
     ))
 
     return leaderboard
+
+def format_hours(minutes: int) -> str:
+    """Короткая длительность в часах: '34 ч 14 мин', '6 ч', '45 мин'."""
+    hours, minutes = divmod(minutes, 60)
+
+    if hours and minutes:
+        return f'{hours} ч {minutes} мин'
+    if hours:
+        return f'{hours} ч'
+    return f'{minutes} мин'
 
 def plural_ru(number: int, forms: tuple[str, str, str]) -> str:
     """Форма слова для числа: ('связь', 'связи', 'связей')."""
@@ -614,7 +752,7 @@ def get_new_stage_text(old_karma: int, new_karma: int) -> str:
     return f"Теперь вы <@&{new_stage['role_id']}>"
 
 def get_level_up_text(level: int) -> str:
-    text: str = levels_data[f'{level}']
+    text = db.get_level_text(level)
     role_id = get_role_id_by_level(level)
 
     text = text.replace('{role}', f'<@&{role_id}>')
@@ -622,22 +760,66 @@ def get_level_up_text(level: int) -> str:
     return text
 
 def get_level_up_verb(level: int) -> str:
-    # Заглушка: глагол в заголовке повышения. Позже — разные глаголы для разных уровней/этапов.
-    return 'достигает'
+    # Заглушка: глагол в строке «Вы … N уровня». Позже — разные глаголы для разных уровней/этапов.
+    return 'достигаете'
+
+def build_level_up_description(level: int, previous_karma: int) -> str:
+    """
+    Текст сообщения о повышении, по шаблону старой Сансары (Amari):
+
+        [текст уровня от администрации]
+        Вы достигаете N уровня.
+        Теперь вы @Роль          ← только при смене ступени Сансары
+
+    :param previous_karma: Карма, от которой считается переход (для смены ступени).
+    """
+    lines = []
+
+    text = get_level_up_text(level)
+    if text:
+        lines.append(text)
+
+    lines.append(f'Вы {get_level_up_verb(level)} {level} уровня.')
+
+    stage_text = get_new_stage_text(previous_karma, get_karma(level))
+    if stage_text:
+        lines.append(stage_text)
+
+    return '\n'.join(lines)
 
 # Функции PIL
-def create_rank_card(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, username: str):
+def get_card_stats(ozernik_id: int) -> dict:
+    """
+    Данные из базы для карточек Сансары и Кубов.
+
+    Считать в основном потоке: соединение SQLite нельзя использовать из другого
+    потока, а сами карточки рисуются в отдельном (asyncio.to_thread), чтобы не
+    останавливать бота.
+    """
+    return {
+        'karma': db.get_karma(ozernik_id),
+        'user_cubes': get_cubes(ozernik_id),
+        'user_cube': get_cube_status(ozernik_id),
+        'next_cube': get_next_cube(ozernik_id),
+        'karma_rank': db.get_karma_rank(ozernik_id),
+        'weekly_karma_rank': db.get_weekly_karma_rank(ozernik_id),
+    }
+
+def create_rank_card(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, username: str, stats: dict | None = None):
+    if stats is None:
+        stats = get_card_stats(ozernik.id)
+
     # Расчет кармы и уровней
-    karma = db.get_karma(ozernik.id)
+    karma = stats['karma']
     level = get_level(karma.karma)
     status = get_status(karma)
 
-    user_cubes = get_cubes(ozernik.id)
-    user_cube = get_cube_status(ozernik.id)
-    next_cube = get_next_cube(ozernik.id)
+    user_cubes = stats['user_cubes']
+    user_cube = stats['user_cube']
+    next_cube = stats['next_cube']
 
-    global_rank = f'#{db.get_karma_rank(ozernik.id)}' if karma.karma > 0 else '-'
-    weekly_rank = f'#{db.get_weekly_karma_rank(ozernik.id)}' if karma.weekly_karma > 0 else '-'
+    global_rank = f'#{stats["karma_rank"]}' if karma.karma > 0 else '-'
+    weekly_rank = f'#{stats["weekly_karma_rank"]}' if karma.weekly_karma > 0 else '-'
     weekly_karma = f'{karma.weekly_karma}' if karma.weekly_karma > 0 else '-'
 
     current_level_karma = get_karma(level)
@@ -1211,7 +1393,10 @@ def create_bind_up_postcard(bind: DataTypes.KarmicBind, avatar_1_image, avatar_2
     buffer.seek(0)
     return buffer
 
-def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, username: str, full_binds: list[dict[str, Image.Image | str | DataTypes.KarmicBind]]) -> Image.Image:
+def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, username: str, full_binds: list[dict[str, Image.Image | str | DataTypes.KarmicBind]], stats: dict | None = None) -> Image.Image:
+    if stats is None:
+        stats = get_card_stats(ozernik.id)
+
     # Расчеты
     size = (1200, 800)
     size_factor = min(size) / 600
@@ -1222,12 +1407,12 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
     radius = 20 * size_factor
     main_box_gap = main_objects_size // 4
 
-    karma = db.get_karma(ozernik.id)
+    karma = stats['karma']
     status = get_status(karma)
 
-    user_cubes = get_cubes(ozernik.id)
-    user_cube = get_cube_status(ozernik.id)
-    next_cube = get_next_cube(ozernik.id)
+    user_cubes = stats['user_cubes']
+    user_cube = stats['user_cube']
+    next_cube = stats['next_cube']
 
     full_binds = sorted(full_binds, key=lambda b: b["bind"].bind_karma, reverse=True)
     num_binds = 10
@@ -1697,6 +1882,75 @@ class Roles:
             "gold_cube",
         ]
 
+    async def _get_role(self, roles_key: str, icons: dict[str, Path], role_name: str, recreate: bool, restore: bool) -> Role | None:
+        """
+        Находит роль по ID из data (кэш сервера → запрос к Discord).
+
+        - recreate: если роли нет — создать и сохранить новый ID;
+        - restore: вернуть название и цвет из настроек.
+        Иконка загружается только при создании роли или при restore —
+        не при каждом обращении (иначе каждое повышение правило 7 ролей).
+        """
+        guild: discord.Guild = self._bot.guild
+
+        if not guild:
+            return None
+
+        roles_data = getattr(data, roles_key)
+        role_data = roles_data[role_name]
+
+        role = guild.get_role(role_data['role_id'])
+
+        if role is None:
+            try:
+                role = await guild.fetch_role(role_data['role_id'])
+            except discord.HTTPException:
+                pass
+
+        created = False
+
+        if role is None and recreate:
+            try:
+                role = await guild.create_role(
+                    reason="Восстановление роли.",
+                    name=role_data['name'],
+                    colour=discord.Colour.from_str(role_data['color']),
+                    hoist=False,
+                    mentionable=False,
+                )
+
+                role_data['role_id'] = role.id
+                setattr(data, roles_key, roles_data)
+                created = True
+            except Exception as e:
+                print(e)
+                print(traceback.format_exc())
+
+        if role is None:
+            return None
+
+        if restore and not created:
+            try:
+                await role.edit(
+                    reason="Восстановление роли.",
+                    name=role_data['name'],
+                    colour=discord.Colour.from_str(role_data['color']),
+                )
+            except Exception as e:
+                print(f'Не удалось восстановить роль {role_name}: {e}')
+
+        if created or restore:
+            # Иконки ролей доступны только на сервере с 2 уровнем буста — ошибку глушим.
+            try:
+                with open(icons[role_name], "rb") as f:
+                    icon_bytes = f.read()
+
+                await role.edit(display_icon=icon_bytes)
+            except Exception:
+                pass
+
+        return role
+
     async def get_sansara_role(
         self,
         role_name: Literal[
@@ -1708,47 +1962,9 @@ class Roles:
             'deva',
         ],
         recreate: bool = True,
+        restore: bool = False,
     ) -> Role | None:
-        guild: discord.Guild = self._bot.guild
-
-        if not guild:
-            return None
-
-        karma_roles = data.karma_roles
-        role = guild.get_role(karma_roles[role_name]['role_id'])
-        if role is None:
-            try:
-                role = await guild.fetch_role(karma_roles[role_name]['role_id'])
-            except discord.HTTPException:
-                pass
-
-        if role is None and recreate:
-            try:
-                role = await guild.create_role(
-                    reason="Восстановление роли.",
-                    name=karma_roles[role_name]['name'],
-                    colour=discord.Colour.from_str(
-                        karma_roles[role_name]['color']
-                    ),
-                    hoist=False,
-                    mentionable=False,
-                )
-
-                karma_roles[role_name]['role_id'] = role.id
-                data.karma_roles = karma_roles
-            except Exception as e:
-                print(e)
-                print(traceback.format_exc())
-
-        try:
-            with open(assets.sansara[role_name], "rb") as f:
-                icon_bytes = f.read()
-
-            await role.edit(display_icon=icon_bytes)
-        except Exception:
-            pass
-
-        return role
+        return await self._get_role('karma_roles', assets.sansara, role_name, recreate, restore)
 
     async def get_cube_role(
         self,
@@ -1759,65 +1975,26 @@ class Roles:
             'gold_cube',
         ],
         recreate: bool = True,
+        restore: bool = False,
     ) -> Role | None:
-        guild: discord.Guild = self._bot.guild
+        return await self._get_role('cube_roles', assets.cubes, role_name, recreate, restore)
 
-        if not guild:
-            return None
-
-        cube_roles = data.cube_roles
-        role = guild.get_role(cube_roles[role_name]['role_id'])
-
-        if role is None:
-            try:
-                role = await guild.fetch_role(cube_roles[role_name]['role_id'])
-            except discord.HTTPException:
-                pass
-
-        if role is None and recreate:
-            try:
-                role = await guild.create_role(
-                    reason="Восстановление роли.",
-                    name=cube_roles[role_name]['name'],
-                    colour=discord.Colour.from_str(
-                        cube_roles[role_name]['color']
-                    ),
-                    hoist=False,
-                    mentionable=False,
-                )
-
-                cube_roles[role_name]['role_id'] = role.id
-                data.cube_roles = cube_roles
-            except Exception as e:
-                print(e)
-                print(traceback.format_exc())
-
-        try:
-            with open(assets.cubes[role_name], "rb") as f:
-                icon_bytes = f.read()
-
-            await role.edit(display_icon=icon_bytes)
-        except Exception:
-            pass
-
-        return role
-
-    async def get_sansara_roles(self, recreate: bool = True) -> list[Role] | None:
+    async def get_sansara_roles(self, recreate: bool = True, restore: bool = False) -> list[Role] | None:
         roles = []
 
         for role_name in self._sansara_roles:
-            role = await self.get_sansara_role(role_name, recreate)
+            role = await self.get_sansara_role(role_name, recreate, restore)
 
             if role is not None:
                 roles.append(role)
 
         return roles or None
 
-    async def get_cube_roles(self, recreate: bool = True) -> list[Role] | None:
+    async def get_cube_roles(self, recreate: bool = True, restore: bool = False) -> list[Role] | None:
         roles = []
 
         for role_name in self._cubes_roles:
-            role = await self.get_cube_role(role_name, recreate)
+            role = await self.get_cube_role(role_name, recreate, restore)
 
             if role is not None:
                 roles.append(role)
@@ -1937,12 +2114,14 @@ class SettingsGeneralPage(Page):
         self.log_channel_id = data.log_channel_id
         self.blocked_channels_id = set(data.blocked_channels_id)
         self.blocked_roles_id = set(data.blocked_roles_id)
+        self.blocked_users_id = set(data.blocked_users_id)
 
         # Флаги изменений
         self.original_karma_channel_id = data.karma_channel_id
         self.original_log_channel_id = data.log_channel_id
         self.original_blocked_channels_id = set(data.blocked_channels_id)
         self.original_blocked_roles_id = set(data.blocked_roles_id)
+        self.original_blocked_users_id = set(data.blocked_users_id)
 
         # -------------------------------------------------
         # Блокировка каналов
@@ -1964,6 +2143,17 @@ class SettingsGeneralPage(Page):
         )
         self.blocked_roles_select.callback = (
             self.blocked_roles_callback
+        )
+
+        # -------------------------------------------------
+        # Блокировка участников
+        # -------------------------------------------------
+
+        self.blocked_users_select = discord.ui.UserSelect(
+            placeholder="Изменить участников"
+        )
+        self.blocked_users_select.callback = (
+            self.blocked_users_callback
         )
 
         # -------------------------------------------------
@@ -2037,6 +2227,18 @@ class SettingsGeneralPage(Page):
         container.add_item(
             discord.ui.ActionRow(
                 self.blocked_roles_select
+            )
+        )
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                self.get_blocked_users_text()
+            )
+        )
+
+        container.add_item(
+            discord.ui.ActionRow(
+                self.blocked_users_select
             )
         )
 
@@ -2196,6 +2398,36 @@ class SettingsGeneralPage(Page):
         await self.navigator.render()
         await interaction.response.defer()
 
+    def get_blocked_users_text(self) -> str:
+        """Как у ролей: зачёркнут — будет снят, со звёздочкой — будет добавлен после «Подтвердить»."""
+        if not self.blocked_users_id and not self.original_blocked_users_id:
+            return "### Заблокированные участники: не выбраны"
+
+        parts = []
+
+        for user_id in (self.original_blocked_users_id | self.blocked_users_id):
+            removed = user_id in self.original_blocked_users_id and user_id not in self.blocked_users_id
+            added = user_id not in self.original_blocked_users_id and user_id in self.blocked_users_id
+
+            if removed:
+                parts.append(f"~~<@{user_id}>~~\\*")
+            elif added:
+                parts.append(f"<@{user_id}>\\*")
+            else:
+                parts.append(f"<@{user_id}>")
+
+        return "### Заблокированные участники: " + ", ".join(parts)
+
+    async def blocked_users_callback(self, interaction: discord.Interaction) -> None:
+        users = [user.id for user in self.blocked_users_select.values]
+
+        self.blocked_users_id.symmetric_difference_update(users)
+
+        self.update_buttons()
+
+        await self.navigator.render()
+        await interaction.response.defer()
+
     async def blocked_roles_callback(self, interaction: discord.Interaction) -> None:
         roles = [role.id for role in self.blocked_roles_select.values]
 
@@ -2221,6 +2453,10 @@ class SettingsGeneralPage(Page):
             data.blocked_roles_id = list(self.blocked_roles_id)
             self.original_blocked_roles_id = set(self.blocked_roles_id)
 
+        if self.blocked_users_id != self.original_blocked_users_id:
+            data.blocked_users_id = list(self.blocked_users_id)
+            self.original_blocked_users_id = set(self.blocked_users_id)
+
         await self.navigator.render()
         await interaction.response.defer()
 
@@ -2230,6 +2466,7 @@ class SettingsGeneralPage(Page):
             or self.log_channel_id != self.original_log_channel_id
             or self.blocked_channels_id != self.original_blocked_channels_id
             or self.blocked_roles_id != self.original_blocked_roles_id
+            or self.blocked_users_id != self.original_blocked_users_id
         )
 
         self.confirm_button.disabled = not edited
@@ -2249,7 +2486,9 @@ class SettingsLevelUpPage(Page):
 
     def update_buttons(self):
         self.buttons = []
-        levels = list(levels_data.items())
+        texts = db.get_level_texts()
+        # Ключи — строки: в окне правки тексты показываются как {'5': 'текст'}.
+        levels = [(str(level), texts.get(level, '')) for level in range(1, LEVEL_TEXTS_COUNT + 1)]
 
         for i in range(0, len(levels), 20):
             group = tuple(levels[i:i + 20])
@@ -2295,7 +2534,13 @@ class SettingsLevelUpPage(Page):
             try:
                 new_levels_data = expand_dict(self.text_input.value)
 
-                levels_data.update(new_levels_data)
+                try:
+                    texts = parse_level_texts(new_levels_data)
+                except ValueError as error:
+                    await interaction.followup.send(f'Не сохранено. {error}', ephemeral=True)
+                    return
+
+                db.set_level_texts(texts)
 
                 self.page.update_buttons()
                 await self.page.navigator.render()
@@ -2395,7 +2640,7 @@ class SettingsSansaraPage(Page):
                 return
 
             guild = self.bot.guild
-            sansara_roles = await self.roles.get_sansara_roles(recreate=True)
+            sansara_roles = await self.roles.get_sansara_roles(recreate=True, restore=True)
             sansara_role_ids = {role.id for role in sansara_roles}
 
             async def restore_roles():
@@ -2716,7 +2961,7 @@ class SettingsCubesPage(Page):
                 return
 
             guild = self.bot.guild
-            cube_roles = await self.roles.get_cube_roles(recreate=True)
+            cube_roles = await self.roles.get_cube_roles(recreate=True, restore=True)
 
             async def restore_roles():
                 message: discord.WebhookMessage = await interaction.followup.send(
@@ -2977,6 +3222,46 @@ class SettingsCubesPage(Page):
 #  ||||||||||||||||||| Класс модуля |||||||||||||||||||||||
 # ---------------------------------------------------------
 
+class BindLeaderboardView(discord.ui.View):
+    """
+    Вкладки таблиц Связи (/leaderboard_cubes, ,lbc): Пары · Время · Кубы.
+
+    Постоянное меню (решение Alium): переключать может любой, кнопки работают всегда,
+    в том числе после перезапуска бота. Для этого:
+    - у кнопок фиксированные custom_id, а при запуске Cog регистрирует меню
+      через bot.add_view — Discord присылает нажатие, бот находит обработчик по custom_id;
+    - меню ничего не помнит о конкретном сообщении: вкладку берёт из custom_id
+      нажатой кнопки, цвет таблицы — у нажавшего.
+    """
+
+    CUSTOM_ID_PREFIX = 'karma:bind_tabs:'
+
+    def __init__(self, cog: "KarmaSistem", tab: str = 'pairs'):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+        for key, (label, _, _) in cog.BIND_TABS.items():
+            active = key == tab
+
+            # Открытая вкладка подсвечена и неактивна.
+            button = discord.ui.Button(
+                label=label,
+                custom_id=f'{self.CUSTOM_ID_PREFIX}{key}',
+                style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
+                disabled=active,
+            )
+            button.callback = self.make_callback(key)
+            self.add_item(button)
+
+    def make_callback(self, key: str):
+        async def callback(interaction: discord.Interaction):
+            await interaction.response.edit_message(
+                embed=self.cog.build_bind_tab(key, interaction.user, interaction.guild),
+                view=BindLeaderboardView(self.cog, key),
+            )
+
+        return callback
+
 class KarmaSistem(commands.Cog):
 
     # ---------- ИНИЦИАЛИЗАЦИЯ -----------
@@ -2987,11 +3272,16 @@ class KarmaSistem(commands.Cog):
         self.delays = set()
 
     def cog_load(self):
+        # Тексты повышений из старого levels.json — в базу (один раз).
+        import_legacy_level_texts(LEGACY_LEVELS_PATH)
+
         self.voice_karma_check.start()
         self.weekly_countdown.start()
 
+        # Кнопки вкладок таблиц Связи работают на всех сообщениях, даже после перезапуска.
+        self.bot.add_view(BindLeaderboardView(self))
+
     async def cog_unload(self):
-        await levels_data.close()
         self.voice_karma_check.cancel()
         self.weekly_countdown.cancel()
 
@@ -3126,17 +3416,11 @@ class KarmaSistem(commands.Cog):
         for level in levels:
             role = await self.update_sansara_roles(member)
 
-            level_karma = get_karma(level)
-            description = get_level_up_text(level)
-
-            stage_text = get_new_stage_text(previous_karma, level_karma)
-            if stage_text:
-                description = f'{description}\n\n{stage_text}' if description else stage_text
-
-            previous_karma = level_karma
+            description = build_level_up_description(level, previous_karma)
+            previous_karma = get_karma(level)
 
             embed = discord.Embed(
-                title=f"**{member.display_name} {get_level_up_verb(level)} {level} уровня**",
+                title=f"**{member.display_name} повышает уровень!**",
                 description=description,
                 colour=role.colour
             )
@@ -3183,10 +3467,12 @@ class KarmaSistem(commands.Cog):
             print(avatar_1.size)
             print(avatar_2.size)
 
-            postcard_bytes = create_bind_up_postcard(
+            # Рисование — в отдельном потоке, чтобы не останавливать бота.
+            postcard_bytes = await asyncio.to_thread(
+                create_bind_up_postcard,
                 bind=bind,
                 avatar_1_image=avatar_1,
-                avatar_2_image=avatar_2
+                avatar_2_image=avatar_2,
             )
 
             file = discord.File(postcard_bytes, filename=f"{member_1.name}_{member_2.name}_postcard.png")
@@ -3212,7 +3498,7 @@ class KarmaSistem(commands.Cog):
             role = await self.update_cube_roles(member)
             cube_name = get_cube_status(db.get_user_by_discord_id(member.id).id)['name']
 
-            title = f"**{member.display_name} получил новый Куб!**"
+            title = f"**{member.display_name} получает новый Куб!**"
             description = ''
 
             match cube_name:
@@ -3283,6 +3569,11 @@ class KarmaSistem(commands.Cog):
         if self.check_blocked_channels(message.channel.id): # Проверка заблокирован ли канал
             return
 
+        # Ветка в заблокированном канале тоже заблокирована (у ветки свой ID).
+        parent_id = getattr(message.channel, 'parent_id', None)
+        if parent_id and self.check_blocked_channels(parent_id):
+            return
+
         if not self.can_get_karma(member):
             return
 
@@ -3328,36 +3619,52 @@ class KarmaSistem(commands.Cog):
 
     @tasks.loop(minutes=1)
     async def voice_karma_check(self):
-        try:
-            if not self.bot.ready:
-                return
-            for channel in self.bot.guild.voice_channels:
-                members = self.get_voice_karma_members(channel)
+        if not self.bot.ready:
+            return
 
-                if len(members) < 2:
-                    continue
+        for channel in self.bot.guild.voice_channels:
+            # Ошибка в одном канале не должна срывать начисление в остальных:
+            # раньше весь проход был в одном try, и первая же ошибка выбрасывала из цикла.
+            try:
+                await self.process_voice_channel(channel)
+            except Exception as error:
+                self.bot.print_error(f"voice_karma_check [{channel.name}]", error)
 
-                for user_1, user_2 in combinations(members, 2):
-                    ozernik_1 = self.bot.db_ensure_user(user_1)
-                    ozernik_2 = self.bot.db_ensure_user(user_2)
+    async def process_voice_channel(self, channel: discord.VoiceChannel) -> None:
+        """Начисляет +1 Связи каждой паре в канале и присылает открытки/новые Кубы."""
+        # Основной аккаунт и его твинк — один озерник: оставляем одного,
+        # иначе получилась бы «связь с самим собой» (ValueError в базе).
+        members = self.get_voice_karma_members(channel)
 
-                    ozernik_1_old_cube = get_cube_status(ozernik_1.id)
-                    ozernik_2_old_cube = get_cube_status(ozernik_2.id)
+        if len(members) < 2:
+            return
 
-                    bind = db.add_bind_karma(ozernik_1.id, ozernik_2.id, karma=1)
+        entries: dict[int, tuple[discord.Member, DataTypes.Ozernik]] = {}
 
-                    await self.give_bind_up_message(user_1, user_2, bind.bind_karma - 1, bind.bind_karma)
+        for member in members:
+            ozernik = self.bot.db_ensure_user(member)
+            entries.setdefault(ozernik.id, (member, ozernik))
 
-                    ozernik_1_new_cube = get_cube_status(ozernik_1.id)
-                    ozernik_2_new_cube = get_cube_status(ozernik_2.id)
+        if len(entries) < 2:
+            return
 
-                    await self.give_cube_up_message(user_1, ozernik_1_old_cube, ozernik_1_new_cube)
-                    await self.give_cube_up_message(user_2, ozernik_2_old_cube, ozernik_2_new_cube)
+        # Куб каждого участника считается один раз до и один раз после,
+        # а все пары записываются в базу одной транзакцией. Раньше на
+        # каждую пару было по два коммита и четыре пересчёта Кубов —
+        # при 15 людях в войсе бот стоял ~3 секунды каждую минуту.
+        old_cubes = {ozernik.id: get_cube_status(ozernik.id) for _, ozernik in entries.values()}
 
-        except Exception:
-            func_name = inspect.currentframe().f_code.co_name
-            tb = traceback.format_exc()
-            print(f"Error in {func_name}: {tb}")
+        pairs = list(combinations(entries.values(), 2))
+        binds = db.add_bind_karma_many(
+            [(ozernik_1.id, ozernik_2.id) for (_, ozernik_1), (_, ozernik_2) in pairs],
+            karma=1,
+        )
+
+        for ((member_1, _), (member_2, _)), bind in zip(pairs, binds):
+            await self.give_bind_up_message(member_1, member_2, bind.bind_karma - 1, bind.bind_karma)
+
+        for member, ozernik in entries.values():
+            await self.give_cube_up_message(member, old_cubes[ozernik.id], get_cube_status(ozernik.id))
 
     @voice_karma_check.error
     async def voice_karma_check_error(self, error):
@@ -3459,7 +3766,10 @@ class KarmaSistem(commands.Cog):
         ozernik = self.bot.db_ensure_user(member)
         avatar = await get_discord_avatar(member)
 
-        rank_card_bytes = create_rank_card(ozernik, avatar, member.display_name)
+        stats = get_card_stats(ozernik.id)
+
+        # Рисование — в отдельном потоке, чтобы не останавливать бота.
+        rank_card_bytes = await asyncio.to_thread(create_rank_card, ozernik, avatar, member.display_name, stats)
 
         return discord.File(rank_card_bytes, filename=f"{member.name}_sansara_rank.png")
 
@@ -3468,11 +3778,16 @@ class KarmaSistem(commands.Cog):
         avatar = await get_discord_avatar(member)
         full_binds = await get_full_binds(member, self.bot)
 
-        rank_card_bytes = create_cube_cart(
+        stats = get_card_stats(ozernik.id)
+
+        # Рисование — в отдельном потоке, чтобы не останавливать бота.
+        rank_card_bytes = await asyncio.to_thread(
+            create_cube_cart,
             ozernik,
             avatar,
             member.display_name,
             full_binds,
+            stats,
         )
 
         return discord.File(rank_card_bytes, filename=f"{member.name}_cube_rank.png")
@@ -3481,11 +3796,18 @@ class KarmaSistem(commands.Cog):
     def build_leaderboard_embed(
             title: str,
             subtitle: str,
-            rows: list[tuple[int, str]],
+            rows: list[tuple[str, str]],
             viewer: discord.Member,
             guild: discord.Guild,
+            one_line: bool = False,
     ) -> discord.Embed:
-        """rows — (discord_id, строки под именем) для первых 10 мест."""
+        """
+        rows — (заголовок места, текст) для первых 10 мест. Заголовок — упоминание(я).
+
+        one_line=True — каждое место одной строкой (таблицы Связи). Многострочные места
+        держат отступ символом-невидимкой «ㅤ»; на телефоне длинная строка переносится,
+        перенос начинается с края, и места сливаются в кашу. Одна строка так не ломается.
+        """
         embed = discord.Embed(
             title=title,
             colour=viewer.top_role.colour,
@@ -3494,11 +3816,19 @@ class KarmaSistem(commands.Cog):
         if guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
 
-        lines = [subtitle]
+        # Пустой подзаголовок (вкладки Связи) — список мест сразу под названием таблицы.
+        lines = [subtitle] if subtitle else []
 
-        for n, (discord_id, body) in enumerate(rows[:10], 1):
-            lines.append('')
-            lines.append(f'**#{n} <:cigar:1208007437639225415> <@{discord_id}>**\n{body}')
+        for n, (header, body) in enumerate(rows[:10], 1):
+            if one_line:
+                lines.append(f'**#{n} <:cigar:1208007437639225415> {header}** · {body}')
+            else:
+                lines.append('')
+                lines.append(f'**#{n} <:cigar:1208007437639225415> {header}**\n{body}')
+
+        if one_line and subtitle:
+            # Отделить подзаголовок от списка.
+            lines.insert(1, '')
 
         embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
 
@@ -3513,7 +3843,7 @@ class KarmaSistem(commands.Cog):
         for ozernik, karma in leaderboard[:10]:
             level = get_level(karma.karma)
             rows.append((
-                ozernik.discord_id,
+                f'<@{ozernik.discord_id}>',
                 f'ㅤ  Уровень: `{level}`\n'
                 f'ㅤ  Карма: `{karma.karma}/{get_karma(level + 1)}`'
             ))
@@ -3529,7 +3859,7 @@ class KarmaSistem(commands.Cog):
         for ozernik, karma in leaderboard[:10]:
             level = get_level(karma.karma)
             rows.append((
-                ozernik.discord_id,
+                f'<@{ozernik.discord_id}>',
                 f'ㅤ  Уровень: `{level}`\n'
                 f'ㅤ  Карма: `{karma.weekly_karma}/{get_karma(level + 1)}`'
             ))
@@ -3540,29 +3870,87 @@ class KarmaSistem(commands.Cog):
             rows, viewer, guild,
         )
 
-    def build_leaderboard_cubes(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
-        leaderboard = get_cube_leaderboard()
+    def build_bind_pairs(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
+        leaderboard = get_pairs_leaderboard()
         if not leaderboard:
             return None
 
-        rows = []
-        for row in leaderboard[:10]:
-            cube_binds = row['cube_binds']
-            total = row['total_bind_karma']
-            rows.append((
-                row['ozernik'].discord_id,
-                f'ㅤ  Куб: `{row["cube"]["name"]}` ({cube_binds} {plural_ru(cube_binds, ("связь", "связи", "связей"))})\n'
-                f'ㅤ  Связь: `{total}` ед. с. ({format_duration_minutes(total) or "0 минут"})'
-            ))
+        rows = [
+            (
+                f'<@{row["first"].discord_id}> + <@{row["second"].discord_id}>',
+                f'{row["level_emoji"]} `{format_hours(row["bind"].bind_karma)}`',
+            )
+            for row in leaderboard[:10]
+        ]
 
-        return self.build_leaderboard_embed('Таблица лидеров Кубов', '*Время, проведённое вместе.*', rows, viewer, guild)
+        return self.build_leaderboard_embed(
+            'Пары',
+            '',
+            rows, viewer, guild, one_line=True,
+        )
+
+    def build_bind_together(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
+        leaderboard = get_together_leaderboard()
+        if not leaderboard:
+            return None
+
+        rows = [
+            (
+                f'<@{row["ozernik"].discord_id}>',
+                f'`{format_hours(row["total_bind_karma"])}` · '
+                f'{row["binds"]} {plural_ru(row["binds"], ("связь", "связи", "связей"))}',
+            )
+            for row in leaderboard[:10]
+        ]
+
+        return self.build_leaderboard_embed(
+            'Время',
+            '',
+            rows, viewer, guild, one_line=True,
+        )
+
+    def build_bind_colored(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
+        leaderboard = get_colored_leaderboard()
+        if not leaderboard:
+            return None
+
+        rows = [
+            (
+                f'<@{row["ozernik"].discord_id}>',
+                f'🟡{row["gold"]} 🔵{row["blue"]} ⚪{row["white"]}',
+            )
+            for row in leaderboard[:10]
+        ]
+
+        return self.build_leaderboard_embed(
+            'Кубы',
+            '',
+            rows, viewer, guild, one_line=True,
+        )
+
+    # Вкладки ,lbc: ключ → (надпись кнопки, сборщик, текст пустой вкладки).
+    BIND_TABS = {
+        'pairs': ('Пары', 'build_bind_pairs', 'Пар пока нет.'),
+        'together': ('Время', 'build_bind_together', 'Связей пока нет.'),
+        'colored': ('Кубы', 'build_bind_colored', 'Цветных связей пока ни у кого нет.'),
+    }
+
+    def build_bind_tab(self, tab: str, viewer: discord.Member, guild: discord.Guild) -> discord.Embed:
+        label, builder, empty_text = self.BIND_TABS[tab]
+        embed = getattr(self, builder)(viewer, guild)
+
+        if embed is None:
+            embed = discord.Embed(title=label, description=empty_text, colour=viewer.top_role.colour)
+
+        return embed
 
     # Таблицы лидеров: (сборщик, ответ при пустой таблице).
     LEADERBOARDS = {
         'leaderboard': ('build_leaderboard', 'Нет таблицы лидеров.'),
         'leaderboard_weekly': ('build_leaderboard_weekly', 'Нет недельной таблицы лидеров.'),
-        'leaderboard_cubes': ('build_leaderboard_cubes', 'Нет таблицы лидеров Кубов.'),
     }
+
+    BIND_EMPTY_TEXT = 'Нет таблиц лидеров Связи.'
 
     async def send_leaderboard(self, interaction: Interaction, name: str) -> None:
         builder, empty_text = self.LEADERBOARDS[name]
@@ -3618,6 +4006,18 @@ class KarmaSistem(commands.Cog):
             await message.reply(file=file, allowed_mentions=no_ping)
             return True
 
+        if name == 'leaderboard_cubes':
+            if not db.get_top_karmic_binds():
+                await message.reply(self.BIND_EMPTY_TEXT, allowed_mentions=no_ping)
+                return True
+
+            await message.reply(
+                embed=self.build_bind_tab('pairs', member, message.guild),
+                view=BindLeaderboardView(self),
+                allowed_mentions=no_ping,
+            )
+            return True
+
         builder, empty_text = self.LEADERBOARDS[name]
         embed = getattr(self, builder)(member, message.guild)
 
@@ -3656,10 +4056,17 @@ class KarmaSistem(commands.Cog):
     async def leaderboard_weekly(self, interaction: Interaction):
         await self.send_leaderboard(interaction, 'leaderboard_weekly')
 
-    @app_commands.command(name='leaderboard_cubes', description='Таблица лидеров Кубов. Сокращение: ,lbc')
+    @app_commands.command(name='leaderboard_cubes', description='Таблицы Связи: пары, со всеми, цветные. Сокращение: ,lbc')
     @app_commands.guilds(config.GUILD_ID)
     async def leaderboard_cubes(self, interaction: Interaction):
-        await self.send_leaderboard(interaction, 'leaderboard_cubes')
+        if not db.get_top_karmic_binds():
+            await interaction.response.send_message(self.BIND_EMPTY_TEXT, ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            embed=self.build_bind_tab('pairs', interaction.user, interaction.guild),
+            view=BindLeaderboardView(self),
+        )
 
     # ------ АДМИНИСТРИРОВАНИЕ КАРМЫ ------
 
