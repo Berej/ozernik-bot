@@ -549,6 +549,10 @@ def get_level_up_text(level: int) -> str:
 
     return text
 
+def get_level_up_verb(level: int) -> str:
+    # Заглушка: глагол в заголовке повышения. Позже — разные глаголы для разных уровней/этапов.
+    return 'достигает'
+
 # Функции PIL
 def create_rank_card(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, username: str):
     # Расчет кармы и уровней
@@ -3017,7 +3021,7 @@ class KarmaSistem(commands.Cog):
             print(description)
 
             embed = discord.Embed(
-                title=f"**{member.display_name} повысил уровень!**",
+                title=f"**{member.display_name} {get_level_up_verb(level)} {level} уровня**",
                 description=description,
                 colour=role.colour
             )

@@ -182,7 +182,7 @@ class TestOnMessage:
         assert karma_of(env, member) == 100
         channel.send.assert_awaited_once()
         embed = channel.send.call_args.kwargs["embed"]
-        assert embed.title == f"**{member.display_name} повысил уровень!**"
+        assert embed.title == f"**{member.display_name} достигает 1 уровня**"
         # Выдана роль Преты (100 кармы).
         assert env.data.karma_roles["preta"]["role_id"] in [role.id for role in member.roles]
 
@@ -448,9 +448,12 @@ class TestLevelUpMessages:
         await env.cog.give_level_up_message(member, 99, 300)
 
         assert channel.send.await_count == 3
-        descriptions = [call.kwargs["embed"].description for call in channel.send.await_args_list]
+        embeds = [call.kwargs["embed"] for call in channel.send.await_args_list]
         preta_id = env.data.karma_roles["preta"]["role_id"]
-        assert descriptions == [f"Первый <@&{preta_id}>", "", "Третий"]
+        assert [embed.description for embed in embeds] == [f"Первый <@&{preta_id}>", "", "Третий"]
+        assert [embed.title for embed in embeds] == [
+            f"**{member.display_name} достигает {level} уровня**" for level in (1, 2, 3)
+        ]
 
     async def test_member_without_avatar_and_guild_without_icon(self, env):
         channel = enable_karma_channel(env)
