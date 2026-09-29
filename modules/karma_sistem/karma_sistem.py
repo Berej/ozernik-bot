@@ -243,8 +243,9 @@ def get_cube_leaderboard() -> list[dict]:
     """
     Топ по Кубам.
 
-    Порядок: выше Куб → больше связей уровня этого Куба или выше →
-    больше суммарная карма связей. Пользователи без Куба не попадают.
+    Порядок: выше Куб → больше суммарная карма связей (время в войсе).
+    Число связей на место не влияет: подняться может только новый Куб.
+    Пользователи без Куба не попадают.
 
     :return: Список словарей с ключами ozernik, cube, cube_binds, total_bind_karma.
     """
@@ -273,7 +274,6 @@ def get_cube_leaderboard() -> list[dict]:
 
     leaderboard.sort(key=lambda row: (
         -row['cube']['place'],
-        -row['cube_binds'],
         -row['total_bind_karma'],
         row['ozernik'].id,
     ))
