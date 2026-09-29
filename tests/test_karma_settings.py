@@ -303,6 +303,24 @@ class TestSansaraPage:
         assert [role.id for role in empty.roles] == [roles["naraka"]["role_id"]]
         interaction.followup.send.assert_awaited_with("Обновление ролей участников завершено.", ephemeral=True)
 
+    async def test_restore_roles_skips_bots_and_removes_their_roles(self, env):
+        create_all_roles(env)
+        roles = env.data.karma_roles
+        naraka = env.guild.get_role(roles["naraka"]["role_id"])
+        other = FakeRole(1)
+        clean_bot = env.guild.add_member(10, bot=True)
+        dirty_bot = env.guild.add_member(11, bot=True, roles=[naraka, other])
+        admin = env.guild.add_member(1)
+
+        navigator, author = open_menu(env, env.karma.SettingsSansaraPage, author=admin)
+
+        await navigator.current_page._restore_roles(make_interaction(author, env.guild))
+        await env.karma.SettingsSansaraPage.restore_task
+
+        assert clean_bot.roles == []
+        assert dirty_bot.roles == [other]  # чужие роли бота не трогаются
+        assert env.db.get_user_by_discord_id(10) is None  # ботов в базу кармы не заносим
+
     async def test_restore_roles_already_running(self, env):
         navigator, author = open_menu(env, env.karma.SettingsSansaraPage)
         interaction = make_interaction(author, env.guild)
@@ -386,6 +404,22 @@ class TestCubesPage:
 
         assert [role.id for role in member.roles] == [cubes["black_cube"]["role_id"]]
         assert lonely.roles == []  # без связей куб не выдаётся
+
+    async def test_restore_roles_skips_bots_and_removes_their_roles(self, env):
+        create_all_roles(env)
+        cubes = env.data.cube_roles
+        black = env.guild.get_role(cubes["black_cube"]["role_id"])
+        bot_member = env.guild.add_member(10, bot=True, roles=[black])
+        # Даже если у бота откуда-то есть связи — куб ему не положен.
+        env.db.add_bind_karma(env.bot.db_ensure_user(bot_member).id, add_ozernik(env, 99), 400)
+        admin = env.guild.add_member(1)
+
+        navigator, author = open_menu(env, env.karma.SettingsCubesPage, author=admin)
+
+        await navigator.current_page._restore_roles(make_interaction(author, env.guild))
+        await env.karma.SettingsCubesPage.restore_task
+
+        assert bot_member.roles == []
 
     async def test_cubes_and_sansara_restore_are_independent(self, env):
         navigator, author = open_menu(env, env.karma.SettingsCubesPage)

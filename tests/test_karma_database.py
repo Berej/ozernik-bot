@@ -157,15 +157,70 @@ class TestKarma:
         assert karma.karma == 5
         assert karma.gift_karma == 5
 
-    def test_remove_karma_below_zero(self, env):
-        """Текущее поведение: карма может уйти в минус, подарочная обнуляется."""
+    def test_remove_karma_not_below_zero(self, env):
         user_id = add_ozernik(env, 111)
         env.db.add_gift_karma(user_id, 3)
 
         karma = env.db.remove_karma(user_id, 5)
 
-        assert karma.karma == -2
+        assert karma.karma == 0
         assert karma.gift_karma == 0
+
+    def test_remove_karma_requires_positive_amount(self, env):
+        user_id = add_ozernik(env, 111)
+
+        with pytest.raises(ValueError):
+            env.db.remove_karma(user_id, 0)
+
+    def test_remove_karma_weekly(self, env):
+        user_id = add_ozernik(env, 111)
+        env.db.add_karma(user_id, 100)
+        env.db.add_karma(user_id, 10, weekly=True)  # 110 / неделя 10
+
+        karma = env.db.remove_karma(user_id, 4, weekly=True)
+        assert (karma.karma, karma.weekly_karma) == (106, 6)
+
+        karma = env.db.remove_karma(user_id, 50, weekly=True)
+        assert (karma.karma, karma.weekly_karma) == (56, 0)
+
+        # Без weekly недельная не трогается.
+        env.db.add_karma(user_id, 5, weekly=True)
+        karma = env.db.remove_karma(user_id, 1)
+        assert karma.weekly_karma == 5
+
+    def test_set_karma_weekly_follows_difference(self, env):
+        user_id = add_ozernik(env, 111)
+        env.db.add_karma(user_id, 100)
+        env.db.add_karma(user_id, 20, weekly=True)  # 120 / неделя 20
+
+        karma = env.db.set_karma(user_id, 130, weekly=True)
+        assert (karma.karma, karma.weekly_karma) == (130, 30)
+
+        karma = env.db.set_karma(user_id, 110, weekly=True)
+        assert (karma.karma, karma.weekly_karma) == (110, 10)
+
+        karma = env.db.set_karma(user_id, 0, weekly=True)
+        assert (karma.karma, karma.weekly_karma) == (0, 0)
+
+    def test_set_karma_rejects_negative_and_clamps_gift(self, env):
+        user_id = add_ozernik(env, 111)
+        env.db.add_gift_karma(user_id, 50)
+
+        with pytest.raises(ValueError):
+            env.db.set_karma(user_id, -1)
+
+        karma = env.db.set_karma(user_id, 20)
+        assert (karma.karma, karma.gift_karma) == (20, 20)
+
+    def test_set_karma_status(self, env):
+        user_id = add_ozernik(env, 111)
+
+        assert env.db.set_karma_status(user_id, "asur").status == "asur"
+        assert env.db.set_karma_status(user_id, "deva").status == "deva"
+        assert env.db.set_karma_status(user_id, None).status is None
+
+        with pytest.raises(ValueError):
+            env.db.set_karma_status(user_id, "human")
 
     def test_set_karma(self, env):
         user_id = add_ozernik(env, 111)

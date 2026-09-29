@@ -182,7 +182,7 @@ class TestOnMessage:
         assert karma_of(env, member) == 100
         channel.send.assert_awaited_once()
         embed = channel.send.call_args.kwargs["embed"]
-        assert embed.title == f"**{member.display_name} повысил уровень!**"
+        assert embed.title == f"**{member.display_name} достигает 1 уровня**"
         # Выдана роль Преты (100 кармы).
         assert env.data.karma_roles["preta"]["role_id"] in [role.id for role in member.roles]
 
@@ -448,9 +448,82 @@ class TestLevelUpMessages:
         await env.cog.give_level_up_message(member, 99, 300)
 
         assert channel.send.await_count == 3
-        descriptions = [call.kwargs["embed"].description for call in channel.send.await_args_list]
+        embeds = [call.kwargs["embed"] for call in channel.send.await_args_list]
         preta_id = env.data.karma_roles["preta"]["role_id"]
-        assert descriptions == [f"Первый <@&{preta_id}>", "", "Третий"]
+        # На 1 уровне сменилась ступень (Нарака → Прета) — приписка «Теперь вы».
+        assert [embed.description for embed in embeds] == [
+            f"Первый <@&{preta_id}>\n\nТеперь вы <@&{preta_id}>",
+            "",
+            "Третий",
+        ]
+        assert [embed.title for embed in embeds] == [
+            f"**{member.display_name} достигает {level} уровня**" for level in (1, 2, 3)
+        ]
+
+    @pytest.mark.parametrize(
+        ("old_karma", "new_karma", "level", "stage"),
+        [
+            (99, 100, 1, "preta"),
+            (999, 1000, 10, "animal"),
+            (4999, 5000, 25, "human"),
+        ],
+    )
+    async def test_threshold_level_says_new_stage(self, env, old_karma, new_karma, level, stage):
+        channel = enable_karma_channel(env)
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        env.db.set_karma(env.bot.db_ensure_user(member).id, new_karma)
+        env.levels[str(level)] = "Текст администрации."
+
+        await env.cog.give_level_up_message(member, old_karma, new_karma)
+
+        role_id = env.data.karma_roles[stage]["role_id"]
+        assert channel.send.call_args.kwargs["embed"].description == f"Текст администрации.\n\nТеперь вы <@&{role_id}>"
+
+    async def test_threshold_without_admin_text(self, env):
+        channel = enable_karma_channel(env)
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        env.db.set_karma(env.bot.db_ensure_user(member).id, 5000)
+
+        await env.cog.give_level_up_message(member, 4999, 5000)
+
+        human_id = env.data.karma_roles["human"]["role_id"]
+        assert channel.send.call_args.kwargs["embed"].description == f"Теперь вы <@&{human_id}>"
+
+    async def test_not_threshold_level_has_no_stage_text(self, env):
+        channel = enable_karma_channel(env)
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        env.db.set_karma(env.bot.db_ensure_user(member).id, 1200)
+        env.levels["11"] = "Одиннадцатый"
+
+        await env.cog.give_level_up_message(member, 1199, 1200)
+
+        assert channel.send.call_args.kwargs["embed"].description == "Одиннадцатый"
+
+    async def test_only_last_mentions_stage_change_across_range(self, env):
+        """Админская правка 0 → 4999: одно сообщение о 24 уровне, но ступень сменилась (Нарака → Зверь)."""
+        channel = enable_karma_channel(env)
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        env.db.set_karma(env.bot.db_ensure_user(member).id, 4999)
+
+        await env.cog.give_level_up_message(member, 0, 4999, only_last=True)
+
+        animal_id = env.data.karma_roles["animal"]["role_id"]
+        channel.send.assert_awaited_once()
+        assert channel.send.call_args.kwargs["embed"].description == f"Теперь вы <@&{animal_id}>"
+
+    async def test_only_last_same_stage_no_text(self, env):
+        channel = enable_karma_channel(env)
+        create_all_roles(env)
+        member = env.guild.add_member(1)
+        env.db.set_karma(env.bot.db_ensure_user(member).id, 4000)
+
+        await env.cog.give_level_up_message(member, 1000, 4000, only_last=True)
+
+        assert channel.send.call_args.kwargs["embed"].description == ""
 
     async def test_member_without_avatar_and_guild_without_icon(self, env):
         channel = enable_karma_channel(env)
@@ -694,4 +767,14 @@ async def test_setup_registers_cog(env):
 def test_cog_commands(env):
     names = {command.name for command in env.cog.get_app_commands()}
 
-    assert names == {"settings_karma", "rank_sansara", "rank_cube", "leaderboard", "leaderboard_weekly"}
+    assert names == {
+        "settings_karma", "rank_sansara", "rank_cube",
+        "leaderboard", "leaderboard_weekly", "leaderboard_cubes",
+        "karma_add", "karma_remove", "karma_set", "karma_status",
+    }
+
+
+def test_admin_commands_hidden_from_non_admins(env):
+    for command in env.cog.get_app_commands():
+        if command.name.startswith("karma_"):
+            assert command.default_permissions.administrator is True
