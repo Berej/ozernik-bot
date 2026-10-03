@@ -536,9 +536,9 @@ class TestLevelUpMessages:
         preta_id = env.data.karma_roles["preta"]["role_id"]
         # Шаблон старой Сансары (Amari): текст уровня → «Вы достигли N уровня.» → «Теперь вы …» при смене ступени.
         assert [embed.description for embed in embeds] == [
-            f"Первый <@&{preta_id}>\nВы достигли 1 уровня.\nТеперь вы <@&{preta_id}>",
-            "Вы достигли 2 уровня.",
-            "Третий\nВы достигли 3 уровня.",
+            f"**Первый <@&{preta_id}>**\n**Вы достигли 1 уровня.**\n**Теперь вы <@&{preta_id}>**",
+            "**Вы достигли 2 уровня.**",
+            "**Третий**\n**Вы достигли 3 уровня.**",
         ]
         assert [embed.title for embed in embeds] == [f"**{member.display_name} повышает уровень!**"] * 3
 
@@ -560,7 +560,7 @@ class TestLevelUpMessages:
         await env.cog.give_level_up_message(member, old_karma, new_karma)
 
         role_id = env.data.karma_roles[stage]["role_id"]
-        assert channel.send.call_args.kwargs["embed"].description == f"Текст администрации.\nВы достигли {level} уровня.\nТеперь вы <@&{role_id}>"
+        assert channel.send.call_args.kwargs["embed"].description == f"**Текст администрации.**\n**Вы достигли {level} уровня.**\n**Теперь вы <@&{role_id}>**"
 
     async def test_threshold_without_admin_text(self, env):
         channel = enable_karma_channel(env)
@@ -571,7 +571,7 @@ class TestLevelUpMessages:
         await env.cog.give_level_up_message(member, 4999, 5000)
 
         human_id = env.data.karma_roles["human"]["role_id"]
-        assert channel.send.call_args.kwargs["embed"].description == f"Вы достигли 25 уровня.\nТеперь вы <@&{human_id}>"
+        assert channel.send.call_args.kwargs["embed"].description == f"**Вы достигли 25 уровня.**\n**Теперь вы <@&{human_id}>**"
 
     async def test_not_threshold_level_has_no_stage_text(self, env):
         channel = enable_karma_channel(env)
@@ -582,7 +582,7 @@ class TestLevelUpMessages:
 
         await env.cog.give_level_up_message(member, 1199, 1200)
 
-        assert channel.send.call_args.kwargs["embed"].description == "Одиннадцатый\nВы достигли 11 уровня."
+        assert channel.send.call_args.kwargs["embed"].description == "**Одиннадцатый**\n**Вы достигли 11 уровня.**"
 
     async def test_only_last_mentions_stage_change_across_range(self, env):
         """Админская правка 0 → 4999: одно сообщение о 24 уровне, но ступень сменилась (Нарака → Зверь)."""
@@ -595,7 +595,7 @@ class TestLevelUpMessages:
 
         animal_id = env.data.karma_roles["animal"]["role_id"]
         channel.send.assert_awaited_once()
-        assert channel.send.call_args.kwargs["embed"].description == f"Вы достигли 24 уровня.\nТеперь вы <@&{animal_id}>"
+        assert channel.send.call_args.kwargs["embed"].description == f"**Вы достигли 24 уровня.**\n**Теперь вы <@&{animal_id}>**"
 
     async def test_only_last_same_stage_no_text(self, env):
         channel = enable_karma_channel(env)
@@ -605,7 +605,7 @@ class TestLevelUpMessages:
 
         await env.cog.give_level_up_message(member, 1000, 4000, only_last=True)
 
-        assert channel.send.call_args.kwargs["embed"].description == "Вы достигли 22 уровня."
+        assert channel.send.call_args.kwargs["embed"].description == "**Вы достигли 22 уровня.**"
 
     async def test_member_without_avatar_and_guild_without_icon(self, env):
         channel = enable_karma_channel(env)
@@ -857,7 +857,8 @@ class TestCommands:
 
         description = interaction.response.send_message.call_args.kwargs["embed"].description
         assert "🥇 <:cigar:1208007437639225415> <@10>" in description
-        assert "Карма: `42/100`" in description
+        assert "Карма за неделю: `42`" in description
+        assert "/" not in description.split("Карма за неделю")[1].split("\n")[0]
 
     @pytest.mark.parametrize("command", ["leaderboard", "leaderboard_weekly"])
     async def test_empty_leaderboard_answers_once(self, env, command):

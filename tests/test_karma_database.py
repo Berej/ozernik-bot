@@ -5,15 +5,21 @@ from itertools import count
 
 import pytest
 
-import utilities
 from conftest import add_ozernik
 
 
 @pytest.fixture
 def clock(monkeypatch):
-    """Управляемые часы для времени изменения кармы."""
+    """
+    Управляемые часы для времени изменения кармы.
+
+    Подменяем там, где now_ms используется (_db.py делает `from utilities import now_ms` —
+    у него своя ссылка на функцию), а не там, где она определена.
+    """
+    from modules.karma_sistem import _db
+
     ticks = count(1_000)
-    monkeypatch.setattr(utilities, "now_ms", lambda: next(ticks))
+    monkeypatch.setattr(_db, "now_ms", lambda: next(ticks))
 
 
 # ---------- ПОЛЬЗОВАТЕЛИ -----------
