@@ -54,12 +54,12 @@ class TestKarmaEdit:
 
         await env.cog.karma_add.callback(env.cog, interaction, target, 150)
 
-        assert (karma(env, target).karma, karma(env, target).weekly_karma) == (150, 150)
+        # Недельная карма не меняется: недельный топ — только за собственную активность.
+        assert (karma(env, target).karma, karma(env, target).weekly_karma) == (150, 0)
         interaction.response.defer.assert_awaited_once_with(ephemeral=True)
         assert answer(interaction) == (
             "**Карма добавлена:** <@2>\n"
-            "Карма: `0` → `150` (уровень 0 → 1)\n"
-            "Недельная: `0` → `150`"
+            "Карма: `0` → `150` (уровень 0 → 1)"
         )
 
     async def test_add_congratulates_once(self, env):
@@ -73,7 +73,7 @@ class TestKarmaEdit:
         # 0 → 10 уровень: одно сообщение о последнем уровне, без промежуточных.
         channel.send.assert_awaited_once()
         assert channel.send.call_args.kwargs["embed"].title == f"**{target.display_name} повышает уровень!**"
-        assert channel.send.call_args.kwargs["embed"].description.startswith("Вы достигли 10 уровня.")
+        assert channel.send.call_args.kwargs["embed"].description.startswith("**Вы достигли 10 уровня.**")
 
     async def test_set_up_congratulates_once(self, env):
         channel = env.karma_channel
@@ -85,7 +85,7 @@ class TestKarmaEdit:
 
         channel.send.assert_awaited_once()
         assert channel.send.call_args.kwargs["embed"].title == f"**{target.display_name} повышает уровень!**"
-        assert channel.send.call_args.kwargs["embed"].description.startswith("Вы достигли 24 уровня.")
+        assert channel.send.call_args.kwargs["embed"].description.startswith("**Вы достигли 24 уровня.**")
 
     @pytest.mark.parametrize(
         ("command", "amount"),
@@ -133,7 +133,7 @@ class TestKarmaEdit:
 
         await env.cog.karma_remove.callback(env.cog, interaction, target, 100)
 
-        assert (karma(env, target).karma, karma(env, target).weekly_karma) == (0, 0)
+        assert (karma(env, target).karma, karma(env, target).weekly_karma) == (0, 30)
         assert answer(interaction).startswith("**Карма отнята:** <@2>\nКарма: `30` → `0`")
 
     async def test_set(self, env):
@@ -145,8 +145,9 @@ class TestKarmaEdit:
 
         await env.cog.karma_set.callback(env.cog, interaction, target, 150)
 
-        assert (karma(env, target).karma, karma(env, target).weekly_karma) == (150, 50)
+        assert (karma(env, target).karma, karma(env, target).weekly_karma) == (150, 20)
         assert answer(interaction).startswith("**Карма установлена:**")
+        assert "Недельная" not in answer(interaction)
 
     async def test_reset_bot(self, env):
         """Главный сценарий: обнулить бота, который успел набрать карму."""
@@ -158,10 +159,23 @@ class TestKarmaEdit:
 
         await env.cog.karma_set.callback(env.cog, interaction, bot_member, 0)
 
-        assert (karma(env, bot_member).karma, karma(env, bot_member).weekly_karma) == (0, 0)
+        # Недельная карма не меняется даже при обнулении (решение Alium 2026-10-03).
+        assert (karma(env, bot_member).karma, karma(env, bot_member).weekly_karma) == (0, 500)
         assert answer(interaction).startswith("**Карма обнулена:** <@2>")
+        assert "Недельная" not in answer(interaction)
         bot_member.add_roles.assert_not_awaited()  # ботам роли Сансары не выдаются
-        assert env.db.get_top_weekly_karma()[0][1].weekly_karma == 0
+
+    async def test_case_remove_all_then_add_keeps_weekly(self, env):
+        """Случай Alium: отнял себе всю карму, потом выдал обратно — недельный топ не должен меняться."""
+        target = env.guild.add_member(2)
+        user_id = env.bot.db_ensure_user(target).id
+        env.db.add_karma(user_id, 300)
+        env.db.add_karma(user_id, 40, weekly=True)  # 340 / неделя 40
+
+        await env.cog.karma_remove.callback(env.cog, make_interaction(admin(env), env.guild), target, 340)
+        await env.cog.karma_add.callback(env.cog, make_interaction(admin(env), env.guild), target, 340)
+
+        assert (karma(env, target).karma, karma(env, target).weekly_karma) == (340, 40)
 
     async def test_log_channel(self, env, log_channel):
         target = env.guild.add_member(2)

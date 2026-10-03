@@ -1,3 +1,16 @@
+"""
+Модуль кармы: Cog — события (сообщения, голос, вход на сервер), фоновые циклы, команды.
+
+Остальное — во вспомогательных файлах рядом:
+  _db.py        — база кармы: схемы таблиц, миграции, KarmaDatabase
+  _state.py     — пути, настройки (data.json), база, тексты повышений
+  _formulas.py  — уровни, ступени, Кубы, форматирование
+  _cards.py     — картинки (карточки, открытки)
+  _roles.py     — роли Сансары и Кубов
+  _settings.py  — меню /settings_karma
+  _boards.py    — таблицы лидеров Связи и их вкладки
+"""
+
 import asyncio # noqa
 import inspect
 import random
@@ -26,3251 +39,22 @@ from bot import OzernikiBot
 from config import config
 from utilities import *
 
-PROJECT_DIR = Path(__file__).resolve().parents[0]
-TEMP_DIR = PROJECT_DIR / "temp"
-DATA_DIR = PROJECT_DIR / "data.json"
 
-# Старое хранилище текстов повышений. Тексты теперь в базе (таблица karma_level_texts);
-# файл читается один раз при запуске для переноса — см. import_legacy_level_texts.
-LEGACY_LEVELS_PATH = PROJECT_DIR / "levels.json"
+# Части модуля. Вспомогательные файлы начинаются с «_»: bot.py грузит как расширение
+# каждый .py в папке модуля, кроме таких (иначе потребовалась бы функция setup в каждом).
+from . import _state
+from ._db import *
+from ._state import *
+from ._formulas import *
+from ._cards import *
+from ._roles import *
+from ._settings import *
+from ._boards import *
 
-# Сколько уровней можно подписать текстом в /settings_karma → «Текст повышений».
-LEVEL_TEXTS_COUNT = 100
-
-data_setup = {
-    'log_channel_id': 0,
-    'karma_message_delay': 1,
-    'karma_voice_delay': 1,
-    'karma_channel_id': 0,
-    'blocked_channels_id': [],
-    'blocked_users_id': [],
-    'blocked_roles_id': [],
-    'required_cubes': 10,
-    'karma_roles': {
-        'naraka': {
-            'name': 'Нарака',
-            'role_id': 0,
-            'required_karma': 0,
-            'tag_name': 'naraka',
-            'color': "#d47b33",
-        },
-        'preta': {
-            'name': 'Прета',
-            'role_id': 0,
-            'required_karma': 100,
-            'tag_name': 'preta',
-            'color': "#eb3434",
-        },
-        'animal': {
-            'name': 'Зверь',
-            'role_id': 0,
-            'required_karma': 1000,
-            'tag_name': 'animal',
-            'color': "#405ee4",
-        },
-        'human': {
-            'name': 'Человек',
-            'role_id': 0,
-            'required_karma': 5000,
-            'tag_name': 'human',
-            'color': "#c1f7f7",
-        },
-        'asur': {
-            'name': 'Асур',
-            'role_id': 0,
-            'required_karma': None,
-            'tag_name': 'asur',
-            'color': "#bf0895",
-        },
-        'deva': {
-            'name': 'Дэва',
-            'role_id': 0,
-            'required_karma': None,
-            'tag_name': 'deva',
-            'color': "#FDD439",
-        },
-    },
-    'cube_roles': {
-        'black_cube': {
-            "name": 'Черный Куб',
-            "color": "#0D0D0D",
-            "role_id": 0,
-            "required_karma": 0,
-            'tag_name': 'black_cube',
-            "place": 1
-        },
-        'white_cube': {
-            "name": 'Белый Куб',
-            "color": "#E7E7E7",
-            "role_id": 0,
-            "required_karma": 360,
-            'tag_name': 'white_cube',
-            "place": 2
-        },
-        'blue_cube': {
-            "name": 'Синий Куб',
-            "color": "#4b69d4",
-            "role_id": 0,
-            "required_karma": 1440,
-            'tag_name': 'blue_cube',
-            "place": 3
-        },
-        'gold_cube': {
-            "name": 'Золотой Куб',
-            "color": "#FFAB33",
-            "role_id": 0,
-            "required_karma": 5760,
-            'tag_name': 'gold_cube',
-            "place": 4
-        },
-    }
-}
-data = DataWorker(DATA_DIR, setup=data_setup)
-db = KarmaDatabase()
-
-def import_legacy_level_texts(path: Path) -> int:
-    """
-    Переносит тексты повышений из старого levels.json в базу (один раз).
-
-    Тексты переносятся, только если в базе их ещё нет — чтобы старый файл
-    не затёр уже отредактированное. Файл после этого переименовывается
-    в levels.json.imported: остаётся резервной копией и больше не читается.
-
-    :return: Сколько непустых текстов перенесено.
-    """
-    if not path.exists():
-        return 0
-
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, json.JSONDecodeError) as error:
-        print(f"[Карма] Не удалось прочитать {path}: {error}")
-        return 0
-
-    texts = {
-        int(level): text
-        for level, text in raw.items()
-        if str(level).isdigit()
-        and 1 <= int(level) <= LEVEL_TEXTS_COUNT
-        and isinstance(text, str)
-        and text
-    }
-
-    imported = 0
-
-    if texts and not db.get_level_texts():
-        db.set_level_texts(texts)
-        imported = len(texts)
-        print(f"[Карма] Тексты повышений перенесены из {path.name} в базу: {imported} шт.")
-
-    path.replace(path.with_name(path.name + ".imported"))
-
-    return imported
-
-def parse_level_texts(raw: dict) -> dict[int, str]:
-    """
-    Проверяет тексты из окна «Текст повышений».
-
-    :raises ValueError: С понятным админу объяснением, что не так.
-    """
-    texts = {}
-
-    for level, text in raw.items():
-        if not str(level).isdigit() or not 1 <= int(level) <= LEVEL_TEXTS_COUNT:
-            raise ValueError(f"Уровень {level!r}: нужен номер от 1 до {LEVEL_TEXTS_COUNT}.")
-        if not isinstance(text, str):
-            raise ValueError(f"Уровень {level}: текст должен быть в кавычках.")
-
-        texts[int(level)] = text
-
-    return texts
-
-# Вспомогательные функции
-def get_status(karma: DataTypes.Karma) -> dict:
-    if karma.status in ("asur", "deva"):
-        return data.karma_roles[karma.status]
-
-    return max(
-        (
-            stage
-            for stage in data.karma_roles.values()
-            if (
-                stage["required_karma"] is not None
-                and karma.karma >= stage["required_karma"]
-            )
-        ),
-        key=lambda stage: stage["required_karma"],
-    )
-
-def get_level(karma: int) -> int | None:
-    if karma is None:
-        return None
-
-    if karma <= 0:
-        return 0
-
-    level = 0
-    required_karma = 0
-    step = 100
-
-    while required_karma + step <= karma:
-        required_karma += step
-        level += 1
-
-        if level % 10 == 0:
-            step *= 2
-
-    return level
-
-def get_karma(level: int) -> int:
-    if level <= 0:
-        return 0
-
-    each_level = 0
-    required_karma = 0
-    step = 100
-
-    while each_level < level:
-        required_karma += step
-        each_level += 1
-
-        if each_level % 10 == 0:
-            step *= 2
-
-    return required_karma
-
-def get_cube(bind_karma: int) -> dict:
-    return max(
-        (
-            cube
-            for cube in data.cube_roles.values()
-            if cube["required_karma"] <= bind_karma
-        ),
-        key=lambda cube: cube["required_karma"],
-    )
-
-def get_cubes(ozernik_id: int) -> tuple[dict, dict, dict, dict]:
-    binds = db.get_user_top_karmic_binds(ozernik_id)
-
-    cubes_count: dict = deepcopy(data.cube_roles)
-
-    for cube in cubes_count.values():
-        cube["count"] = 0
-
-    for ozernik, _bind in binds:
-        bind_cube = get_cube(_bind.bind_karma)
-
-        for cube in cubes_count.values():
-            if cube["place"] <= bind_cube["place"]:
-                cube["count"] += 1
-
-    return tuple(cubes_count.values())
-
-def get_cube_status(ozernik_id: int) -> dict | None:
-    binds = db.get_user_top_karmic_binds(ozernik_id)
-
-    return get_cube_status_by_binds([bind.bind_karma for _, bind in binds])
-
-def get_cube_status_by_binds(bind_karmas: list[int]) -> dict | None:
-    """Текущий Куб по списку значений кармы связей пользователя."""
-    cubes_count: dict[str, int] = {}
-
-    for bind_karma in bind_karmas:
-        bind_cube = get_cube(bind_karma)
-
-        for cube in data.cube_roles.values():
-            if cube["place"] <= bind_cube["place"]:
-                name = cube["name"]
-                cubes_count[name] = cubes_count.get(name, 0) + 1
-
-    available_cubes = [
-        cube
-        for cube in data.cube_roles.values()
-        if cubes_count.get(cube["name"], 0) >= (
-            1 if cube["place"] == 1 else data.required_cubes
-        )
-    ]
-
-    if not available_cubes:
-        return None
-
-    return max(
-        available_cubes,
-        key=lambda _cube: _cube["required_karma"],
-    )
-
-# ---------- Таблицы лидеров Связи (/leaderboard_cubes, ,lbc) ----------
-
-# Уровень отдельной связи (не путать с Кубом — ступенью самого человека).
-BIND_LEVEL_NAMES = {
-    'black_cube': 'Чёрная',
-    'white_cube': 'Белая',
-    'blue_cube': 'Синяя',
-    'gold_cube': 'Золотая',
-}
-
-BIND_LEVEL_EMOJI = {
-    'black_cube': '⚫',
-    'white_cube': '⚪',
-    'blue_cube': '🔵',
-    'gold_cube': '🟡',
-}
-
-def get_binds_by_user() -> tuple[dict[int, DataTypes.Ozernik], dict[int, list[int]]]:
-    """Все связи, разложенные по пользователям: (озерники по ID, карма каждой его связи)."""
-    ozerniks: dict[int, DataTypes.Ozernik] = {}
-    bind_karmas: dict[int, list[int]] = {}
-
-    for first, second, bind in db.get_top_karmic_binds():
-        for ozernik in (first, second):
-            ozerniks[ozernik.id] = ozernik
-            bind_karmas.setdefault(ozernik.id, []).append(bind.bind_karma)
-
-    return ozerniks, bind_karmas
-
-def get_pairs_leaderboard() -> list[dict]:
-    """
-    Сильнейшие пары: кто больше всех времени провёл в войсе друг с другом.
-
-    :return: Словари с ключами first, second, bind, level (название уровня связи), level_emoji.
-    """
-    return [
-        {
-            'first': first,
-            'second': second,
-            'bind': bind,
-            'level': BIND_LEVEL_NAMES[get_cube(bind.bind_karma)['tag_name']],
-            'level_emoji': BIND_LEVEL_EMOJI[get_cube(bind.bind_karma)['tag_name']],
-        }
-        for first, second, bind in db.get_top_karmic_binds()
-    ]
-
-def get_together_leaderboard() -> list[dict]:
-    """
-    Связь «со всеми вместе»: сумма всех связей человека.
-
-    Это не время в войсе, а время с каждым собеседником, сложенное:
-    час втроём даёт по часу с каждым из двух — всего 2 часа.
-
-    :return: Словари с ключами ozernik, total_bind_karma, binds.
-    """
-    ozerniks, bind_karmas = get_binds_by_user()
-
-    leaderboard = [
-        {
-            'ozernik': ozerniks[ozernik_id],
-            'total_bind_karma': sum(karmas),
-            'binds': len(karmas),
-        }
-        for ozernik_id, karmas in bind_karmas.items()
-    ]
-
-    leaderboard.sort(key=lambda row: (-row['total_bind_karma'], row['ozernik'].id))
-
-    return leaderboard
-
-def get_colored_leaderboard() -> list[dict]:
-    """
-    Цветные связи (выше Чёрной).
-
-    Порядок (решение Alium): золотые → синие → белые → связь со всеми вместе.
-    Считается точно: золотая связь — только золотая, в синие/белые не идёт.
-    Люди без цветных связей не попадают.
-
-    :return: Словари с ключами ozernik, gold, blue, white, total_bind_karma.
-    """
-    ozerniks, bind_karmas = get_binds_by_user()
-
-    leaderboard = []
-
-    for ozernik_id, karmas in bind_karmas.items():
-        levels = [get_cube(karma)['tag_name'] for karma in karmas]
-
-        row = {
-            'ozernik': ozerniks[ozernik_id],
-            'gold': levels.count('gold_cube'),
-            'blue': levels.count('blue_cube'),
-            'white': levels.count('white_cube'),
-            'total_bind_karma': sum(karmas),
-        }
-
-        if row['gold'] or row['blue'] or row['white']:
-            leaderboard.append(row)
-
-    leaderboard.sort(key=lambda row: (
-        -row['gold'],
-        -row['blue'],
-        -row['white'],
-        -row['total_bind_karma'],
-        row['ozernik'].id,
-    ))
-
-    return leaderboard
-
-def format_hours(minutes: int) -> str:
-    """Короткая длительность в часах: '34 ч 14 мин', '6 ч', '45 мин'."""
-    hours, minutes = divmod(minutes, 60)
-
-    if hours and minutes:
-        return f'{hours} ч {minutes} мин'
-    if hours:
-        return f'{hours} ч'
-    return f'{minutes} мин'
-
-def plural_ru(number: int, forms: tuple[str, str, str]) -> str:
-    """Форма слова для числа: ('связь', 'связи', 'связей')."""
-    n = number % 100
-
-    if 11 <= n <= 14:
-        return forms[2]
-
-    n %= 10
-
-    if n == 1:
-        return forms[0]
-    if 2 <= n <= 4:
-        return forms[1]
-
-    return forms[2]
-
-def load_icon(path: str | Path, size: tuple[int, int]) -> Image.Image:
-    """Загружает PNG-иконку и изменяет её размер."""
-    with Image.open(path) as source:
-        return source.convert("RGBA").resize(
-            size,
-            Image.Resampling.LANCZOS,
-        )
-
-async def get_discord_avatar(member: discord.Member) -> Image.Image:
-    avatar_bytes = await member.display_avatar.read()
-
-    with Image.open(BytesIO(avatar_bytes)) as source:
-        return source.convert("RGBA").resize(
-            (220, 220),
-            Image.Resampling.LANCZOS,
-        )
-
-def draw_counter(xy: tuple[int, int], nums: tuple[int, int], fill: Any, main_font: FreeTypeFont, image: Image.Image) -> tuple[int, int, int, int]:
-    num1 = nums[0]
-    num2 = nums[1]
-
-    sep_font = main_font.font_variant(size=main_font.size * 0.63)
-
-    draw = ImageDraw.Draw(image)
-
-    main_text = f'{num1}'
-    sep_text = f'/{num2}' if num2 else ''
-
-    main_length = draw.textlength(
-        main_text,
-        main_font,
-    )
-    sep_length = draw.textlength(
-        sep_text,
-        sep_font,
-    )
-
-    full_length = main_length + sep_length
-
-    main_xy = (
-        xy[0]- full_length // 2,
-        xy[1],
-    )
-
-    main_box = draw.textbbox(
-        main_xy,
-        main_text,
-        main_font,
-        anchor='lm'
-    )
-
-    sep_xy = (
-        main_xy[0] + main_length + 1,
-        main_box[3],
-    )
-
-    draw.text(
-        main_xy,
-        main_text,
-        fill,
-        main_font,
-        anchor='lm'
-    )
-    draw.text(
-        sep_xy,
-        sep_text,
-        '#6F6F6F',
-        sep_font,
-        anchor='lb',
-    )
-
-    sep_box = draw.textbbox(
-        sep_xy,
-        sep_text,
-        sep_font,
-        anchor='lb',
-    )
-
-    full_box = (
-        main_box[0],
-        main_box[1],
-        sep_box[2],
-        main_box[3],
-    )
-
-    return full_box
-
-def get_next_status(karma: DataTypes.Karma) -> dict:
-    status = get_status(karma)
-
-    if status['name'] in ("Человек", "Асур", "Дэва"):
-        return None
-
-    return next(
-        (
-            stage
-            for stage in data.karma_roles.values()
-            if stage['required_karma'] > status['required_karma']
-        ),
-        None
-    )
-
-def get_next_cube(ozernik_id: int) -> dict | None:
-    now_cube = get_cube_status(ozernik_id)
-
-    if not now_cube:
-        return data.cube_roles['black_cube']
-
-    return next(
-        (
-            cube
-            for cube in data.cube_roles.values()
-            if cube['required_karma'] > now_cube['required_karma']
-        ),
-        data.cube_roles.get('gold_cube', None)
-    )
-
-def get_next_cube_from_cube(cube_name: Literal['black_cube', 'white_cube', 'blue_cube', 'gold_cube']) -> dict | None:
-    now_cube = data.cube_roles.get(cube_name, None)
-
-    if now_cube is None:
-        raise ValueError(f'Cube "{cube_name}" not found')
-
-    return next(
-        (
-            cube
-            for cube in data.cube_roles.values()
-            if cube['required_karma'] > now_cube['required_karma']
-        ),
-        None
-    )
-
-def rounded_gradient(image: Image.Image, box: tuple[int, int, int, int], radius: int, start_color: str, end_color: str):
-    x1, y1, x2, y2 = box
-    width = x2 - x1
-    height = y2 - y1
-
-    start_rgb = tuple(bytes.fromhex(start_color.lstrip("#")))
-    end_rgb = tuple(bytes.fromhex(end_color.lstrip("#")))
-
-    gradient = Image.new("RGB", (width, height))
-    draw = ImageDraw.Draw(gradient)
-
-    for x in range(width):
-        progress = x / (width - 1)
-
-        color = tuple(
-            int(
-                start_rgb[i]
-                + (end_rgb[i] - start_rgb[i]) * progress
-            )
-            for i in range(3)
-        )
-
-        draw.line(
-            [(x, 0), (x, height)],
-            fill=color,
-        )
-
-    mask = Image.new("L", (width, height), 0)
-
-    ImageDraw.Draw(mask).rounded_rectangle(
-        (0, 0, width, height),
-        radius=radius,
-        fill=255,
-    )
-
-    image.paste(
-        gradient,
-        (x1, y1),
-        mask,
-    )
-
-def format_duration_minutes(minutes: int, backtick: bool = False) -> str:
-    days, remainder = divmod(minutes, 24 * 60)
-    hours, minutes = divmod(remainder, 60)
-
-    def plural(number: int, forms: tuple[str, str, str]) -> str:
-        n = number % 100
-
-        if 11 <= n <= 14:
-            return forms[2]
-
-        n %= 10
-
-        if n == 1:
-            return forms[0]
-        if 2 <= n <= 4:
-            return forms[1]
-
-        return forms[2]
-
-    parts = []
-    bt = ''
-    if backtick:
-        bt = '`'
-
-    if days:
-        parts.append(f"{bt}{days}{bt} {plural(days, ('день', 'дня', 'дней'))}")
-
-    if hours:
-        parts.append(f"{bt}{hours}{bt} {plural(hours, ('час', 'часа', 'часов'))}")
-
-    if minutes:
-        parts.append(f"{bt}{minutes}{bt} {plural(minutes, ('минута', 'минуты', 'минут'))}")
-
-    return ", ".join(parts)
-
-def format_duration_seconds(seconds: int, backtick: bool = False) -> str:
-    days, remainder = divmod(seconds, 24 * 60 * 60)
-    hours, remainder = divmod(remainder, 60 * 60)
-    minutes, seconds = divmod(remainder, 60)
-
-    def plural(number: int, forms: tuple[str, str, str]) -> str:
-        n = number % 100
-
-        if 11 <= n <= 14:
-            return forms[2]
-
-        n %= 10
-
-        if n == 1:
-            return forms[0]
-        if 2 <= n <= 4:
-            return forms[1]
-
-        return forms[2]
-
-    parts = []
-
-    bt = ''
-    if backtick:
-        bt = '`'
-
-    if days:
-        parts.append(f"{bt}{days}{bt} {plural(days, ('день', 'дня', 'дней'))}")
-
-    if hours:
-        parts.append(f"{bt}{hours}{bt} {plural(hours, ('час', 'часа', 'часов'))}")
-
-    if minutes:
-        parts.append(f"{bt}{minutes}{bt} {plural(minutes, ('минута', 'минуты', 'минут'))}")
-
-    if seconds:
-        parts.append(f"{bt}{seconds}{bt} {plural(seconds, ('секунда', 'секунды', 'секунд'))}")
-
-    return ", ".join(parts)
-
-async def get_full_binds(member: discord.Member, bot, amount: int = 10) -> list[dict[str, Image.Image | str | DataTypes.KarmicBind]]:
-    guild = member.guild
-    ozernik = db.get_user_by_discord_id(member.id)
-    binds = db.get_user_top_karmic_binds(ozernik.id)
-
-    full_binds = []
-
-    n = 0
-    for _ozernik, bind in binds:
-        n += 1
-
-        _member = guild.get_member(_ozernik.discord_id)
-
-        if _member is None:
-            _member = await bot.fetch_user(_ozernik.discord_id)
-
-        full_binds.append({
-            'name': _member.display_name,
-            'bind': bind,
-            'avatar': await get_discord_avatar(_member),
-        })
-
-        if n >= amount:
-            break
-
-    return full_binds
-
-def collapse_dict(_data: dict) -> str:
-    return ",\n".join(
-        f"{key!r}: {collapse_value(value)}"
-        for key, value in _data.items()
-    )
-
-def collapse_value(value) -> str:
-    if isinstance(value, dict):
-        return "{\n" + collapse_dict(value) + "\n}"
-
-    return repr(value)
-
-def expand_dict(text: str) -> dict:
-    return ast.literal_eval("{" + text + "}")
-
-def get_stage_by_karma(karma: int) -> dict:
-    """Обычная ступень Сансары (без Асура/Дэвы) для количества кармы."""
-    return max(
-        (
-            stage
-            for stage in data.karma_roles.values()
-            if (
-                stage["required_karma"] is not None
-                and karma >= stage["required_karma"]
-        )
-        ),
-        key=lambda stage: stage["required_karma"],
-    )
-
-def get_role_id_by_level(level: int) -> str:
-    return get_stage_by_karma(get_karma(level))['role_id']
-
-def get_new_stage_text(old_karma: int, new_karma: int) -> str:
-    """Приписка «Теперь вы [роль]», если между old_karma и new_karma сменилась ступень Сансары."""
-    old_stage = get_stage_by_karma(old_karma)
-    new_stage = get_stage_by_karma(new_karma)
-
-    if old_stage['tag_name'] == new_stage['tag_name']:
-        return ''
-
-    return f"Теперь вы <@&{new_stage['role_id']}>"
-
-def get_level_up_text(level: int) -> str:
-    text = db.get_level_text(level)
-    role_id = get_role_id_by_level(level)
-
-    text = text.replace('{role}', f'<@&{role_id}>')
-
-    return text
-
-def get_level_up_line(level: int) -> str:
-    """
-    Строка «Вы … N уровня.» — глагол зависит от уровня, как в старой Сансаре (решение Alium и Габа):
-    1–40 — «достигли», 41–80 — «добились», 81+ — «доползли до».
-
-    Строка собирается целиком, а не подстановкой одного глагола: у «доползли»
-    нужен предлог «до», и одна схема «Вы {глагол} N уровня» не подходит.
-    """
-    if level <= 40:
-        return f'Вы достигли {level} уровня.'
-    if level <= 80:
-        return f'Вы добились {level} уровня.'
-    return f'Вы доползли до {level} уровня.'
-
-def build_level_up_description(level: int, previous_karma: int) -> str:
-    """
-    Текст сообщения о повышении, по шаблону старой Сансары (Amari):
-
-        [текст уровня от администрации]
-        Вы достигли N уровня.  ← глагол по уровню, см. get_level_up_line
-        Теперь вы @Роль          ← только при смене ступени Сансары
-
-    :param previous_karma: Карма, от которой считается переход (для смены ступени).
-    """
-    lines = []
-
-    text = get_level_up_text(level)
-    if text:
-        lines.append(text)
-
-    lines.append(get_level_up_line(level))
-
-    stage_text = get_new_stage_text(previous_karma, get_karma(level))
-    if stage_text:
-        lines.append(stage_text)
-
-    return '\n'.join(lines)
-
-# Функции PIL
-def get_card_stats(ozernik_id: int) -> dict:
-    """
-    Данные из базы для карточек Сансары и Кубов.
-
-    Считать в основном потоке: соединение SQLite нельзя использовать из другого
-    потока, а сами карточки рисуются в отдельном (asyncio.to_thread), чтобы не
-    останавливать бота.
-    """
-    return {
-        'karma': db.get_karma(ozernik_id),
-        'user_cubes': get_cubes(ozernik_id),
-        'user_cube': get_cube_status(ozernik_id),
-        'next_cube': get_next_cube(ozernik_id),
-        'karma_rank': db.get_karma_rank(ozernik_id),
-        'weekly_karma_rank': db.get_weekly_karma_rank(ozernik_id),
-    }
-
-def create_rank_card(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, username: str, stats: dict | None = None):
-    if stats is None:
-        stats = get_card_stats(ozernik.id)
-
-    # Расчет кармы и уровней
-    karma = stats['karma']
-    level = get_level(karma.karma)
-    status = get_status(karma)
-
-    user_cubes = stats['user_cubes']
-    user_cube = stats['user_cube']
-    next_cube = stats['next_cube']
-
-    global_rank = f'#{stats["karma_rank"]}' if karma.karma > 0 else '-'
-    weekly_rank = f'#{stats["weekly_karma_rank"]}' if karma.weekly_karma > 0 else '-'
-    weekly_karma = f'{karma.weekly_karma}' if karma.weekly_karma > 0 else '-'
-
-    current_level_karma = get_karma(level)
-    next_level_karma = get_karma(level + 1)
-
-    karma_on_level = karma.karma - current_level_karma
-    required_on_level = next_level_karma - current_level_karma
-
-    progress_level_up = round(karma_on_level / required_on_level, 2)
-
-    next_stage = get_next_status(karma)
-    if next_stage:
-        next_stage_level = get_level(next_stage['required_karma'])
-    else:
-        next_stage_level = None
-
-    # Определение цветов
-    main_color = "#2A2C30"
-    sep_color = "#24272A"
-    sign_color = "#8B8B8B"
-
-    # Создание изображения и базовых прямоугольников
-    image = Image.new(
-        mode="RGBA",
-        size=(900, 220),
-        color=(0, 0, 0, 0),
-    )
-    height_factor = image.height / 220
-    draw = ImageDraw.Draw(image)
-
-    gap = round(5 * height_factor)
-
-    sep_box_height = (image.height - gap * 2) // 3
-
-    main_box = (
-        0,
-        0,
-        image.width // 9 * 7,
-        image.height,
-    )
-
-    sep_boxes_x1 = main_box[2] + gap
-
-    sep_1_box = (
-        sep_boxes_x1,
-        0,
-        image.width,
-        sep_box_height,
-    )
-
-    sep_2_box = (
-        sep_boxes_x1,
-        sep_box_height + gap,
-        image.width,
-        sep_box_height * 2 + gap,
-    )
-
-    sep_3_box = (
-        sep_boxes_x1,
-        sep_box_height * 2 + gap * 2,
-        image.width,
-        image.height,
-    )
-
-    radius = 20 * height_factor
-
-    draw.rounded_rectangle(
-        main_box,
-        radius=radius,
-        fill=main_color,
-    ) # Большой прямоугольник
-
-    draw.rounded_rectangle(
-        sep_1_box,
-        radius=radius,
-        fill=main_color,
-    ) # Верхний маленький
-
-    draw.rounded_rectangle(
-        sep_2_box,
-        radius=radius,
-        fill=main_color,
-    ) # Средний маленький
-
-    draw.rounded_rectangle(
-        sep_3_box,
-        radius=radius,
-        fill=main_color,
-    ) # Нижний маленький
-
-    sep_boxes_width = image.width - sep_boxes_x1
-
-    # Создание полоски прогресса в своем уровне
-    fill_x = main_box[2] * progress_level_up
-
-    mask = Image.new("L", image.size, 0)
-    mask_draw = ImageDraw.Draw(mask)
-
-    mask_draw.rounded_rectangle(
-        main_box,
-        radius=radius,
-        fill=255,
-    )
-
-    mask_draw.rectangle(
-        (main_box[0], main_box[1], main_box[2], main_box[3] - 12 * height_factor),
-        fill=0,
-    )
-
-    image.paste(
-        sep_color,
-        (0, 0, image.width, image.height),
-        mask,
-    ) # Незаполненная часть полоски
-
-    mask_draw.rectangle(
-        (fill_x, main_box[1], main_box[2], main_box[3]),
-        fill=0,
-    )
-
-    image.paste(
-        status["color"],
-        (0, 0, image.width, image.height),
-        mask,
-    ) # Заполненная часть полоски
-
-    # Вставка аватара
-    avatar_size = image.height // 3 * 2
-    avatar_image = avatar_image.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
-
-    mask = Image.new("L", avatar_image.size, 0)
-    mask_draw = ImageDraw.Draw(mask)
-
-    mask_draw.ellipse((0, 0, avatar_image.width, avatar_image.height), fill=255)
-
-    avatar_image.putalpha(mask)
-
-    avatar_gap = image.height // 2 - avatar_image.height // 2
-
-    image.paste(
-        avatar_image,
-        (avatar_gap, avatar_gap),
-        avatar_image,
-    )
-
-    avatar_right_end = avatar_image.width + avatar_gap
-
-    # Вставка имени
-    font = ImageFont.truetype(
-        assets.fonts['Roboto-Bold'],
-            size=45 * height_factor,
-        )
-
-    name_xy = (avatar_right_end + avatar_gap, avatar_gap)
-    max_name_length = (main_box[2] - avatar_gap) - name_xy[0]
-
-    if draw.textlength(username, font=font) >= max_name_length:
-        while username:
-            username = username.rstrip() + '...'
-
-            if draw.textlength(username, font=font) <= max_name_length:
-                break
-
-            username = username[:-4]
-
-    draw.text(
-        name_xy,
-        username,
-        font=font,
-        fill=status["color"],
-        anchor='lt'
-    )
-
-    # Вставка рангов
-    sign_font = ImageFont.truetype(
-        assets.fonts['Roboto'],
-        size=22 * height_factor,
-    )
-    num_font = ImageFont.truetype(
-        assets.fonts['Roboto-Bold'],
-        size=40 * height_factor,
-    )
-
-    column_width = (main_box[2] - avatar_right_end) / 3
-
-    ranks_x1 = avatar_right_end + column_width * 0.6
-    ranks_x2 = avatar_right_end + column_width * 1.5
-    ranks_x3 = avatar_right_end + column_width * 2.4
-
-    ranks_y = image.height / 11 * 6
-    ranks_y2 = image.height - (image.height - ranks_y) / 2
-
-    draw.text(
-        (ranks_x1, ranks_y),
-        'РАНГ\nКАРМЫ',
-        align="center",
-        font=sign_font,
-        fill=sign_color,
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x1, ranks_y2),
-        global_rank,
-        font=num_font,
-        fill=status["color"],
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x2, ranks_y),
-        'РАНГ\nНЕДЕЛИ',
-        align="center",
-        font=sign_font,
-        fill=sign_color,
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x2, ranks_y2),
-        weekly_rank,
-        font=num_font,
-        fill='#BFBFBF',
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x3, ranks_y),
-        'КАРМА\nНЕДЕЛИ',
-        align="center",
-        font=sign_font,
-        fill=sign_color,
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x3, ranks_y2),
-        weekly_karma,
-        font=num_font,
-        fill='#BFBFBF',
-        anchor="mm",
-    )
-
-    # Вставка уровня
-    sign_font = ImageFont.truetype(
-        assets.fonts['Roboto-Bold'],
-        size=16 * height_factor,
-    )
-
-    num_font = ImageFont.truetype(
-        assets.fonts['Roboto-Bold'],
-        size=25 * height_factor,
-    )
-
-    sep_box_counters_x = round(sep_boxes_x1 + sep_boxes_width / 100 * 71)
-
-    level_counter_xy = (
-        sep_box_counters_x,
-        sep_1_box[3] - sep_box_height // 3
-    )
-
-    level_box = draw_counter(
-        level_counter_xy,
-        nums=(
-            level,
-            next_stage_level
-        ),
-        fill=status["color"],
-        main_font=num_font,
-        image=image,
-    )
-
-    level_frame = (
-        level_box[0] - 9 * height_factor,
-        level_box[1] - 7 * height_factor,
-        level_box[2] + 9 * height_factor,
-        level_box[3] + 5 * height_factor
-    )
-
-    draw.rounded_rectangle(
-        level_frame,
-        radius=5 * height_factor,
-        fill=sep_color,
-    ) # Рамка уровня
-
-    draw.text(
-        (sep_box_counters_x, level_frame[1] - 10 * height_factor),
-        f'УРОВЕНЬ',
-        sign_color,
-        font=sign_font,
-        anchor="mm",
-    )
-
-    draw_counter(
-        level_counter_xy,
-        nums=(
-            level,
-            next_stage_level
-        ),
-        fill=status["color"],
-        main_font=num_font,
-        image=image,
-    )
-
-    level_sign_box = draw.textbbox(
-        (sep_box_counters_x, level_frame[1] - 10 * height_factor),
-        f'УРОВЕНЬ',
-        font=sign_font,
-        anchor="mm",
-    )
-
-    # Вставка иконки Сансары
-    sansara_image = Image.open(assets.sansara[status['tag_name']]).convert("RGBA")
-
-    icon_gap = round(8 * height_factor)
-    icon_box = (
-        sep_boxes_x1 + icon_gap * 2,
-        icon_gap,
-        level_sign_box[0] - icon_gap * 2,
-        sep_1_box[3] - icon_gap
-    )
-
-    icon_box_width = icon_box[2] - icon_box[0]
-    icon_box_height = icon_box[3] - icon_box[1]
-    icon_center_xy = (icon_box[0] + icon_box[2]) // 2, (icon_box[1] + icon_box[3]) // 2
-    icon_aspect_ratio = icon_box_width / icon_box_height
-
-    sansara_aspect_ratio = sansara_image.width / sansara_image.height
-    aligning = round(2 * height_factor)
-
-    if sansara_aspect_ratio > icon_aspect_ratio:
-        sansara_width = icon_box_width
-        sansara_height = round(icon_box_width / sansara_aspect_ratio)
-
-        sansara_box = (
-            icon_box[0] + aligning,
-            icon_center_xy[1] - sansara_height // 2 + aligning,
-        )
-    else:
-        sansara_width = round(icon_box_height * sansara_aspect_ratio)
-        sansara_height = icon_box_height
-
-        sansara_box = (
-            icon_center_xy[0] - sansara_width // 2 + aligning,
-            icon_box[1] + aligning
-        )
-
-    sansara_image = sansara_image.resize((sansara_width, sansara_height), Image.Resampling.LANCZOS)
-
-    image.paste(
-        sansara_image,
-        sansara_box,
-        sansara_image,
-    )
-
-    # Вставка счетчика кубов
-    cube_counter_xy = (
-        sep_box_counters_x,
-        sep_2_box[3] - sep_box_height // 3
-    )
-
-    if not user_cube:
-        count_available_cubes = user_cubes[0]["count"]
-        required_cubes = 1
-    else:
-        if user_cube["place"] == len(user_cubes):
-            count_available_cubes = 0
-            required_cubes = 0
-        else:
-            count_available_cubes = user_cubes[user_cube["place"]]["count"]
-            required_cubes = data.required_cubes
-
-    cube_counter_box = draw_counter(
-        cube_counter_xy,
-        nums=(
-            count_available_cubes,
-            required_cubes,
-        ),
-        fill=next_cube['color'],
-        main_font=num_font,
-        image=image,
-    )
-
-    cube_counter_frame = (
-        cube_counter_box[0] - 9 * height_factor,
-        cube_counter_box[1] - 7 * height_factor,
-        cube_counter_box[2] + 9 * height_factor,
-        cube_counter_box[3] + 5 * height_factor,
-    )
-
-    draw.rounded_rectangle(
-        cube_counter_frame,
-        radius=5 * height_factor,
-        fill=sep_color,
-    )  # Рамка счетчика кубов
-
-    draw_counter(
-        cube_counter_xy,
-        nums=(
-            count_available_cubes,
-            required_cubes,
-        ),
-        fill=next_cube['color'],
-        main_font=num_font,
-        image=image,
-    )
-
-    draw.text(
-        (sep_box_counters_x, cube_counter_frame[1] - 10 * height_factor),
-        f'СВЯЗЬ',
-        sign_color,
-        font=sign_font,
-        anchor="mm"
-    )
-
-    # Вставка куба
-    cube_size = sep_box_height // 4 * 3
-
-    cube_center_xy = (
-        icon_center_xy[0],
-        sep_2_box[1] + sep_box_height // 2,
-    )
-
-    cube_xy = (
-        cube_center_xy[0] - cube_size // 2,
-        cube_center_xy[1] - cube_size // 2
-    )
-
-    if user_cube:
-        cube_image = load_icon(
-            assets.cubes[user_cube["tag_name"]],
-            (cube_size, cube_size),
-        )
-    else:
-        cube_image = load_icon(
-            assets.cubes['drink'],
-            (cube_size, cube_size),
-        )
-
-    image.paste(
-        cube_image,
-        cube_xy,
-        cube_image,
-    )
-
-    # Счетчик опыта
-    score_xy = (
-        sep_boxes_x1 + sep_boxes_width // 2,
-        sep_3_box[3] - sep_box_height // 3
-    )
-
-    score_box = draw_counter(
-        score_xy,
-        nums=(
-            karma.karma,
-            next_level_karma,
-        ),
-        fill='white',
-        main_font=num_font,
-        image=image,
-    )
-
-    score_frame = (
-        score_box[0] - 9 * height_factor,
-        score_box[1] - 7 * height_factor,
-        score_box[2] + 8 * height_factor,
-        score_box[3] + 4 * height_factor,
-    )
-
-    draw.rounded_rectangle(
-        score_frame,
-        radius=5 * height_factor,
-        fill=sep_color,
-    )  # Нижний маленький внутренний прямоугольник
-
-    draw_counter(
-        score_xy,
-        nums=(
-            karma.karma,
-            next_level_karma,
-        ),
-        fill='white',
-        main_font=num_font,
-        image=image,
-    )
-
-    draw.text(
-        (score_xy[0], score_frame[1] - 10 * height_factor),
-        f'КАРМА',
-        sign_color,
-        font=sign_font,
-        anchor="mm",
-    )
-
-    # Сохранение изображения
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    buffer.seek(0)
-    return buffer
-
-def create_bind_up_postcard(bind: DataTypes.KarmicBind, avatar_1_image, avatar_2_image) -> str:
-    bind_karma = bind.bind_karma
-
-    cube = get_cube(bind_karma)
-
-    # Создание изображения и базовых прямоугольников
-    image = Image.new(
-        mode="RGBA",
-        size=(850, 300),
-        color=(30, 30, 30, 255)
-    )
-
-    background_path = random.choice(list(assets.backgrounds.values()))
-
-    background = Image.open(background_path).convert("RGBA")
-    background = background.resize(
-        (image.width, background.height * image.width // background.width),
-        Image.Resampling.LANCZOS,
-    )
-
-    background_box = (0, random.randint(image.height - background.height, 0))
-    image.paste(
-        background,
-        background_box,
-    )
-
-    # Вставка аватарок
-    mask = Image.new("L", avatar_1_image.size, 0)
-    mask_draw = ImageDraw.Draw(mask)
-
-    mask_draw.ellipse((0, 0, avatar_1_image.width, avatar_1_image.height), fill=255)
-
-    avatar_1_image.putalpha(mask)
-    avatar_2_image.putalpha(mask)
-
-    height_center = (image.height // 2) - avatar_1_image.height // 2
-
-    xy_1 = height_center, height_center
-    xy_2 = image.width - (height_center + avatar_1_image.height), height_center
-
-    image.paste(
-        avatar_1_image,
-        xy_1,
-        avatar_1_image,
-    )
-
-    image.paste(
-        avatar_2_image,
-        xy_2,
-        avatar_2_image,
-    )
-
-    # Вставка куба
-    cube_image = Image.open(assets.cubes[cube["tag_name"]]).convert('RGBA')
-
-    side = (image.height // 2) - image.height // 20
-    cube_image = cube_image.resize(
-        (side, side),
-        Image.Resampling.LANCZOS,
-    )
-
-    cube_image_box = ((image.width // 2) - cube_image.width // 2, ((image.height // 2) - cube_image.height // 2))
-    image.paste(
-        cube_image,
-        cube_image_box,
-    )
-
-    # Сохранение изображения
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    buffer.seek(0)
-    return buffer
-
-def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, username: str, full_binds: list[dict[str, Image.Image | str | DataTypes.KarmicBind]], stats: dict | None = None) -> Image.Image:
-    if stats is None:
-        stats = get_card_stats(ozernik.id)
-
-    # Расчеты
-    size = (1200, 800)
-    size_factor = min(size) / 600
-
-    main_objects_size = size[1] // 5
-    gap = size[1] // 150
-
-    radius = 20 * size_factor
-    main_box_gap = main_objects_size // 4
-
-    karma = stats['karma']
-    status = get_status(karma)
-
-    user_cubes = stats['user_cubes']
-    user_cube = stats['user_cube']
-    next_cube = stats['next_cube']
-
-    full_binds = sorted(full_binds, key=lambda b: b["bind"].bind_karma, reverse=True)
-    num_binds = 10
-
-    # Определение цветов
-    main_color = "#2A2C30"
-    sep_color = "#24272A"
-    sign_color = "#BFBFBF"
-    status_color = status["color"]
-
-    # Создание изображения и базовых прямоугольников
-    image = Image.new(
-        mode="RGBA",
-        size=size,
-        color=(0, 0, 0, 0),
-    )
-    draw = ImageDraw.Draw(image)
-
-    main_box = (
-        0,
-        0,
-        image.width,
-        main_objects_size + main_box_gap * 2,
-    )
-
-    draw.rounded_rectangle(
-        main_box,
-        radius=radius,
-        fill=main_color,
-    )
-
-    binds_full_box = (
-        0,
-        main_box[3],
-        image.width,
-        image.height,
-    )
-
-    binds_full_box_height = binds_full_box[3] - binds_full_box[1]
-    bind_box_width = image.width // 2
-    bind_box_height = round(binds_full_box_height // (num_binds // 2) - gap * 1.3)
-
-    left_boxes = []
-    right_boxes = []
-
-    y1 = binds_full_box[1] + gap
-
-    for n in range(num_binds // 2):
-        left_box = (
-            0,
-            y1,
-            bind_box_width - gap // 2,
-            y1 + bind_box_height,
-        )
-
-        right_box = (
-            bind_box_width + gap // 2,
-            y1,
-            image.width,
-            y1 + bind_box_height,
-        )
-
-        left_boxes.append(left_box)
-        right_boxes.append(right_box)
-
-        draw.rounded_rectangle(left_box, radius=radius, fill=main_color)
-        draw.rounded_rectangle(right_box, radius=radius, fill=main_color)
-
-        y1 += bind_box_height + gap
-
-    bind_boxes = left_boxes + right_boxes
-    for n, full_bind in enumerate(full_binds):
-        full_bind['box'] = bind_boxes[n]
-
-    for bind_box in bind_boxes:
-        mask = Image.new("L", image.size, 0)
-        mask_draw = ImageDraw.Draw(mask)
-
-        mask_draw.rounded_rectangle(
-            bind_box,
-            radius=radius,
-            fill=255,
-        )
-
-        mask_draw.rectangle(
-            (bind_box[0], bind_box[1], bind_box[2], bind_box[3] - bind_box_height / 13),
-            fill=0,
-        )
-
-        image.paste(
-            sep_color,
-            (0, 0, image.width, image.height),
-            mask,
-        )  # Незаполненная часть полоски
-
-        avatar_center_xy = (
-            bind_box[0] + bind_box_height // 2,
-            bind_box[3] - bind_box_height // 2
-        )
-
-        no_avatar_font = ImageFont.truetype(
-            font=assets.fonts['Roboto-Bold'],
-            size=25 * size_factor
-        )
-
-        draw.text(
-            avatar_center_xy,
-            '—',
-            sign_color,
-            font=no_avatar_font,
-            align="center",
-            anchor="mm"
-        )
-
-    # Вставка аватара
-    avatar_size = main_objects_size
-    avatar_image = avatar_image.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
-
-    mask = Image.new("L", avatar_image.size, 0)
-    mask_draw = ImageDraw.Draw(mask)
-
-    mask_draw.ellipse((0, 0, avatar_image.width, avatar_image.height), fill=255)
-
-    avatar_image.putalpha(mask)
-
-    image.paste(
-        avatar_image,
-        (main_box_gap, main_box_gap),
-        avatar_image,
-    )
-
-    avatar_full_box = (0, 0, avatar_size + main_box_gap * 2, avatar_size + main_box_gap * 2)
-
-    # Вставка куба
-    cube_size = round(main_objects_size / 10 * 9)
-    cube_gap = round(main_box[3] / 2 - cube_size / 2)
-
-    cube_xy = (
-        image.width - cube_size - cube_gap,
-        cube_gap,
-    )
-
-    if user_cube:
-        cube_image = load_icon(
-            assets.cubes[user_cube["tag_name"]],
-            (cube_size, cube_size),
-        )
-    else:
-        cube_image = load_icon(
-            assets.cubes['drink'],
-            (cube_size, cube_size),
-        )
-
-    image.paste(
-        cube_image,
-        cube_xy,
-        cube_image,
-    )
-
-    # Вставка имени
-    name_font = ImageFont.truetype(
-        assets.fonts['Roboto-Bold'],
-        size=40 * size_factor,
-    )
-    name_text = f'{username}'
-
-    name_xy = (avatar_full_box[2], cube_gap)
-    max_name_length = (main_box[2] - avatar_full_box[2]) - name_xy[0]
-
-    if draw.textlength(name_text, font=name_font) >= max_name_length:
-        while name_text:
-            name_text = name_text.rstrip() + '...'
-
-            if draw.textlength(name_text, font=name_font) <= max_name_length:
-                break
-
-            name_text = name_text[:-4]
-
-    draw.text(
-        name_xy,
-        name_text,
-        font=name_font,
-        fill=status["color"],
-        anchor='lt'
-    )
-
-    # sign_font = ImageFont.truetype(
-    #     assets.fonts['Roboto-Bold'],
-    #     size=35 * size_factor,
-    # )
-
-    # sign_text = 'Связи:'
-    # sign_xy = (avatar_full_box[2], main_box[3] - main_box_gap)
-    # max_sign_length = (main_box[2] - avatar_full_box[2]) - name_xy[0]
-    #
-    # if draw.textlength(username, font=name_font) >= max_sign_length:
-    #     while username:
-    #         username = username.rstrip() + '...'
-    #
-    #         if draw.textlength(username, font=name_font) <= max_sign_length:
-    #             break
-    #
-    #         username = username[:-4]
-    #
-    # draw.text(
-    #     sign_xy,
-    #     sign_text,
-    #     font=sign_font,
-    #     fill='#9F9F9F',
-    #     anchor='lb',
-    #     spacing=10
-    # )
-
-    # Вставка рангов
-    sign_font = ImageFont.truetype(
-        assets.fonts['Roboto'],
-        size=20 * size_factor,
-    )
-    num_font = ImageFont.truetype(
-        assets.fonts['Roboto-Bold'],
-        size=30 * size_factor,
-    )
-
-    avatar_right_end = avatar_full_box[2]
-    cube_left_end = main_box[2] - cube_size - cube_gap * 2
-
-    column_width = (cube_left_end - avatar_right_end) / 3
-
-    ranks_x1 = avatar_right_end + column_width * 0.3
-    ranks_x2 = avatar_right_end + column_width * 1.1
-    ranks_x3 = avatar_right_end + column_width * 1.9
-    ranks_x4 = avatar_right_end + column_width * 2.7
-
-    ranks_y = main_box[3] / 10 * 6
-    ranks_y2 = main_box[3] - (main_box[3] - ranks_y) / 2
-
-    gold_text =  f'{user_cubes[3]['count']}' if user_cubes[3]['count'] >= 10 else f'{user_cubes[3]['count']}/10'
-    blue_text =  f'{user_cubes[2]['count']}' if user_cubes[2]['count'] >= 10 else f'{user_cubes[2]['count']}/10'
-    white_text = f'{user_cubes[1]['count']}' if user_cubes[1]['count'] >= 10 else f'{user_cubes[1]['count']}/10'
-    black_text = f'{user_cubes[0]['count']}' if user_cubes[0]['count'] >= 1 else f'{user_cubes[0]['count']}/1'
-
-    draw.text(
-        (ranks_x1, ranks_y),
-        'ЗОЛОТЫЕ',
-        align="center",
-        font=sign_font,
-        fill=sign_color,
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x1, ranks_y2),
-        gold_text,
-        font=num_font,
-        fill='#BFBFBF',
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x2, ranks_y),
-        'СИНИЕ+',
-        align="center",
-        font=sign_font,
-        fill=sign_color,
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x2, ranks_y2),
-        blue_text,
-        font=num_font,
-        fill='#BFBFBF',
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x3, ranks_y),
-        'БЕЛЫЕ+',
-        align="center",
-        font=sign_font,
-        fill=sign_color,
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x3, ranks_y2),
-        white_text,
-        font=num_font,
-        fill='#BFBFBF',
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x4, ranks_y),
-        'ЧЕРНЫЕ+',
-        align="center",
-        font=sign_font,
-        fill=sign_color,
-        anchor="mm",
-    )
-
-    draw.text(
-        (ranks_x4, ranks_y2),
-        black_text,
-        font=num_font,
-        fill='#BFBFBF',
-        anchor="mm",
-    )
-
-    # Вставка связей
-    bind_object_size = bind_box_height // 4 * 3
-    bind_name_font = ImageFont.truetype(
-        font=assets.fonts['Roboto-Bold'],
-        size=25 * size_factor
-    )
-    bind_counter_font = ImageFont.truetype(
-        font=assets.fonts['Roboto-Bold'],
-        size=19 * size_factor
-    )
-
-    for full_bind in full_binds:
-        bind_cube = get_cube(full_bind['bind'].bind_karma)
-        next_cube = get_next_cube_from_cube(bind_cube['tag_name'])
-        bind_color = bind_cube['color']
-        name_color = '#AAAAAA'
-
-        # Вставка полоски прогресса
-        if bind_cube['tag_name'] != 'gold_cube':
-            progress_factor = full_bind['bind'].bind_karma / next_cube['required_karma']
-
-            fill_width = bind_box_width * progress_factor
-            fill_x = full_bind['box'][0] + fill_width
-
-            mask = Image.new("L", image.size, 0)
-            mask_draw = ImageDraw.Draw(mask)
-
-            mask_draw.rounded_rectangle(
-                full_bind['box'],
-                radius=radius,
-                fill=255,
-            )
-
-            mask_draw.rectangle(
-                (full_bind['box'][0], full_bind['box'][1], full_bind['box'][2], full_bind['box'][3] - bind_box_height / 13),
-                fill=0,
-            )
-
-            image.paste(
-                sep_color,
-                (0, 0, image.width, image.height),
-                mask,
-            )  # Незаполненная часть полоски
-
-            mask_draw.rectangle(
-                (fill_x, full_bind['box'][1], full_bind['box'][2], full_bind['box'][3]),
-                fill=0,
-            )
-
-            image.paste(
-                bind_color,
-                (0, 0, image.width, image.height),
-                mask,
-            )  # Заполненная часть полоски
-        else:
-            rounded_gradient(
-                image,
-                full_bind['box'],
-                radius,
-                bind_color,
-                "#FFC573",
-            )
-            bind_color = '#000000'
-            name_color = '#000000'
-
-        # Вставка аватара
-        bind_avatar_image = full_bind['avatar'].resize((bind_object_size, bind_object_size), Image.Resampling.LANCZOS)
-
-        mask = Image.new("L", bind_avatar_image.size, 0)
-        mask_draw = ImageDraw.Draw(mask)
-
-        mask_draw.ellipse((0, 0, bind_avatar_image.width, bind_avatar_image.height), fill=255)
-
-        bind_avatar_image.putalpha(mask)
-
-        avatar_center_xy = (
-            full_bind['box'][0] + bind_box_height // 2,
-            full_bind['box'][3] - bind_box_height // 2
-        )
-        avatar_xy = (
-            avatar_center_xy[0] - bind_object_size // 2,
-            avatar_center_xy[1] - bind_object_size // 2
-        )
-        image.paste(
-            bind_avatar_image,
-            avatar_xy,
-            bind_avatar_image,
-        )
-
-        # Вставка имени
-        bind_name_xy = (full_bind['box'][0] + bind_box_height, full_bind['box'][1] + bind_box_height / 5)
-        max_bind_name_length = bind_box_width - bind_box_height * 1.2
-
-        if draw.textlength(full_bind['name'], font=bind_name_font) >= max_bind_name_length:
-            while full_bind['name']:
-                full_bind['name'] = full_bind['name'].rstrip() + '...'
-
-                if draw.textlength(full_bind['name'], font=bind_name_font) <= max_bind_name_length:
-                    break
-
-                full_bind['name'] = full_bind['name'][:-4]
-
-        draw.text(
-            bind_name_xy,
-            full_bind['name'],
-            font=bind_name_font,
-            fill=name_color,
-            anchor='lt'
-        )
-
-        # Вставка счётчика
-        bind_counter_xy = (full_bind['box'][0] + bind_box_height, full_bind['box'][3] - bind_box_height / 6)
-        draw.text(
-            bind_counter_xy,
-            format_duration_minutes(full_bind['bind'].bind_karma),
-            font=bind_counter_font,
-            fill=bind_color,
-            anchor='ld'
-        )
-
-        if next_cube:
-            bind_ambition_xy = (full_bind['box'][2] - bind_box_height / 4, bind_counter_xy[1])
-            draw.text(
-                bind_ambition_xy,
-                format_duration_minutes(next_cube['required_karma']),
-                font=bind_counter_font,
-                fill=sign_color,
-                anchor='rd'
-            )
-
-    # Сохранение изображения
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    buffer.seek(0)
-    return buffer
-
-# ---------------------------------------------------------
-# |||||||||||||||| Класс работы с ролями ||||||||||||||||||
-# ---------------------------------------------------------
-
-class Roles:
-    def __init__(self, bot: OzernikiBot):
-        self._bot = bot
-
-        self._sansara_roles = [
-            "naraka",
-            "preta",
-            "animal",
-            "human",
-            "asur",
-            "deva",
-        ]
-
-        self._cubes_roles = [
-            "black_cube",
-            "white_cube",
-            "blue_cube",
-            "gold_cube",
-        ]
-
-    async def _get_role(self, roles_key: str, icons: dict[str, Path], role_name: str, recreate: bool, restore: bool) -> Role | None:
-        """
-        Находит роль по ID из data (кэш сервера → запрос к Discord).
-
-        - recreate: если роли нет — создать и сохранить новый ID;
-        - restore: вернуть название и цвет из настроек.
-        Иконка загружается только при создании роли или при restore —
-        не при каждом обращении (иначе каждое повышение правило 7 ролей).
-        """
-        guild: discord.Guild = self._bot.guild
-
-        if not guild:
-            return None
-
-        roles_data = getattr(data, roles_key)
-        role_data = roles_data[role_name]
-
-        role = guild.get_role(role_data['role_id'])
-
-        if role is None:
-            try:
-                role = await guild.fetch_role(role_data['role_id'])
-            except discord.HTTPException:
-                pass
-
-        created = False
-
-        if role is None and recreate:
-            try:
-                role = await guild.create_role(
-                    reason="Восстановление роли.",
-                    name=role_data['name'],
-                    colour=discord.Colour.from_str(role_data['color']),
-                    hoist=False,
-                    mentionable=False,
-                )
-
-                role_data['role_id'] = role.id
-                setattr(data, roles_key, roles_data)
-                created = True
-            except Exception as e:
-                print(e)
-                print(traceback.format_exc())
-
-        if role is None:
-            return None
-
-        if restore and not created:
-            try:
-                await role.edit(
-                    reason="Восстановление роли.",
-                    name=role_data['name'],
-                    colour=discord.Colour.from_str(role_data['color']),
-                )
-            except Exception as e:
-                print(f'Не удалось восстановить роль {role_name}: {e}')
-
-        if created or restore:
-            # Иконки ролей доступны только на сервере с 2 уровнем буста — ошибку глушим.
-            try:
-                with open(icons[role_name], "rb") as f:
-                    icon_bytes = f.read()
-
-                await role.edit(display_icon=icon_bytes)
-            except Exception:
-                pass
-
-        return role
-
-    async def get_sansara_role(
-        self,
-        role_name: Literal[
-            'naraka',
-            'preta',
-            'animal',
-            'human',
-            'asur',
-            'deva',
-        ],
-        recreate: bool = True,
-        restore: bool = False,
-    ) -> Role | None:
-        return await self._get_role('karma_roles', assets.sansara, role_name, recreate, restore)
-
-    async def get_cube_role(
-        self,
-        role_name: Literal[
-            'black_cube',
-            'white_cube',
-            'blue_cube',
-            'gold_cube',
-        ],
-        recreate: bool = True,
-        restore: bool = False,
-    ) -> Role | None:
-        return await self._get_role('cube_roles', assets.cubes, role_name, recreate, restore)
-
-    async def get_sansara_roles(self, recreate: bool = True, restore: bool = False) -> list[Role] | None:
-        roles = []
-
-        for role_name in self._sansara_roles:
-            role = await self.get_sansara_role(role_name, recreate, restore)
-
-            if role is not None:
-                roles.append(role)
-
-        return roles or None
-
-    async def get_cube_roles(self, recreate: bool = True, restore: bool = False) -> list[Role] | None:
-        roles = []
-
-        for role_name in self._cubes_roles:
-            role = await self.get_cube_role(role_name, recreate, restore)
-
-            if role is not None:
-                roles.append(role)
-
-        return roles or None
-
-# ---------------------------------------------------------
-# ||||||||| Классы страниц у команды настроек |||||||||||||
-# ---------------------------------------------------------
-
-class SettingsMainPage(Page):
-    """
-    Главная страница настроек. Хаб для навигации.
-    """
-    title = 'Карма'
-
-    def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
-        super().__init__(navigator, author)
-        self.bot = bot
-
-        self.general_button = discord.ui.Button(
-            label="Общие",
-            style=discord.ButtonStyle.primary,
-        )
-
-        async def general_callback(interaction):
-            await self.navigator.push(SettingsGeneralPage, author=self.author, bot=self.bot)
-            await interaction.response.defer()
-
-        self.general_button.callback = (
-            general_callback
-        )
-
-        self.sansara_button = discord.ui.Button(
-            label="Сансара",
-            style=discord.ButtonStyle.primary,
-        )
-
-        async def sansara_callback(interaction):
-            await self.navigator.push(SettingsSansaraPage, author=self.author, bot=self.bot)
-            await interaction.response.defer()
-
-        self.sansara_button.callback = (
-            sansara_callback
-        )
-
-        self.cubes_button = discord.ui.Button(
-            label="Кубы",
-            style=discord.ButtonStyle.primary,
-        )
-
-        async def cubes_callback(interaction):
-            await self.navigator.push(SettingsCubesPage, author=self.author, bot=self.bot)
-            await interaction.response.defer()
-
-        self.cubes_button.callback = (
-            cubes_callback
-        )
-
-        self.level_up_button = discord.ui.Button(
-            label="Текст повышений",
-            style=discord.ButtonStyle.primary,
-        )
-
-        async def level_up_callback(interaction): # noqa
-            await self.navigator.push(SettingsLevelUpPage, author=self.author, bot=self.bot)
-            await interaction.response.defer()
-
-        self.level_up_button.callback = (
-            level_up_callback
-        )
-
-    def build_content(self, container: discord.Container):
-        container.add_item(
-            discord.ui.TextDisplay(
-                '*На создание этого меню у меня ушло неприлично много времени, так что наслаждайтесь этим текстом в назидание о правильном времяпрепровождении, а не этим всем.*\n'
-                '*Если возникнут какие-то вопросы, обращайтесь к Габу (если я еще не умер).*'
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.general_button
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.sansara_button
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.cubes_button
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.level_up_button
-            )
-        )
-
-class SettingsGeneralPage(Page):
-    """
-    Страница общих настроек.
-    """
-    title = 'Карма -> Общие'
-
-    def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
-        super().__init__(navigator, author)
-        self.bot = bot
-
-        # Изменяемые значения
-        self.karma_channel_id = data.karma_channel_id
-        self.log_channel_id = data.log_channel_id
-        self.blocked_channels_id = set(data.blocked_channels_id)
-        self.blocked_roles_id = set(data.blocked_roles_id)
-        self.blocked_users_id = set(data.blocked_users_id)
-
-        # Флаги изменений
-        self.original_karma_channel_id = data.karma_channel_id
-        self.original_log_channel_id = data.log_channel_id
-        self.original_blocked_channels_id = set(data.blocked_channels_id)
-        self.original_blocked_roles_id = set(data.blocked_roles_id)
-        self.original_blocked_users_id = set(data.blocked_users_id)
-
-        # -------------------------------------------------
-        # Блокировка каналов
-        # -------------------------------------------------
-
-        self.blocked_channels_select = discord.ui.ChannelSelect(
-            placeholder="Изменить каналы"
-        )
-        self.blocked_channels_select.callback = (
-            self.blocked_channels_callback
-        )
-
-        # -------------------------------------------------
-        # Блокировка ролей
-        # -------------------------------------------------
-
-        self.blocked_roles_select = discord.ui.RoleSelect(
-            placeholder="Изменить роли"
-        )
-        self.blocked_roles_select.callback = (
-            self.blocked_roles_callback
-        )
-
-        # -------------------------------------------------
-        # Блокировка участников
-        # -------------------------------------------------
-
-        self.blocked_users_select = discord.ui.UserSelect(
-            placeholder="Изменить участников"
-        )
-        self.blocked_users_select.callback = (
-            self.blocked_users_callback
-        )
-
-        # -------------------------------------------------
-        # Канал оповещений
-        # -------------------------------------------------
-
-        self.karma_channel_select = discord.ui.ChannelSelect(
-            placeholder="Изменить канал",
-            channel_types=[
-                discord.ChannelType.text,
-            ],
-        )
-        self.karma_channel_select.callback = (
-            self.karma_channel_callback
-        )
-
-        # -------------------------------------------------
-        # Канал логов
-        # -------------------------------------------------
-
-        self.log_channel_select = discord.ui.ChannelSelect(
-            placeholder="Изменить канал",
-            channel_types=[
-                discord.ChannelType.text,
-            ],
-        )
-        self.log_channel_select.callback = (
-            self.log_channel_callback
-        )
-
-        # -------------------------------------------------
-        # Кнопки
-        # -------------------------------------------------
-
-        self.confirm_button = discord.ui.Button(
-            label="Подтвердить",
-            style=discord.ButtonStyle.primary,
-        )
-        self.confirm_button.callback = self.confirm_callback
-
-    def build_content(self, container: discord.Container):
-        self.update_buttons()
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                '*Этим меню будут пользоваться одновременно чаще всего и одновременно никогда. И то, наверное, только Дракон (долгих лет ему жизни.)\n\n'
-                'Чтобы использовать это меню, нужно изменить канал или каналы на нужные значения, а затем нажать «Подтвердить». Тут всё довольно наглядно, поэтому не побоюсь этого страшного слова — «интуитивно».\n\n'
-                'Если вы мисскликнули по каналу и после этого не можете выбрать его снова, то это потому, что в подобных выпадающих списках нельзя нажать на один и тот же канал дважды. Я долго пытался решить эту проблему, но в итоге забил и оставил хотя бы это сообщение.\n\n'
-                '-# Во избежание проблемы выше можно не мисскликать. Ну или нажать по очереди на другие каналы, чтобы сбросить «хвост».*'
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                self.get_blocked_channels_text()
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.blocked_channels_select
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                self.get_roles_channels_text()
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.blocked_roles_select
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                self.get_blocked_users_text()
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.blocked_users_select
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                self.get_karma_channel_text()
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.karma_channel_select
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                self.get_log_channel_text()
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.log_channel_select
-            )
-        )
-
-    def build_footer_buttons(self):
-        footer_buttons = [self.confirm_button]
-        return footer_buttons
-
-    def get_karma_channel_text(self) -> str:
-        if self.karma_channel_id is None:
-            return "### Канал оповещений: не выбран"
-
-        if self.karma_channel_id == self.original_karma_channel_id:
-            return (
-                f"### Канал оповещений: "
-                f"<#{self.karma_channel_id}>"
-            )
-        else:
-            return (
-                f"### Канал оповещений: "
-                f"__<#{self.karma_channel_id}>__*"
-            )
-
-    def get_log_channel_text(self) -> str:
-        if self.log_channel_id is None:
-            return "### Канал логов: не выбран"
-
-        if self.log_channel_id == self.original_log_channel_id:
-            return (
-                f"### Канал логов: "
-                f"<#{self.log_channel_id}>"
-            )
-        else:
-            return (
-                f"### Канал логов: "
-                f"__<#{self.log_channel_id}>__*"
-            )
-
-    def get_blocked_channels_text(self) -> str:
-        if not self.blocked_channels_id and (
-                self.original_blocked_channels_id
-                == self.blocked_channels_id
-        ):
-            return "### Заблокированные каналы: не выбраны"
-
-        parts = []
-
-        for channel_id in (self.original_blocked_channels_id | self.blocked_channels_id):
-            removed = (
-                    channel_id in self.original_blocked_channels_id
-                    and channel_id not in self.blocked_channels_id
-            )
-
-            added = (
-                    channel_id not in self.original_blocked_channels_id
-                    and channel_id in self.blocked_channels_id
-            )
-
-            if removed:
-                parts.append(f"~~<#{channel_id}>~~\\*")
-            elif added:
-                parts.append(f"__<#{channel_id}>__\\*")
-            else:
-                parts.append(f"<#{channel_id}>")
-
-        if not parts:
-            return "### Заблокированные каналы: не выбраны"
-
-        return (
-                "### Заблокированные каналы: "
-                + ", ".join(parts)
-        )
-
-    def get_roles_channels_text(self) -> str:
-        if not self.blocked_roles_id and (
-                self.original_blocked_roles_id
-                == self.blocked_roles_id
-        ):
-            return "### Заблокированные роли: не выбраны"
-
-        parts = []
-
-        for role_id in (self.original_blocked_roles_id | self.blocked_roles_id):
-            removed = (
-                    role_id in self.original_blocked_roles_id
-                    and role_id not in self.blocked_roles_id
-            )
-
-            added = (
-                    role_id not in self.original_blocked_roles_id
-                    and role_id in self.blocked_roles_id
-            )
-
-            if removed:
-                parts.append(f"~~<@&{role_id}>~~\\*")
-            elif added:
-                parts.append(f"<@&{role_id}>\\*")
-            else:
-                parts.append(f"<@&{role_id}>")
-
-        if not parts:
-            return "### Заблокированные роли: не выбраны"
-
-        return (
-                "### Заблокированные роли: "
-                + ", ".join(parts)
-        )
-
-    async def karma_channel_callback(self, interaction: discord.Interaction) -> None:
-        channel = self.karma_channel_select.values[0]
-
-        self.karma_channel_id = channel.id
-
-        self.update_buttons()
-
-        await self.navigator.render()
-        await interaction.response.defer()
-
-    async def log_channel_callback(self, interaction: discord.Interaction) -> None:
-        channel = self.log_channel_select.values[0]
-
-        self.log_channel_id = channel.id
-
-        self.update_buttons()
-
-        await self.navigator.render()
-        await interaction.response.defer()
-
-    async def blocked_channels_callback(self, interaction: discord.Interaction) -> None:
-        channels = [channel.id for channel in self.blocked_channels_select.values]
-
-        self.blocked_channels_id.symmetric_difference_update(channels)
-
-        await self.navigator.render()
-        await interaction.response.defer()
-
-    def get_blocked_users_text(self) -> str:
-        """Как у ролей: зачёркнут — будет снят, со звёздочкой — будет добавлен после «Подтвердить»."""
-        if not self.blocked_users_id and not self.original_blocked_users_id:
-            return "### Заблокированные участники: не выбраны"
-
-        parts = []
-
-        for user_id in (self.original_blocked_users_id | self.blocked_users_id):
-            removed = user_id in self.original_blocked_users_id and user_id not in self.blocked_users_id
-            added = user_id not in self.original_blocked_users_id and user_id in self.blocked_users_id
-
-            if removed:
-                parts.append(f"~~<@{user_id}>~~\\*")
-            elif added:
-                parts.append(f"<@{user_id}>\\*")
-            else:
-                parts.append(f"<@{user_id}>")
-
-        return "### Заблокированные участники: " + ", ".join(parts)
-
-    async def blocked_users_callback(self, interaction: discord.Interaction) -> None:
-        users = [user.id for user in self.blocked_users_select.values]
-
-        self.blocked_users_id.symmetric_difference_update(users)
-
-        self.update_buttons()
-
-        await self.navigator.render()
-        await interaction.response.defer()
-
-    async def blocked_roles_callback(self, interaction: discord.Interaction) -> None:
-        roles = [role.id for role in self.blocked_roles_select.values]
-
-        self.blocked_roles_id.symmetric_difference_update(roles)
-
-        await self.navigator.render()
-        await interaction.response.defer()
-
-    async def confirm_callback(self, interaction: discord.Interaction) -> None:
-        if self.karma_channel_id != self.original_karma_channel_id:
-            data.karma_channel_id = self.karma_channel_id
-            self.original_karma_channel_id = self.karma_channel_id
-
-        if self.log_channel_id != self.original_log_channel_id:
-            data.log_channel_id = self.log_channel_id
-            self.original_log_channel_id = self.log_channel_id
-
-        if self.blocked_channels_id != self.original_blocked_channels_id:
-            data.blocked_channels_id = list(self.blocked_channels_id)
-            self.original_blocked_channels_id = set(self.blocked_channels_id)
-
-        if self.blocked_roles_id != self.original_blocked_roles_id:
-            data.blocked_roles_id = list(self.blocked_roles_id)
-            self.original_blocked_roles_id = set(self.blocked_roles_id)
-
-        if self.blocked_users_id != self.original_blocked_users_id:
-            data.blocked_users_id = list(self.blocked_users_id)
-            self.original_blocked_users_id = set(self.blocked_users_id)
-
-        await self.navigator.render()
-        await interaction.response.defer()
-
-    def update_buttons(self) -> None:
-        edited = (
-            self.karma_channel_id != self.original_karma_channel_id
-            or self.log_channel_id != self.original_log_channel_id
-            or self.blocked_channels_id != self.original_blocked_channels_id
-            or self.blocked_roles_id != self.original_blocked_roles_id
-            or self.blocked_users_id != self.original_blocked_users_id
-        )
-
-        self.confirm_button.disabled = not edited
-
-class SettingsLevelUpPage(Page):
-    """
-    Страница настроек текстов повышений.
-    """
-    title = 'Карма -> Текст повышений'
-
-    def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
-        super().__init__(navigator, author)
-        self.bot = bot
-        self.buttons = []
-
-        self.update_buttons()
-
-    def update_buttons(self):
-        self.buttons = []
-        texts = db.get_level_texts()
-        # Ключи — строки: в окне правки тексты показываются как {'5': 'текст'}.
-        levels = [(str(level), texts.get(level, '')) for level in range(1, LEVEL_TEXTS_COUNT + 1)]
-
-        for i in range(0, len(levels), 20):
-            group = tuple(levels[i:i + 20])
-
-            button = discord.ui.Button(
-                label=f"Изменить ({i + 1} - {i + 20})",
-                style=discord.ButtonStyle.primary,
-            )
-
-            async def callback(
-                    interaction: discord.Interaction,
-                    _group=group,
-            ):
-                try:
-                    await interaction.response.send_modal(self.LevelUpTextModal(_group, self))
-                except Exception:
-                    traceback.print_exc()
-
-            button.callback = callback
-
-            self.buttons.append(button)
-
-    class LevelUpTextModal(discord.ui.Modal):
-        def __init__(self, levels_tuple: tuple, page):
-            super().__init__(title="Текст повышения")
-            self.page = page
-
-            str_levels = collapse_dict(dict(levels_tuple))
-
-            self.text_input = discord.ui.TextInput(
-                label="Текст",
-                style=discord.TextStyle.long,
-                default=str_levels,
-                placeholder="Введите текст повышения...",
-                required=True,
-                max_length=4000,
-            )
-
-            self.add_item(self.text_input)
-
-        async def on_submit(self, interaction: discord.Interaction):
-            await interaction.response.defer()
-            try:
-                new_levels_data = expand_dict(self.text_input.value)
-
-                try:
-                    texts = parse_level_texts(new_levels_data)
-                except ValueError as error:
-                    await interaction.followup.send(f'Не сохранено. {error}', ephemeral=True)
-                    return
-
-                db.set_level_texts(texts)
-
-                self.page.update_buttons()
-                await self.page.navigator.render()
-
-                await interaction.followup.send('Изменено.', ephemeral=True)
-            except SyntaxError as error:
-                message = str(error)
-
-                if "unterminated string literal" in message:
-                    explanation = "Строка не закрыта. Проверьте кавычки."
-                elif "unterminated triple-quoted string literal" in message:
-                    explanation = "Многострочная строка не закрыта. Проверьте тройные кавычки."
-                elif "unexpected EOF while parsing" in message:
-                    explanation = "Выражение неожиданно закончилось. Возможно, не хватает закрывающей скобки или кавычки."
-                elif "invalid syntax" in message:
-                    explanation = "Обнаружена ошибка в синтаксисе."
-                else:
-                    explanation = message
-
-                text = self.text_input.value
-
-                if error.lineno is not None:
-                    explanation += f"\nСтрока: {error.lineno}"
-                    lines = text.splitlines()
-                    if 1 <= error.lineno <= len(lines):
-                        # Подчёркиваем строку с ошибкой.
-                        lines.insert(error.lineno, '^' * len(lines[error.lineno - 1]))
-                    text = "\n".join(lines)
-
-
-                if error.offset is not None:
-                    explanation += f"\nПозиция: {error.offset}"
-
-                await interaction.followup.send(
-                    f'{explanation}\n```{text}```',
-                    ephemeral=True
-                )
-
-    def build_content(self, container: discord.Container):
-        container.add_item(
-            discord.ui.TextDisplay(
-                '*Речь о текстах которые показываются при повышении уровней Сансары.*\n'
-                '*Изменяются только __явно__ измененные значения. То есть, при удалении строки {\'n\': \'qwerty\'} из блока изменений целиком, её содержимое изменено не будет.*\n'
-                '*Для упоминания ролей, каналов, пользователей, игр, времени или чего-бы то ни было в каком-то из уровней, используйте стандартную нотацию Discord через айди или ключевое слово. (пример мне делать лень)*'
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                '-# *Тут планируется показ уровней, но Габу его делать лень, остальная Сансара не ждет (она ждёт).*'
-            )
-        )
-
-        for button in self.buttons:
-            container.add_item(
-                discord.ui.ActionRow(
-                    button
-                )
-            )
-
-class SettingsSansaraPage(Page):
-    """
-    Страница настроек Сансары.
-    """
-    title = 'Карма -> Сансара'
-    restore_task: asyncio.Task | None = None
-
-    def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
-        super().__init__(navigator, author)
-        self.bot = bot
-        self.roles = Roles(bot)
-
-        # Кнопка задержки между выдачей опыта сообщений
-        self.karma_message_delay_button = discord.ui.Button(
-            label="Изменить",
-            style=discord.ButtonStyle.primary,
-        )
-
-        async def karma_message_delay_button_callback(interaction: discord.Interaction):
-            await interaction.response.send_modal(self.DelayModal(self.navigator))
-
-        self.karma_message_delay_button.callback = karma_message_delay_button_callback
-
-        self.karma_edit_roles_by_data_button = self.create_confirm_button(
-            label="Восстановить роли",
-            confirm_label="Подтвердить восстановление ролей",
-            action=self._restore_roles,
-        )
-
-    async def _restore_roles(self, interaction: Interaction):
-        try:
-            if self.restore_task is not None and not self.restore_task.done():
-                await interaction.followup.send(
-                    'Задача уже выполняется',
-                    ephemeral=True
-                )
-                return
-
-            guild = self.bot.guild
-            sansara_roles = await self.roles.get_sansara_roles(recreate=True, restore=True)
-            sansara_role_ids = {role.id for role in sansara_roles}
-
-            async def restore_roles():
-                message: discord.WebhookMessage = await interaction.followup.send(
-                    f'Обновление ролей участников: 0/{len(guild.members)}',
-                    ephemeral=True
-                )
-
-                n = 0
-
-                for member in guild.members:
-                    n += 1
-
-                    if n % 27 == 0:
-                        await message.edit(
-                            content=f'Обновление ролей участников: {n}/{len(guild.members)}'
-                        )
-
-                    if member.bot:
-                        # Ботам роли Сансары не положены — снимаем, если были выданы.
-                        bot_sansara_roles = [role for role in member.roles if role.id in sansara_role_ids]
-
-                        if bot_sansara_roles:
-                            await member.remove_roles(
-                                *bot_sansara_roles,
-                                reason="Ботам роли Сансары не выдаются",
-                            )
-
-                        continue
-
-                    ozernik = self.bot.db_ensure_user(member)
-
-                    karma = db.get_karma(ozernik.id)
-                    status = get_status(karma)
-
-                    target_role = await self.roles.get_sansara_role(
-                        status["tag_name"]
-                    )
-
-                    current_sansara_roles = [
-                        role
-                        for role in member.roles
-                        if role.id in sansara_role_ids
-                    ]
-
-                    if (
-                        len(current_sansara_roles) == 1
-                        and current_sansara_roles[0].id == target_role.id
-                    ):
-                        continue
-
-                    roles_to_remove = [
-                        role
-                        for role in current_sansara_roles
-                        if role.id != target_role.id
-                    ]
-
-                    if roles_to_remove:
-                        await member.remove_roles(
-                            *roles_to_remove,
-                            reason="Восстановление ролей Сансары",
-                        )
-
-                    if target_role not in member.roles:
-                        await member.add_roles(
-                            target_role,
-                            reason="Восстановление ролей Сансары",
-                        )
-
-
-                await message.delete()
-                await interaction.followup.send(
-                    f'Обновление ролей участников завершено.',
-                    ephemeral=True
-                )
-
-            SettingsSansaraPage.restore_task = asyncio.create_task(restore_roles())
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(tb)
-            print(e)
-
-    class DelayModal(discord.ui.Modal):
-        def __init__(self, navigator: Navigator):
-            super().__init__(title="Задержка между сообщениями")
-
-            self.navigator = navigator
-
-            delay = data.karma_message_delay
-
-            str_delay = str(delay)
-
-            self.text_input = discord.ui.TextInput(
-                label="Задержка между сообщениями в секундах",
-                style=discord.TextStyle.short,
-                default=str_delay,
-                placeholder=f"1–9",
-                required=True,
-                max_length=1,
-            )
-
-            self.add_item(self.text_input)
-
-        async def on_submit(self, interaction: discord.Interaction):
-            try:
-                value = int(self.text_input.value)
-            except ValueError:
-                await interaction.response.send_message(
-                    "Введите целое число.",
-                    ephemeral=True,
-                )
-                return
-
-            if not 1 <= value <= 9:
-                await interaction.response.send_message(
-                    "Введите число от 1 до 9.",
-                    ephemeral=True,
-                )
-                return
-
-            data.karma_message_delay = value
-            await interaction.response.defer()
-            await self.navigator.render()
-
-        async def on_error(
-                self,
-                interaction: discord.Interaction,
-                error: Exception,
-        ) -> None:
-            traceback_text = traceback.format_exc()
-
-            print(
-                f"Error:\n"
-                f"{traceback_text}"
-            )
-
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"Произошла ошибка:\n```python\n{error}\n```",
-                    ephemeral=True,
-                )
-            else:
-                await interaction.response.send_message(
-                    f"Произошла ошибка:\n```python\n{error}\n```",
-                    ephemeral=True,
-                )
-
-    def build_content(self, container: discord.Container):
-        container.add_item(
-            discord.ui.TextDisplay(
-                '*Это меню я изначально не хотел делать, но потом подумал, что редактирование ролей Сансары — довольно важная функция.\n'
-                'Как ни странно, это меню я сделал третьим — после «Общих» и «Текстов повышений». Поэтому решил совместить в нём подходы, которые использовал в этих двух меню.\n\n'
-                'Здравствуй, админ, решивший сюда заглянуть. Вероятно, просто чтобы просто почитать.*\n'
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                self.get_karma_roles_text()
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                f'## Уровни сансары:\n'
-                f'*Каждые десять уровней увеличивается количество кармы, необходимое для перехода на следующий уровень: '
-                f'сначала на 100 ед. к., затем на 200, затем на 400, затем на 800 и т. д. '
-                f'Поэтому чем выше уровень Сансары, тем больше кармы требуется для каждого нового уровня.*'
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                self.get_karma_levels_text()
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                '## Восстановление ролей:\n'
-                '*Все роли которые подверглись изменениям будут возвращены в исходное состояние (название и цвет), также будут возвращены удаленные роли.\n'
-                'Также все пользователи которым выдана неправильная роль или не выдана роль будут обновлены.\n'
-                '-# Может занять некоторое время.*'
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.karma_edit_roles_by_data_button
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                self.get_karma_message_delay_text()
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                '*Карма выдается максимум только раз в определенный промежуток времени — это задержка между выдачей Кармы.*'
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.karma_message_delay_button
-            )
-        )
-
-    @staticmethod
-    def get_karma_message_delay_text() -> str:
-        if data.karma_message_delay:
-            n = format_duration_seconds(data.karma_message_delay, True)
-            return (
-                f"## Задержка между выдачей Кармы: "
-                f"{n}."
-            )
-        else:
-            return (
-                f"## Задержка между выдачей Кармы: "
-                f"Не задана"
-            )
-
-    @staticmethod
-    def get_karma_roles_text() -> str:
-        lines = [f'## Роли сансары:']
-        for karma_role in data.karma_roles.values():
-            required_karma = karma_role['required_karma']
-            level = get_level(required_karma)
-
-            if level is None:
-                level = '25+'
-                required_karma = '5000+'
-
-            lines.append(
-                f'- <@&{karma_role['role_id']}>:'
-                f' `{karma_role['name']}`,'
-                f' `{required_karma}` кармы ({level} ур.)''.'
-            )
-
-        return '\n'.join(lines)
-
-    @staticmethod
-    def get_karma_levels_text() -> str:
-        fin_lines = []
-
-        lines = []
-        for level in range(1, 31):
-            required_karma = get_karma(level)
-            str_level = str(level).zfill(2)
-
-            lines.append(
-                f'{str_level} ур: `{required_karma}`'
-            )
-
-        third = math.ceil(len(lines) / 3)
-
-        for i in range(third):
-            left = lines[i]
-            middle = lines[i + third] if i + third < len(lines) else ""
-            right = lines[i + third * 2] if i + third * 2 < len(lines) else ""
-
-            left_text = f'{left}' if left else ''
-            middle_text = f'{middle}' if middle else ''
-            right_text = f'{right}' if right else ''
-
-            line = f"{left_text.ljust(14)} {middle_text.ljust(14)} {right_text}"
-
-            line = line.replace('1 ур: ', '1 ур:  ')
-            line = line.replace('07 ур: ', '07 ур:  ')
-            line = line.replace('10 ур: ', '10 ур:  ')
-            line = line.replace('`1000`  ', '`1000` ')
-            line = line.replace('`3000`  ', '`3000` ')
-
-            fin_lines.append(line)
-
-        fin_lines.append('и т.д.')
-
-        return '\n'.join(fin_lines)
-
-class SettingsCubesPage(Page):
-    """
-    Страница настроек Кубов.
-    """
-    title = 'Карма -> Кубы'
-    restore_task: asyncio.Task | None = None
-
-    def __init__(self, navigator: Navigator, author: discord.Member, bot: OzernikiBot):
-        super().__init__(navigator, author)
-        self.bot = bot
-        self.roles = Roles(bot)
-
-        # Кнопка изменения предела золотого куба
-        self.gold_cube_required_karma_button = discord.ui.Button(
-            label="Изменить",
-            style=discord.ButtonStyle.primary,
-        )
-
-        async def gold_cube_required_karma_button_callback(interaction: discord.Interaction):
-            await interaction.response.send_modal(self.GoldCubeModal(self.navigator))
-
-        self.gold_cube_required_karma_button.callback = gold_cube_required_karma_button_callback
-
-        self.cubes_edit_roles_by_data_button = self.create_confirm_button(
-            label="Восстановить роли",
-            confirm_label="Подтвердить восстановление ролей",
-            action=self._restore_roles,
-        )
-
-    async def _restore_roles(self, interaction: Interaction):
-        try:
-            if self.restore_task is not None and not self.restore_task.done():
-                await interaction.followup.send(
-                    'Задача уже выполняется',
-                    ephemeral=True
-                )
-                return
-
-            guild = self.bot.guild
-            cube_roles = await self.roles.get_cube_roles(recreate=True, restore=True)
-
-            async def restore_roles():
-                message: discord.WebhookMessage = await interaction.followup.send(
-                    f'Обновление ролей участников: 0/{len(guild.members)}',
-                    ephemeral=True
-                )
-
-                n = 0
-
-                for member in guild.members:
-                    n += 1
-
-                    if n % 27 == 0:
-                        await message.edit(
-                            content=(
-                                f'Обновление ролей участников: '
-                                f'{n}/{len(guild.members)}'
-                            )
-                        )
-
-                    if member.bot:
-                        # Ботам роли Кубов не положены — снимаем, если были выданы.
-                        bot_cube_roles = [role for role in member.roles if role in cube_roles]
-
-                        if bot_cube_roles:
-                            await member.remove_roles(
-                                *bot_cube_roles,
-                                reason="Ботам роли Кубов не выдаются",
-                            )
-
-                        continue
-
-                    ozernik = self.bot.db_ensure_user(member)
-
-                    member_cube = get_cube_status(ozernik.id)
-
-                    if not member_cube:
-                        continue
-
-                    member_cube_role = await self.roles.get_cube_role(
-                        member_cube['tag_name']
-                    )
-
-                    current_cube_roles = [
-                        role
-                        for role in member.roles
-                        if role in cube_roles
-                    ]
-
-                    if (
-                            len(current_cube_roles) == 1
-                            and current_cube_roles[0] == member_cube_role
-                    ):
-                        continue
-
-                    roles_to_remove = [
-                        role
-                        for role in current_cube_roles
-                        if role != member_cube_role
-                    ]
-
-                    if roles_to_remove:
-                        await member.remove_roles(
-                            *roles_to_remove,
-                            reason="Восстановление ролей Кубов",
-                        )
-
-                    if member_cube_role not in member.roles:
-                        await member.add_roles(
-                            member_cube_role,
-                            reason="Восстановление ролей Кубов",
-                        )
-
-                await message.delete()
-                await interaction.followup.send(
-                    'Обновление ролей участников завершено.',
-                    ephemeral=True
-                )
-
-            SettingsCubesPage.restore_task = asyncio.create_task(restore_roles())
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(tb)
-            print(e)
-
-    class GoldCubeModal(discord.ui.Modal):
-        def __init__(self, navigator: Navigator):
-            super().__init__(title="Необходимая Карма связи для Золотого Куба")
-
-            self.navigator = navigator
-
-            required_days = data.cube_roles['gold_cube']['required_karma'] / 60 / 24
-
-            self.text_input = discord.ui.TextInput(
-                label="Необходимая Карма связи для Золотого Куба",
-                style=discord.TextStyle.short,
-                default=f"{required_days:g}",
-                placeholder=f"От 3, до 7.",
-                required=True,
-                max_length=1,
-            )
-
-            self.add_item(self.text_input)
-
-        async def on_submit(self, interaction: discord.Interaction):
-            if interaction.user.id not in config.OWNERS_IDS:
-                await interaction.response.send_message(
-                    "Доступно только <@512079329619083291>. Согласуйте это изменение с ним или другим разработчиком Бота если Габ исчез.",
-                    ephemeral=True,
-                )
-                return
-
-            try:
-                value = int(self.text_input.value)
-            except ValueError:
-                await interaction.response.send_message(
-                    "Введите целое число.",
-                    ephemeral=True,
-                )
-                return
-
-            if not 3 <= value <= 7:
-                await interaction.response.send_message(
-                    "Введите число от 3 до 7.",
-                    ephemeral=True,
-                )
-                return
-
-            required_karma = value * 24 * 60
-
-            cube_roles = data.cube_roles
-            cube_roles['gold_cube']['required_karma'] = required_karma
-            data.cube_roles = cube_roles
-
-            await interaction.response.defer()
-            await self.navigator.render()
-
-        async def on_error(
-                self,
-                interaction: discord.Interaction,
-                error: Exception,
-        ) -> None:
-            traceback_text = traceback.format_exc()
-
-            print(
-                f"Error:\n"
-                f"{traceback_text}"
-            )
-
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"Произошла ошибка:\n```python\n{error}\n```",
-                    ephemeral=True,
-                )
-            else:
-                await interaction.response.send_message(
-                    f"Произошла ошибка:\n```python\n{error}\n```",
-                    ephemeral=True,
-                )
-
-    def build_content(self, container: discord.Container):
-        container.add_item(
-            discord.ui.TextDisplay(
-                '*Если делать меню Сансары, то надо делать меню Кубов.\n'
-                'Я просто скопировал меню Сансары и поменял значения.\n\n'
-                'Расцветё-ё-ё-ём, на во-одоле-е.*\n'
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                self.get_cubes_roles_text()
-            )
-        )
-
-        cube_roles = data.cube_roles
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                '## О Кубах и Связи\n'
-                'Кармическая связь или просто "Связь"  — это единица опыта выдаваемая за время в голосовой канале с конкретным человеком.\n'
-                '- 1 минута это 1 ед. связи.\n'
-                '- У каждой пары юзер-юзер есть отдельный счётчик Связи.\n'
-                '- Каждый юзер имеет таблицу Связи со всеми юзерами, с которыми он когда-либо проводил время в голосовых каналах.\n'
-                'Уровень воспоминаний — это оценка количества накопленной Связи между двумя конкретными юзерами. Имеет всего четыре уровня:\n'
-               f'- Черная — {cube_roles['black_cube']['required_karma']} ед. с.\n'
-               f'- Белая — {cube_roles['white_cube']['required_karma']} ед. с. ({format_duration_minutes(cube_roles['white_cube']['required_karma'])})\n'
-               f'- Синяя — {cube_roles['blue_cube']['required_karma']} ед. с. ({format_duration_minutes(cube_roles['blue_cube']['required_karma'])})\n'
-               f'- Золотая — {cube_roles['gold_cube']['required_karma']} ед. с. ({format_duration_minutes(cube_roles['gold_cube']['required_karma'])})\n'
-                'Этап воспоминаний — это общая оценка Связи юзера с другими людьми. Он определяется количеством его связей, достигших определённого уровня. Для повышения этапа необходимо иметь как минимум десять связей соответствующего уровня или выше.\n'
-                '- Черный куб — 1 связь являются Черной или выше.\n'
-                '- Белый куб — 10 связей являются Белыми или выше.\n'
-                '- Синий куб — 10 связей являются Синими или выше.\n'
-                '- Золотой куб — 10 связей являются Золотыми.\n'
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                '## Восстановление ролей:\n'
-                '*Все роли которые подверглись изменениям будут возвращены в исходное состояние (название и цвет), также будут возвращены удаленные роли.\n'
-                'Также все пользователи которым выдана неправильная роль или не выдана роль будут обновлены.\n'
-                '-# Может занять некоторое время.*'
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.cubes_edit_roles_by_data_button
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                self.get_gold_cube_required_karma_text()
-            )
-        )
-
-        container.add_item(
-            discord.ui.TextDisplay(
-                '*Необходимое количество дней для Золотой Связи можно изменить.*'
-            )
-        )
-
-        container.add_item(
-            discord.ui.ActionRow(
-                self.gold_cube_required_karma_button
-            )
-        )
-
-    @staticmethod
-    def get_gold_cube_required_karma_text() -> str:
-        format_duration = format_duration_minutes(data.cube_roles['gold_cube']['required_karma'], True)
-        return (
-            f"## Количество дней для Золотой Связи: "
-            f"{format_duration}."
-        )
-
-    @staticmethod
-    def get_cubes_roles_text() -> str:
-        lines = [f'## Роли Кубов:']
-        for cube_role in data.cube_roles.values():
-            required_karma = cube_role['required_karma']
-            format_duration = format_duration_minutes(required_karma)
-
-            if not format_duration:
-                format_duration = '0 минут'
-
-            lines.append(
-                f'- <@&{cube_role['role_id']}>:'
-                f' `{cube_role['name']}`,'
-                f' `{required_karma}` ед. с. ({format_duration}) для 1 связи.'
-            )
-
-        return '\n'.join(lines)
 
 # ---------------------------------------------------------
 #  ||||||||||||||||||| Класс модуля |||||||||||||||||||||||
 # ---------------------------------------------------------
-
-class BindLeaderboardView(discord.ui.View):
-    """
-    Вкладки таблиц Связи (/leaderboard_cubes, ,lbc): Пары · Время · Кубы.
-
-    Постоянное меню (решение Alium): переключать может любой, кнопки работают всегда,
-    в том числе после перезапуска бота. Для этого:
-    - у кнопок фиксированные custom_id, а при запуске Cog регистрирует меню
-      через bot.add_view — Discord присылает нажатие, бот находит обработчик по custom_id;
-    - меню ничего не помнит о конкретном сообщении: вкладку берёт из custom_id
-      нажатой кнопки, цвет таблицы — у нажавшего.
-    """
-
-    CUSTOM_ID_PREFIX = 'karma:bind_tabs:'
-
-    def __init__(self, cog: "KarmaSistem", tab: str = 'pairs'):
-        super().__init__(timeout=None)
-        self.cog = cog
-
-        for key, (label, _, _) in cog.BIND_TABS.items():
-            active = key == tab
-
-            # Открытая вкладка подсвечена и неактивна.
-            button = discord.ui.Button(
-                label=label,
-                custom_id=f'{self.CUSTOM_ID_PREFIX}{key}',
-                style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
-                disabled=active,
-            )
-            button.callback = self.make_callback(key)
-            self.add_item(button)
-
-    def make_callback(self, key: str):
-        async def callback(interaction: discord.Interaction):
-            await interaction.response.edit_message(
-                embed=self.cog.build_bind_tab(key, interaction.user, interaction.guild),
-                view=BindLeaderboardView(self.cog, key),
-            )
-
-        return callback
 
 class KarmaSistem(commands.Cog):
 
@@ -3332,20 +116,20 @@ class KarmaSistem(commands.Cog):
             return True
         # Кулдаун ставится сразу, чтобы два сообщения подряд не прошли оба.
         self.delays.add(user_id)
-        asyncio.create_task(self.remove_delay(user_id, data.karma_message_delay))
+        asyncio.create_task(self.remove_delay(user_id, _state.data.karma_message_delay))
         return False
 
     # - ПРОВЕРКА БЛОКИРОВОК ВЫДАЧИ ОПЫТА -
 
     @staticmethod
     def check_blocked_channels(channel_id: int) -> bool:
-        if channel_id in data.blocked_channels_id:
+        if channel_id in _state.data.blocked_channels_id:
             return True
         return False
 
     @staticmethod
     def check_blocked_roles(roles: list[discord.Role]) -> bool:
-        blocked_roles_id = data.blocked_roles_id
+        blocked_roles_id = _state.data.blocked_roles_id
         for role in roles:
             if role.id in blocked_roles_id:
                 return True
@@ -3353,14 +137,14 @@ class KarmaSistem(commands.Cog):
 
     @staticmethod
     def check_blocked_users(user_id: int) -> bool:
-        if user_id in data.blocked_users_id:
+        if user_id in _state.data.blocked_users_id:
             return True
         return False
 
     # ------ ОБНОВЛЕНИЕ УЧАСТНИКОВ -------
 
     async def update_cube_roles(self, member: discord.Member) -> Role:
-        ozernik = db.get_user_by_discord_id(member.id)
+        ozernik = _state.db.get_user_by_discord_id(member.id)
         member_cube = get_cube_status(ozernik.id)
 
         member_cube_role = await self.roles.get_cube_role(
@@ -3378,8 +162,8 @@ class KarmaSistem(commands.Cog):
         return member_cube_role
 
     async def update_sansara_roles(self, member: discord.Member) -> Role:
-        ozernik = db.get_user_by_discord_id(member.id)
-        karma = db.get_karma(ozernik.id)
+        ozernik = _state.db.get_user_by_discord_id(member.id)
+        karma = _state.db.get_karma(ozernik.id)
         member_status = get_status(karma)
 
         member_sansara_role = await self.roles.get_sansara_role(
@@ -3403,7 +187,7 @@ class KarmaSistem(commands.Cog):
         Поздравляет с новыми уровнями: по сообщению на каждый уровень.
         only_last=True — одно сообщение о последнем достигнутом уровне (для админских правок).
         """
-        channel = self.bot.get_channel(data.karma_channel_id if data.karma_channel_id else 0)
+        channel = self.bot.get_channel(_state.data.karma_channel_id if _state.data.karma_channel_id else 0)
 
         if not channel:
             return
@@ -3451,7 +235,7 @@ class KarmaSistem(commands.Cog):
             await asyncio.sleep(0.2)
 
     async def give_bind_up_message(self, member_1: discord.Member, member_2: discord.Member, old_karma: int, new_karma: int) -> None:
-        channel = self.bot.get_channel(data.karma_channel_id if data.karma_channel_id else 0)
+        channel = self.bot.get_channel(_state.data.karma_channel_id if _state.data.karma_channel_id else 0)
 
         if not channel:
             print('no karma channel')
@@ -3466,10 +250,10 @@ class KarmaSistem(commands.Cog):
         print(new_cube['name'], old_cube['name'])
 
         if new_cube['name'] != old_cube['name']:
-            ozernik_1 = db.get_user_by_discord_id(member_1.id)
-            ozernik_2 = db.get_user_by_discord_id(member_2.id)
+            ozernik_1 = _state.db.get_user_by_discord_id(member_1.id)
+            ozernik_2 = _state.db.get_user_by_discord_id(member_2.id)
 
-            bind = db.get_karmic_bind(ozernik_1.id, ozernik_2.id)
+            bind = _state.db.get_karmic_bind(ozernik_1.id, ozernik_2.id)
 
             avatar_1 = await get_discord_avatar(member_1)
             avatar_2 = await get_discord_avatar(member_2)
@@ -3496,7 +280,7 @@ class KarmaSistem(commands.Cog):
     async def give_cube_up_message(self, member: discord.Member, old_cube: dict, new_cube: dict) -> None:
         try:
             channel = self.bot.get_channel(
-                data.karma_channel_id if data.karma_channel_id else 0
+                _state.data.karma_channel_id if _state.data.karma_channel_id else 0
             )
 
             if not channel:
@@ -3506,7 +290,7 @@ class KarmaSistem(commands.Cog):
                 return
 
             role = await self.update_cube_roles(member)
-            cube_name = get_cube_status(db.get_user_by_discord_id(member.id).id)['name']
+            cube_name = get_cube_status(_state.db.get_user_by_discord_id(member.id).id)['name']
 
             title = f"**{member.display_name} получает новый Куб!**"
             description = ''
@@ -3627,7 +411,7 @@ class KarmaSistem(commands.Cog):
         if self.check_delay(ozernik.id):
             return
 
-        old_karma, new_karma = db.add_karma(ozernik.id, 1, True)
+        old_karma, new_karma = _state.db.add_karma(ozernik.id, 1, True)
 
         await self.give_level_up_message(member, old_karma.karma, new_karma.karma)
 
@@ -3701,7 +485,7 @@ class KarmaSistem(commands.Cog):
         old_cubes = {ozernik.id: get_cube_status(ozernik.id) for _, ozernik in entries.values()}
 
         pairs = list(combinations(entries.values(), 2))
-        binds = db.add_bind_karma_many(
+        binds = _state.db.add_bind_karma_many(
             [(ozernik_1.id, ozernik_2.id) for (_, ozernik_1), (_, ozernik_2) in pairs],
             karma=1,
         )
@@ -3732,18 +516,18 @@ class KarmaSistem(commands.Cog):
         try:
             week_start = self.get_week_start()
 
-            if data.weekly_reset_week is None:
+            if _state.data.weekly_reset_week is None:
                 # Первый запуск: не сбрасываем, просто запоминаем текущую неделю.
-                data.weekly_reset_week = week_start
+                _state.data.weekly_reset_week = week_start
                 return
 
-            if data.weekly_reset_week == week_start:
+            if _state.data.weekly_reset_week == week_start:
                 return
 
             await self.announce_weekly_winners()
 
-            db.reset_weekly_karma()
-            data.weekly_reset_week = week_start
+            _state.db.reset_weekly_karma()
+            _state.data.weekly_reset_week = week_start
 
         except Exception as error:
             self.bot.print_error("weekly_countdown", error)
@@ -3755,14 +539,14 @@ class KarmaSistem(commands.Cog):
     async def announce_weekly_winners(self) -> None:
         leaderboard = [
             (ozernik, karma)
-            for ozernik, karma in db.get_top_weekly_karma()[:3]
+            for ozernik, karma in _state.db.get_top_weekly_karma()[:3]
             if karma.weekly_karma > 0
         ]
 
         if not leaderboard:
             return
 
-        channel = self.bot.get_channel(data.karma_channel_id if data.karma_channel_id else 0)
+        channel = self.bot.get_channel(_state.data.karma_channel_id if _state.data.karma_channel_id else 0)
 
         if not channel:
             return
@@ -3845,14 +629,10 @@ class KarmaSistem(commands.Cog):
             rows: list[tuple[str, str]],
             viewer: discord.Member,
             guild: discord.Guild,
-            one_line: bool = False,
     ) -> discord.Embed:
         """
-        rows — (заголовок места, текст) для первых 10 мест. Заголовок — упоминание(я).
-
-        one_line=True — каждое место одной строкой (таблицы Связи). Многострочные места
-        держат отступ символом-невидимкой «ㅤ»; на телефоне длинная строка переносится,
-        перенос начинается с края, и места сливаются в кашу. Одна строка так не ломается.
+        rows — (заголовок места, строки под ним) для первых 10 мест. Заголовок — упоминание(я).
+        Строки под заголовком начинаются с отступа-невидимки «ㅤ», места разделены пустой строкой.
         """
         embed = discord.Embed(
             title=title,
@@ -3862,26 +642,18 @@ class KarmaSistem(commands.Cog):
         if guild.icon:
             embed.set_thumbnail(url=guild.icon.url)
 
-        # Пустой подзаголовок (вкладки Связи) — список мест сразу под названием таблицы.
-        lines = [subtitle] if subtitle else []
+        lines = [subtitle]
 
         for n, (header, body) in enumerate(rows[:10], 1):
-            if one_line:
-                lines.append(f'**#{n} <:cigar:1208007437639225415> {header}** · {body}')
-            else:
-                lines.append('')
-                lines.append(f'**#{n} <:cigar:1208007437639225415> {header}**\n{body}')
-
-        if one_line and subtitle:
-            # Отделить подзаголовок от списка.
-            lines.insert(1, '')
+            lines.append('')
+            lines.append(f'**#{n} <:cigar:1208007437639225415> {header}**\n{body}')
 
         embed.description = '\n'.join(lines).replace('#1 ', '🥇 ').replace('#2 ', '🥈 ').replace('#3 ', '🥉 ')
 
         return embed
 
     def build_leaderboard(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
-        leaderboard = db.get_top_karma()
+        leaderboard = _state.db.get_top_karma()
         if not leaderboard:
             return None
 
@@ -3897,7 +669,7 @@ class KarmaSistem(commands.Cog):
         return self.build_leaderboard_embed('Таблица лидеров', '*Ментальное здоровье и рыбалка.*', rows, viewer, guild)
 
     def build_leaderboard_weekly(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
-        leaderboard = db.get_top_weekly_karma()
+        leaderboard = _state.db.get_top_weekly_karma()
         if not leaderboard:
             return None
 
@@ -3907,7 +679,7 @@ class KarmaSistem(commands.Cog):
             rows.append((
                 f'<@{ozernik.discord_id}>',
                 f'ㅤ  Уровень: `{level}`\n'
-                f'ㅤ  Карма: `{karma.weekly_karma}/{get_karma(level + 1)}`'
+                f'ㅤ  Карма за неделю: `{karma.weekly_karma}`'
             ))
 
         return self.build_leaderboard_embed(
@@ -3924,15 +696,16 @@ class KarmaSistem(commands.Cog):
         rows = [
             (
                 f'<@{row["first"].discord_id}> + <@{row["second"].discord_id}>',
-                f'{row["level_emoji"]} `{format_hours(row["bind"].bind_karma)}`',
+                f'ㅤ  Связь: {row["level_emoji"]} {row["level"]}\n'
+                f'ㅤ  Вместе: `{format_hours(row["bind"].bind_karma)}`',
             )
             for row in leaderboard[:10]
         ]
 
         return self.build_leaderboard_embed(
             'Пары',
-            '',
-            rows, viewer, guild, one_line=True,
+            '*Ты должен собрать воспоминания. Они нужны нам для нашего будущего, для полноценного эликсира.*',
+            rows, viewer, guild,
         )
 
     def build_bind_together(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
@@ -3943,16 +716,16 @@ class KarmaSistem(commands.Cog):
         rows = [
             (
                 f'<@{row["ozernik"].discord_id}>',
-                f'`{format_hours(row["total_bind_karma"])}` · '
-                f'{row["binds"]} {plural_ru(row["binds"], ("связь", "связи", "связей"))}',
+                f'ㅤ  Время: `{format_hours(row["total_bind_karma"])}`\n'
+                f'ㅤ  Связей: `{row["binds"]}`',
             )
             for row in leaderboard[:10]
         ]
 
         return self.build_leaderboard_embed(
             'Время',
-            '',
-            rows, viewer, guild, one_line=True,
+            '*Балансируй субстанцию своих прошлых жизней.*',
+            rows, viewer, guild,
         )
 
     def build_bind_colored(self, viewer: discord.Member, guild: discord.Guild) -> discord.Embed | None:
@@ -3963,15 +736,15 @@ class KarmaSistem(commands.Cog):
         rows = [
             (
                 f'<@{row["ozernik"].discord_id}>',
-                f'🟡{row["gold"]} 🔵{row["blue"]} ⚪{row["white"]}',
+                f'ㅤ  Связи: 🟡 `{row["gold"]}` · 🔵 `{row["blue"]}` · ⚪ `{row["white"]}`',
             )
             for row in leaderboard[:10]
         ]
 
         return self.build_leaderboard_embed(
             'Кубы',
-            '',
-            rows, viewer, guild, one_line=True,
+            '*Я вижу свои воспоминания... Пойманные в маленькие кубики...*',
+            rows, viewer, guild,
         )
 
     # Вкладки ,lbc: ключ → (надпись кнопки, сборщик, текст пустой вкладки).
@@ -4053,7 +826,7 @@ class KarmaSistem(commands.Cog):
             return True
 
         if name == 'leaderboard_cubes':
-            if not db.get_top_karmic_binds():
+            if not _state.db.get_top_karmic_binds():
                 await message.reply(self.BIND_EMPTY_TEXT, allowed_mentions=no_ping)
                 return True
 
@@ -4105,7 +878,7 @@ class KarmaSistem(commands.Cog):
     @app_commands.command(name='leaderboard_cubes', description='Таблицы Связи: пары, со всеми, цветные. Сокращение: ,lbc')
     @app_commands.guilds(config.GUILD_ID)
     async def leaderboard_cubes(self, interaction: Interaction):
-        if not db.get_top_karmic_binds():
+        if not _state.db.get_top_karmic_binds():
             await interaction.response.send_message(self.BIND_EMPTY_TEXT, ephemeral=True)
             return
 
@@ -4129,7 +902,7 @@ class KarmaSistem(commands.Cog):
 
     async def send_log(self, text: str) -> None:
         """Пишет в канал логов из настроек кармы, если он задан."""
-        channel = self.bot.get_channel(data.log_channel_id if data.log_channel_id else 0)
+        channel = self.bot.get_channel(_state.data.log_channel_id if _state.data.log_channel_id else 0)
 
         if not channel:
             return
@@ -4170,13 +943,13 @@ class KarmaSistem(commands.Cog):
         Асур и Дэва требуют достигнутого Человека: если карма упала ниже порога,
         статус снимается. Возвращает обновлённую карму и пометку для ответа админу.
         """
-        human_karma = data.karma_roles['human']['required_karma']
+        human_karma = _state.data.karma_roles['human']['required_karma']
 
         if karma.status is None or karma.karma >= human_karma:
             return karma, ''
 
-        status_name = data.karma_roles[karma.status]['name']
-        karma = db.set_karma_status(karma.user_id, None)
+        status_name = _state.data.karma_roles[karma.status]['name']
+        karma = _state.db.set_karma_status(karma.user_id, None)
 
         return karma, f'\nСтатус `{status_name}` снят: карма ниже Человека (`{human_karma}`).'
 
@@ -4184,11 +957,10 @@ class KarmaSistem(commands.Cog):
     def karma_change_text(action: str, member: discord.Member, old: DataTypes.Karma, new: DataTypes.Karma) -> str:
         return (
             f'**{action}:** {member.mention}\n'
-            f'Карма: `{old.karma}` → `{new.karma}` (уровень {get_level(old.karma)} → {get_level(new.karma)})\n'
-            f'Недельная: `{old.weekly_karma}` → `{new.weekly_karma}`'
+            f'Карма: `{old.karma}` → `{new.karma}` (уровень {get_level(old.karma)} → {get_level(new.karma)})'
         )
 
-    @app_commands.command(name='karma_add', description='Добавить карму участнику (и недельную).')
+    @app_commands.command(name='karma_add', description='Добавить карму участнику. Недельная карма не меняется.')
     @app_commands.guilds(config.GUILD_ID)
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(user='Участник', amount='Сколько кармы добавить')
@@ -4199,11 +971,12 @@ class KarmaSistem(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         ozernik = self.bot.db_ensure_user(user)
-        old, new = db.add_karma(ozernik.id, amount, weekly=True)
+        # Недельная карма не меняется: недельный топ — только за собственную активность.
+        old, new = _state.db.add_karma(ozernik.id, amount)
 
         await self.finish_admin_edit(interaction, user, self.karma_change_text('Карма добавлена', user, old, new), old, new)
 
-    @app_commands.command(name='karma_remove', description='Отнять карму у участника (и недельную). Ниже нуля не опускается.')
+    @app_commands.command(name='karma_remove', description='Отнять карму у участника. Ниже нуля не опускается, недельная не меняется.')
     @app_commands.guilds(config.GUILD_ID)
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(user='Участник', amount='Сколько кармы отнять')
@@ -4214,14 +987,14 @@ class KarmaSistem(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         ozernik = self.bot.db_ensure_user(user)
-        old = db.get_karma(ozernik.id)
-        new = db.remove_karma(ozernik.id, amount, weekly=True)
+        old = _state.db.get_karma(ozernik.id)
+        new = _state.db.remove_karma(ozernik.id, amount)
         new, status_note = self.drop_status_if_not_human(new)
 
         text = self.karma_change_text('Карма отнята', user, old, new) + status_note
         await self.finish_admin_edit(interaction, user, text, old, new)
 
-    @app_commands.command(name='karma_set', description='Установить карму участнику. 0 — обнулить (вместе с недельной).')
+    @app_commands.command(name='karma_set', description='Установить карму участнику. 0 — обнулить. Недельная карма не меняется.')
     @app_commands.guilds(config.GUILD_ID)
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(user='Участник', amount='Новое значение кармы')
@@ -4232,8 +1005,8 @@ class KarmaSistem(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         ozernik = self.bot.db_ensure_user(user)
-        old = db.get_karma(ozernik.id)
-        new = db.set_karma(ozernik.id, amount, weekly=True)
+        old = _state.db.get_karma(ozernik.id)
+        new = _state.db.set_karma(ozernik.id, amount)
         new, status_note = self.drop_status_if_not_human(new)
 
         action = 'Карма обнулена' if amount == 0 else 'Карма установлена'
@@ -4256,7 +1029,7 @@ class KarmaSistem(commands.Cog):
         new_status = None if status.value == 'none' else status.value
 
         ozernik = self.bot.db_ensure_user(user)
-        old = db.get_karma(ozernik.id)
+        old = _state.db.get_karma(ozernik.id)
 
         if old.status == new_status:
             await interaction.response.send_message(
@@ -4265,7 +1038,7 @@ class KarmaSistem(commands.Cog):
             )
             return
 
-        human_karma = data.karma_roles['human']['required_karma']
+        human_karma = _state.data.karma_roles['human']['required_karma']
 
         if new_status is not None and old.karma < human_karma:
             await interaction.response.send_message(
@@ -4277,7 +1050,7 @@ class KarmaSistem(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        new = db.set_karma_status(ozernik.id, new_status)
+        new = _state.db.set_karma_status(ozernik.id, new_status)
 
         await self.finish_admin_edit(
             interaction,

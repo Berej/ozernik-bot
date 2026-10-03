@@ -248,7 +248,9 @@ def test_level_texts_survive_restart(tmp_path):
     path = tmp_path / "database.db"
 
     def open_db():
-        db = utilities.KarmaDatabase.__new__(utilities.KarmaDatabase)
+        from modules.karma_sistem._db import KarmaDatabase
+
+        db = KarmaDatabase.__new__(KarmaDatabase)
         db._con = sqlite3.connect(path)
         db._con.row_factory = sqlite3.Row
         db._con.execute("PRAGMA foreign_keys = ON")
