@@ -309,3 +309,12 @@ class TestFormatting:
 def test_level_up_line(env, level, line):
     """Глагол по уровню, как в старой Сансаре: достигли → добились → доползли до."""
     assert env.karma.get_level_up_line(level) == line
+
+
+def test_level_up_description_all_bold_multiline(env):
+    """Весь текст поздравления жирным — каждая строка отдельно, пустые строки не трогаем."""
+    env.db.set_level_texts({5: "Строка один\n\nСтрока два"})
+
+    text = env.karma.build_level_up_description(5, previous_karma=450)
+
+    assert text == "**Строка один**\n\n**Строка два**\n**Вы достигли 5 уровня.**"

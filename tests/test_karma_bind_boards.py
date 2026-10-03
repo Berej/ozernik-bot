@@ -140,7 +140,14 @@ class TestEmbeds:
         embed = env.cog.build_bind_tab("pairs", viewer, env.guild)
 
         assert embed.title == "Пары"
-        assert "**🥇 <:cigar:1208007437639225415> <@1> + <@2>** · 🟡 `96 ч`" in embed.description
+        assert embed.description.startswith(
+            "*Ты должен собрать воспоминания. Они нужны нам для нашего будущего, для полноценного эликсира.*\n\n"
+        )
+        assert (
+            "**🥇 <:cigar:1208007437639225415> <@1> + <@2>**\n"
+            "ㅤ  Связь: 🟡 Золотая\n"
+            "ㅤ  Вместе: `96 ч`"
+        ) in embed.description
 
     def test_together(self, env):
         for n in range(29):
@@ -150,8 +157,12 @@ class TestEmbeds:
         embed = env.cog.build_bind_tab("together", viewer, env.guild)
 
         assert embed.title == "Время"
-        assert embed.description.startswith("**🥇")  # подзаголовка нет
-        assert "**🥇 <:cigar:1208007437639225415> <@1>** · `33 ч 50 мин` · 29 связей" in embed.description
+        assert embed.description.startswith("*Балансируй субстанцию своих прошлых жизней.*\n\n")
+        assert (
+            "**🥇 <:cigar:1208007437639225415> <@1>**\n"
+            "ㅤ  Время: `33 ч 50 мин`\n"
+            "ㅤ  Связей: `29`"
+        ) in embed.description
 
     def test_colored(self, env):
         bind(env, 1, 2, 5760)
@@ -161,22 +172,28 @@ class TestEmbeds:
         embed = env.cog.build_bind_tab("colored", viewer, env.guild)
 
         assert embed.title == "Кубы"
-        assert "**🥇 <:cigar:1208007437639225415> <@1>** · 🟡1 🔵0 ⚪1" in embed.description
+        assert embed.description.startswith("*Я вижу свои воспоминания... Пойманные в маленькие кубики...*\n\n")
+        assert (
+            "**🥇 <:cigar:1208007437639225415> <@1>**\n"
+            "ㅤ  Связи: 🟡 `1` · 🔵 `0` · ⚪ `1`"
+        ) in embed.description
 
     @pytest.mark.parametrize("tab", ["pairs", "together", "colored"])
-    def test_one_line_per_place(self, env, tab):
-        """На телефоне многострочные места с отступом-невидимкой ломаются — каждое место одной строкой."""
+    def test_places_like_karma_leaderboards(self, env, tab):
+        """Как ,lb и ,lbw: цитата, затем места через пустую строку, подробности — строками с отступом."""
         for n in range(5):
             bind(env, 1, 100 + n, 400 * (n + 1))
         viewer = env.guild.add_member(1)
 
-        lines = description(env, tab, viewer).split("\n")
-        places = [line for line in lines if "<:cigar:" in line]
+        blocks = description(env, tab, viewer).split("\n\n")
 
+        assert blocks[0].startswith("*") and blocks[0].endswith("*")  # цитата курсивом
+        places = blocks[1:]
         assert len(places) >= 2
-        assert all(line.startswith("**") and "ㅤ" not in line for line in places)
-        # Без подзаголовка: только места, подряд, без пустых строк.
-        assert lines == places
+        for place in places:
+            header, *details = place.split("\n")
+            assert header.startswith("**") and "<:cigar:" in header
+            assert details and all(line.startswith("ㅤ  ") for line in details)
 
     def test_karma_leaderboards_stay_multiline(self, env):
         env.db.set_karma(add_ozernik(env, 10), 150)

@@ -113,7 +113,7 @@ def test_cards_render_without_database(env, monkeypatch, card):
     ozernik = env.db.get_user(me)
     stats = env.karma.get_card_stats(me)
 
-    monkeypatch.setattr(env.karma, "db", None)  # любое обращение к базе упадёт
+    monkeypatch.setattr(env.karma._state, "db", None)  # любое обращение к базе упадёт
 
     if card == "rank":
         buffer = env.karma.create_rank_card(ozernik, avatar(), "User", stats)

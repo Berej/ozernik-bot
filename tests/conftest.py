@@ -285,8 +285,9 @@ def env(monkeypatch, tmp_path):
     data = utilities.DataWorker(tmp_path / "data.json", setup=copy.deepcopy(karma.data_setup))
     levels = LevelTexts(db)
 
-    monkeypatch.setattr(karma, "db", db)
-    monkeypatch.setattr(karma, "data", data)
+    # База и настройки модуля живут в _state — подменяем там, чтобы видели все файлы модуля.
+    monkeypatch.setattr(karma._state, "db", db)
+    monkeypatch.setattr(karma._state, "data", data)
     # Реальный levels.json тестового бота не трогаем.
     monkeypatch.setattr(karma, "LEGACY_LEVELS_PATH", tmp_path / "levels.json")
     monkeypatch.setattr(karma.SettingsSansaraPage, "restore_task", None)
