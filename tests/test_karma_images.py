@@ -121,3 +121,21 @@ def test_cards_render_without_database(env, monkeypatch, card):
         buffer = env.karma.create_cube_cart(ozernik, avatar(), "User", [], stats)
 
     assert_png(buffer)
+
+
+@pytest.mark.parametrize("bind_karma", [359, 1437, 1439, 5744, 5759, 1, 0])
+def test_cube_card_bind_almost_at_next_level(env, bind_karma):
+    """
+    Кейс 2026-10-04: «rank_cube raised ValueError: x1 must be greater than or equal to x0».
+    Заливка прогресса считалась от половины картинки, а плашка связи на пару пикселей уже —
+    при прогрессе >99,7% до следующего уровня связи край заливки вылезал за плашку.
+    """
+    me = add_ozernik(env, 1)
+    other = add_ozernik(env, 2)
+    if bind_karma:
+        env.db.add_bind_karma(me, other, bind_karma)
+    else:
+        env.db._ensure_karmic_bind(me, other)
+    full_binds = [{"name": "X", "bind": env.db.get_karmic_bind(me, other), "avatar": avatar()}]
+
+    assert_png(env.karma.create_cube_cart(env.db.get_user(me), avatar(), "User", full_binds))

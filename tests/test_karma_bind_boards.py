@@ -175,7 +175,8 @@ class TestEmbeds:
         assert embed.description.startswith("*Я вижу свои воспоминания... Пойманные в маленькие кубики...*\n\n")
         assert (
             "**🥇 <:cigar:1208007437639225415> <@1>**\n"
-            "ㅤ  Связи: 🟡 `1` · 🔵 `0` · ⚪ `1`"
+            "ㅤ  Связи:\n"
+            "ㅤ  🟡 `1` · 🔵 `0` · ⚪ `1`"
         ) in embed.description
 
     @pytest.mark.parametrize("tab", ["pairs", "together", "colored"])
