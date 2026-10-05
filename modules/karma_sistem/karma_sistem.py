@@ -736,7 +736,10 @@ class KarmaSistem(commands.Cog):
         rows = [
             (
                 f'<@{row["ozernik"].discord_id}>',
-                f'ㅤ  Связи: 🟡 `{row["gold"]}` · 🔵 `{row["blue"]}` · ⚪ `{row["white"]}`',
+                # Кружки отдельной строкой: на телефоне со шрифтом 100% «Связи: 🟡 · 🔵 · ⚪» в одну
+                # строку не помещалась, хвост переносился без отступа и места сливались.
+                f'ㅤ  Связи:\n'
+                f'ㅤ  🟡 `{row["gold"]}` · 🔵 `{row["blue"]}` · ⚪ `{row["white"]}`',
             )
             for row in leaderboard[:10]
         ]
