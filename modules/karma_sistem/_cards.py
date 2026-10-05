@@ -1154,8 +1154,12 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
         if bind_cube['tag_name'] != 'gold_cube':
             progress_factor = full_bind['bind'].bind_karma / next_cube['required_karma']
 
-            fill_width = bind_box_width * progress_factor
-            fill_x = full_bind['box'][0] + fill_width
+            # Длина заполненной части — от настоящей ширины плашки связи, а не от половины
+            # картинки: плашка на несколько пикселей уже (зазор между колонками). Раньше при
+            # прогрессе >99,7% правый край заливки вылезал за плашку, и Pillow падал с
+            # «x1 must be greater than or equal to x0» — карточка Кубов не рисовалась.
+            box = full_bind['box']
+            fill_x = box[0] + (box[2] - box[0]) * min(max(progress_factor, 0), 1)
 
             mask = Image.new("L", image.size, 0)
             mask_draw = ImageDraw.Draw(mask)
