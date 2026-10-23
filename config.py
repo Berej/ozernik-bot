@@ -95,10 +95,5 @@ class ConfigWorker(DataWorker):
         self._data["MODULES"][module_path] = False
         self._commit_data()
 
-    def module_remove(self, module_path: str):
-        # self.MODULES — это тот же словарь, что self._data["MODULES"] (DataWorker.__getattr__).
-        self._data["MODULES"].pop(module_path, None)
-        self._commit_data()
-
 
 config = ConfigWorker(CONFIG_PATH, CONFIG_TEMPLATE)

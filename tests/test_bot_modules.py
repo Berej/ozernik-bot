@@ -1,16 +1,23 @@
 """
-Поиск модулей при запуске (OzernikiBot.discover_modules).
+Поиск и загрузка модулей при запуске (OzernikiBot.discover_modules / load_configured_extensions).
 
-config.json помнит модули между запусками. Удалённый файл модуля раньше оставался
-в списке навсегда: бот при каждом запуске пытался его загрузить, а /modules_control
-продолжал его показывать. Теперь такие записи убираются.
+Кейс 2026-10-24: поиск шёл по относительному пути "modules" от папки запуска. Под systemd это
+была другая папка (старая копия бота) — карма, РСН и Зал славы «не находились», а тогдашняя
+чистка списка вычёркивала их из config.json. Теперь:
+- модули ищутся через систему импорта Python (pkgutil) — там же, откуда их грузит load_extension;
+- записи о не найденных модулях не удаляются, а пропускаются с предупреждением.
 """
 
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from conftest import bot_module
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeConfig:
@@ -20,64 +27,97 @@ class FakeConfig:
     def module_add(self, module_path):
         self.MODULES.setdefault(module_path, True)
 
-    def module_remove(self, module_path):
-        self.MODULES.pop(module_path, None)
-
 
 @pytest.fixture
-def modules_dir(tmp_path, monkeypatch):
-    """Папка бота tmp_path/bot с modules/: два модуля и вспомогательный файл."""
-    root = tmp_path / "bot"
-    (root / "modules" / "karma").mkdir(parents=True)
-    (root / "modules" / "karma" / "karma.py").write_text("")
-    (root / "modules" / "karma" / "_helper.py").write_text("")
-    (root / "modules" / "bridge").mkdir()
-    (root / "modules" / "bridge" / "bridge_main.py").write_text("")
-    return root
+def package(tmp_path, monkeypatch):
+    """
+    Фейковый пакет модулей со своим именем (Python кэширует импортированные пакеты —
+    одно имя на все тесты подсунуло бы второму тесту пакет первого).
+    """
+    name = f"fake_modules_{uuid.uuid4().hex[:8]}"
+    root = tmp_path / "bot" / name
+
+    def file(path: str):
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text("")
+
+    file("__init__.py")
+    file("karma/__init__.py")
+    file("karma/karma.py")
+    file("karma/_helper.py")            # вспомогательный файл — не модуль
+    file("bridge/__init__.py")
+    file("bridge/bridge_main.py")
+    file("bridge/cogs/__init__.py")     # вложенный пакет — не модуль
+    file("bridge/cogs/bridge_discord.py")
+    file("_hidden/__init__.py")         # папка на «_» — пропускается
+    file("_hidden/thing.py")
+
+    monkeypatch.syspath_prepend(str(tmp_path / "bot"))
+    return name
 
 
-def discover(monkeypatch, modules: dict[str, bool], root) -> dict[str, bool]:
+def discover(monkeypatch, name: str, modules: dict[str, bool]):
     config = FakeConfig(modules)
     monkeypatch.setattr(bot_module, "config", config)
-    bot = SimpleNamespace(modules_folder="modules", modules_root=str(root))
+    bot = SimpleNamespace(modules_folder=name)
 
     bot_module.OzernikiBot.discover_modules(bot)
 
-    return config.MODULES
+    return bot, config.MODULES
 
 
-def test_new_modules_added(modules_dir, monkeypatch):
-    assert discover(monkeypatch, {}, modules_dir) == {
-        "modules.bridge.bridge_main": True,
-        "modules.karma.karma": True,
+def test_new_modules_added(package, monkeypatch):
+    bot, modules = discover(monkeypatch, package, {})
+
+    assert modules == {f"{package}.bridge.bridge_main": True, f"{package}.karma.karma": True}
+    assert bot.found_modules == set(modules)
+
+
+def test_switches_kept_and_missing_not_removed(package, monkeypatch):
+    """Не найденный модуль остаётся в config.json (настройки не стираются), выключенный — выключен."""
+    bot, modules = discover(monkeypatch, package, {
+        f"{package}.bridge.bridge": True,          # файла нет (удалённый новый мост)
+        f"{package}.bridge.bridge_main": False,    # выключен админом
+    })
+
+    assert modules == {
+        f"{package}.bridge.bridge": True,
+        f"{package}.bridge.bridge_main": False,
+        f"{package}.karma.karma": True,
     }
+    assert f"{package}.bridge.bridge" not in bot.found_modules
 
 
-def test_removed_module_dropped_and_switches_kept(modules_dir, monkeypatch):
-    result = discover(monkeypatch, {
-        "modules.bridge.bridge": True,         # файл удалён (новый мост)
-        "modules.bridge.bridge_main": False,   # выключен админом — так и остаётся
-        "modules.karma.karma": True,
-    }, modules_dir)
-
-    assert result == {"modules.bridge.bridge_main": False, "modules.karma.karma": True}
-
-
-def test_found_from_bot_folder_not_from_launch_folder(modules_dir, tmp_path, monkeypatch):
-    """
-    Кейс 2026-10-24: systemd запускал бота из другой папки, где была старая modules/ без кармы.
-    Поиск шёл от папки запуска — карма «пропадала» и вычёркивалась из config.json.
-    """
+def test_launch_folder_does_not_matter(package, tmp_path, monkeypatch):
+    """Запуск из другой папки, где лежит своя неполная modules/, ни на что не влияет."""
     elsewhere = tmp_path / "elsewhere"
     (elsewhere / "modules" / "bridge").mkdir(parents=True)
     (elsewhere / "modules" / "bridge" / "bridge_main.py").write_text("")
     monkeypatch.chdir(elsewhere)
 
-    result = discover(monkeypatch, {"modules.karma.karma": True, "modules.bridge.bridge_main": True}, modules_dir)
+    bot, _ = discover(monkeypatch, package, {})
 
-    assert result == {"modules.karma.karma": True, "modules.bridge.bridge_main": True}
+    assert f"{package}.karma.karma" in bot.found_modules
 
 
-def test_bot_folder_is_where_bot_py_is():
-    import os
-    assert bot_module.BASE_DIR == os.path.dirname(os.path.abspath(bot_module.__file__))
+async def test_load_skips_missing_with_warning(monkeypatch, capsys):
+    monkeypatch.setattr(bot_module, "config", FakeConfig({
+        "modules.gone.gone": True,
+        "modules.off.off": False,
+        "modules.ok.ok": True,
+    }))
+    bot = SimpleNamespace(found_modules={"modules.off.off", "modules.ok.ok"}, load_extension=AsyncMock())
+
+    await bot_module.OzernikiBot.load_configured_extensions(bot)
+
+    bot.load_extension.assert_awaited_once_with("modules.ok.ok")
+    out = capsys.readouterr().out
+    assert "[gone] Модуль не найден — пропущен" in out
+    assert "[off] Cog is disabled" in out
+
+
+def test_real_modules_found():
+    """Все папки настоящих модулей — пакеты (с __init__.py), иначе поиск их не увидит."""
+    folders = [p for p in (ROOT / "modules").iterdir() if p.is_dir() and not p.name.startswith(("_", "."))]
+
+    assert all((folder / "__init__.py").exists() for folder in folders), [f.name for f in folders]
