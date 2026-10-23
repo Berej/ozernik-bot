@@ -16,6 +16,12 @@ class BridgeDiscord(commands.Cog):
         self.send_dis_message.start()
         self.do_request.start()
 
+    async def cog_unload(self):
+        # Циклы tasks.loop сами не останавливаются при выгрузке кога: без этого после
+        # перезагрузки модуля работали бы два цикла отправки.
+        self.send_dis_message.cancel()
+        self.do_request.cancel()
+
     # -------------------------
     #        ON MESSAGE
     # -------------------------
