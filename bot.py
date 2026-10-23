@@ -1,6 +1,8 @@
 # main.py
 
 import asyncio
+import importlib
+import pkgutil
 import sys
 import os
 import traceback
@@ -22,9 +24,6 @@ init()
 
 GUILD_ID = config.GUILD_ID
 MODULES_FOLDER = "modules"
-# Папка бота. Модули ищутся от неё, а не от папки запуска: systemd запускает бота
-# из своей WorkingDirectory, и относительный "modules" указывал не туда (кейс 2026-10-24).
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
@@ -46,7 +45,7 @@ class OzernikiBot(commands.Bot):
 
         self.moscow_tz = MOSCOW_TZ
         self.modules_folder = MODULES_FOLDER
-        self.modules_root = BASE_DIR
+        self.found_modules: set[str] = set()
 
         self.db = Database()
 
@@ -79,49 +78,35 @@ class OzernikiBot(commands.Bot):
 
     def discover_modules(self) -> None:
         """
-        Находит Python-модули в папке modules
-        и добавляет их в конфигурацию.
-        Модули, чьих файлов больше нет, из конфигурации убирает.
+        Находит модули-расширения в пакете modules и добавляет новые в конфигурацию.
+
+        Ищет через систему импорта Python (pkgutil), а не по пути к папке: Python ищет пакет
+        там же, откуда потом его грузит load_extension, — найденное и загружаемое совпадают.
+        Кейс 2026-10-24: поиск шёл по относительному пути "modules" от папки запуска; под
+        systemd это была другая папка (старая копия бота) — карма, РСН и Зал славы «не находились».
+
+        Модуль = файл <папка>/<имя>.py в папке-пакете (с __init__.py). Папки и файлы на «_»,
+        вложенные пакеты (bridge/cogs) — не модули.
+
+        Записи о не найденных модулях из config.json НЕ удаляются — load_configured_extensions
+        пропускает их с предупреждением: ошибка поиска не должна стирать настройки.
         """
-        found = set()
+        self.found_modules = set()
+        package = importlib.import_module(self.modules_folder)
 
-        # Путь от папки бота: относительный "modules" считался бы от папки запуска.
-        # Под systemd это была другая папка — бот «не находил» карму, РСН и Зал славы
-        # и вычёркивал их из config.json (кейс 2026-10-24).
-        modules_dir = os.path.join(self.modules_root, self.modules_folder)
-
-        for folder in sorted(os.listdir(modules_dir)):
-            folder_path = os.path.join(modules_dir, folder)
-
-            if not os.path.isdir(folder_path):
+        for folder in sorted(pkgutil.iter_modules(package.__path__), key=lambda info: info.name):
+            if not folder.ispkg or folder.name.startswith("_"):
                 continue
 
-            if folder.startswith("_"):
-                continue
+            subpackage = importlib.import_module(f"{self.modules_folder}.{folder.name}")
 
-            for filename in sorted(os.listdir(folder_path)):
-                if not filename.endswith(".py"):
+            for module in sorted(pkgutil.iter_modules(subpackage.__path__), key=lambda info: info.name):
+                if module.ispkg or module.name.startswith("_"):
                     continue
 
-                if filename.startswith("_"):
-                    continue
-
-                module_path = (
-                    f"{self.modules_folder}."
-                    f"{folder}."
-                    f"{filename[:-3]}"
-                )
-
-                found.add(module_path)
+                module_path = f"{self.modules_folder}.{folder.name}.{module.name}"
+                self.found_modules.add(module_path)
                 config.module_add(module_path)
-
-        # config.json помнит модули между запусками. Без этой чистки удалённый файл
-        # оставался бы в списке: бот при каждом запуске пытался бы его загрузить
-        # (ошибка в консоли), а /modules_control продолжал бы его показывать.
-        for module_path in list(config.MODULES):
-            if module_path.startswith(f"{self.modules_folder}.") and module_path not in found:
-                config.module_remove(module_path)
-                print(f"Модуль {module_path} больше не существует — убран из config.json.")
 
     async def load_configured_extensions(self) -> None:
         """
@@ -132,6 +117,15 @@ class OzernikiBot(commands.Bot):
             start=1,
         ):
             module_name = module_path.rsplit(".", maxsplit=1)[-1]
+
+            if module_path not in self.found_modules:
+                print(
+                    Fore.YELLOW
+                    + f"{index}. [{module_name}] Модуль не найден — пропущен "
+                      f"({module_path}; если его удалили, запись можно убрать из config.json)."
+                    + Style.RESET_ALL
+                )
+                continue
 
             if not loaded:
                 print(
