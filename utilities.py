@@ -16,6 +16,9 @@ class JsonWorker:
     def __init__(self, path: str):
         json_path = Path(path)
         super().__setattr__("json_path", json_path)
+        # Записи файла — строго по одной: пишут и основной поток, и фоновые (NewDataWorker).
+        # object.__setattr__ — потому что DataWorker перехватывает присваивание атрибутов.
+        object.__setattr__(self, "_write_lock", Lock())
         super().__setattr__("_data", self._open_data())
 
     def _open_data(self) -> dict[str, Any]:
@@ -37,10 +40,11 @@ class JsonWorker:
         """
         tmp_path = self.json_path.with_name(self.json_path.name + ".tmp")
 
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        with self._write_lock:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
 
-        os.replace(tmp_path, self.json_path)
+            os.replace(tmp_path, self.json_path)
 
     def _commit_data(self) -> None:
         self._write_json(self._data)
@@ -83,6 +87,9 @@ class NewDataWorker(JsonWorker, MutableMapping):
         # Есть правки, ещё не дошедшие до диска.
         self._dirty = False
 
+        # Запись, которая сейчас идёт в отдельном потоке (её дожидается close()).
+        self._write_future: asyncio.Future | None = None
+
         self._commit_event = asyncio.Event()
         self._commit_task = asyncio.create_task(
             self._commit_worker()
@@ -102,7 +109,10 @@ class NewDataWorker(JsonWorker, MutableMapping):
             snapshot = deepcopy(self._data)
 
             try:
-                await asyncio.to_thread(self._write_json, snapshot)
+                # shield: отмена задачи (close) не должна обрывать ожидание этой записи —
+                # поток всё равно допишет файл, а close() его дождётся.
+                self._write_future = asyncio.ensure_future(asyncio.to_thread(self._write_json, snapshot))
+                await asyncio.shield(self._write_future)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -128,6 +138,14 @@ class NewDataWorker(JsonWorker, MutableMapping):
             await self._commit_task
         except asyncio.CancelledError:
             pass
+
+        # Отмена задачи не останавливает уже запущенный поток записи — дожидаемся его.
+        # Иначе он мог бы закончить ПОСЛЕ последней записи и затереть свежие данные старыми.
+        if self._write_future is not None and not self._write_future.done():
+            try:
+                await self._write_future
+            except Exception:
+                pass
 
         # Последняя запись того, что не успело дойти до диска.
         if self._dirty:
@@ -364,6 +382,10 @@ def now_ms() -> int:
     """Текущее время в миллисекундах (Unix)."""
     return time.time_ns() // 1_000_000
 
+def current_hour() -> int:
+    """Начало текущего часа в Unix-секундах (UTC) — ключ журнала активности."""
+    return int(time.time()) // 3600 * 3600
+
 class OzernikNotfound(Exception):
     """Озёрник не найден в Discord"""
     pass
@@ -392,6 +414,62 @@ class Database:
                     telegram_id INTEGER UNIQUE,
                     telegram_bot_id INTEGER UNIQUE
                 );
+            """)
+
+            # Твинки: дополнительные Discord-аккаунты пользователя, сколько угодно.
+            # Сообщения и войс с твинка засчитываются основному аккаунту.
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS user_twinks (
+                    discord_id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    linked_at INTEGER NOT NULL DEFAULT 0,
+
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+            """)
+
+            self.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_twinks_user
+                ON user_twinks(user_id);
+            """)
+
+            # Миграция: раньше твинк был один — в колонке users.discord_twink_id.
+            # Переносим в таблицу, колонку обнуляем (она больше не используется).
+            self.execute("""
+                INSERT OR IGNORE INTO user_twinks (discord_id, user_id)
+                SELECT discord_twink_id, id
+                FROM users
+                WHERE discord_twink_id IS NOT NULL
+            """)
+            self.execute("""
+                UPDATE users
+                SET discord_twink_id = NULL
+                WHERE discord_twink_id IS NOT NULL
+            """)
+
+            # Журнал активности — общий для всех систем бота (решение Alium 2026-10-23):
+            # сколько чего человек сделал за каждый час. Из него строятся графики «по дням,
+            # неделям, месяцам» и «в какое время суток активен» для будущей общей карточки
+            # статистики. hour — начало часа в Unix-секундах UTC (сдвиг МСК целый, поэтому
+            # часы и сутки по Москве из него получаются без потерь). kind — вид активности:
+            # 'messages', 'voice_minutes'; другие системы (Зал славы, Мафия и т.п.) добавляют
+            # свои виды без изменения таблицы, поэтому CHECK на kind нет.
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS activity (
+                    user_id INTEGER NOT NULL,
+                    hour INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    amount INTEGER NOT NULL DEFAULT 0,
+
+                    PRIMARY KEY (user_id, kind, hour),
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+            """)
+
+            # Для графиков всего сервера (без конкретного человека).
+            self.execute("""
+                CREATE INDEX IF NOT EXISTS idx_activity_kind_hour
+                ON activity(kind, hour);
             """)
 
             # Таблица мостов
@@ -458,6 +536,23 @@ class Database:
         return self._con
 
     # Функции управления пользователями в БД.
+    def _discord_id_taken(self, discord_id: int, except_user_id: int | None = None) -> bool:
+        """Занят ли Discord ID: основной аккаунт или твинк другого пользователя."""
+        row = self.fetchone("""
+            SELECT 1
+            FROM users
+            WHERE discord_id = ?
+              AND id IS NOT ?
+            UNION
+            SELECT 1
+            FROM user_twinks
+            WHERE discord_id = ?
+              AND user_id IS NOT ?
+            LIMIT 1
+        """, (discord_id, except_user_id, discord_id, except_user_id))
+
+        return row is not None
+
     def add_user(
             self,
             discord_id: int,
@@ -470,13 +565,12 @@ class Database:
         Добавляет пользователя в таблицу.
 
         Создаёт новую запись пользователя с основным Discord ID и,
-        при наличии, дополнительными привязками к Telegram, Discord-твинку
-        и Telegram-боту.
+        при наличии, привязками к Telegram, Discord-твинку и Telegram-боту.
 
         :param discord_id: Discord ID основного аккаунта пользователя.
         :param alias: Прозвище пользователя в именительном падеже.
         :param telegram_id: Telegram ID пользователя, если он уже известен.
-        :param discord_twink_id: Discord ID дополнительного аккаунта пользователя.
+        :param discord_twink_id: Discord ID дополнительного аккаунта (пишется в user_twinks).
         :param telegram_bot_id: Telegram ID пользователя для отдельной привязки.
         :return: Внутренний ID созданного пользователя.
         :raises sqlite3.IntegrityError: Если один из переданных ID уже привязан.
@@ -485,43 +579,33 @@ class Database:
             raise sqlite3.IntegrityError("Основной Discord ID и Discord ID твинка не могут совпадать.")
 
         with self.transaction():
-            existing_row = self.fetchone("""
-                SELECT id
-                FROM users
-                WHERE discord_id IN (?, ?)
-                   OR discord_twink_id IN (?, ?)
-                LIMIT 1
-            """,
-                (
-                    discord_id,
-                    discord_twink_id,
-                    discord_id,
-                    discord_twink_id,
-                ),
-            )
-
-            if existing_row is not None:
-                raise sqlite3.IntegrityError("Один из переданных Discord ID уже привязан к пользователю.")
+            for checked_id in (discord_id, discord_twink_id):
+                if checked_id is not None and self._discord_id_taken(checked_id):
+                    raise sqlite3.IntegrityError("Один из переданных Discord ID уже привязан к пользователю.")
 
             row = self.fetchone("""
                 INSERT INTO users (
                     discord_id,
                     alias,
                     telegram_id,
-                    discord_twink_id,
                     telegram_bot_id
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?)
                 RETURNING id
             """,
                 (
                     discord_id,
                     alias,
                     telegram_id,
-                    discord_twink_id,
                     telegram_bot_id,
                 ),
             )
+
+            if discord_twink_id is not None:
+                self.execute("""
+                    INSERT INTO user_twinks (discord_id, user_id, linked_at)
+                    VALUES (?, ?, ?)
+                """, (discord_twink_id, row["id"], now_ms()))
 
         return row["id"]
 
@@ -550,7 +634,11 @@ class Database:
             SELECT *
             FROM users
             WHERE discord_id = ?
-               OR discord_twink_id = ?
+               OR id = (
+                   SELECT user_id
+                   FROM user_twinks
+                   WHERE discord_id = ?
+               )
         """,(discord_id, discord_id))
 
         if row is None:
@@ -611,10 +699,6 @@ class Database:
             updates.append("telegram_id = ?")
             values.append(telegram_id)
 
-        if discord_twink_id is not None:
-            updates.append("discord_twink_id = ?")
-            values.append(discord_twink_id)
-
         if telegram_bot_id is not None:
             updates.append("telegram_bot_id = ?")
             values.append(telegram_bot_id)
@@ -629,68 +713,175 @@ class Database:
             if current_row is None:
                 raise ValueError(f"Пользователь с внутренним ID {user_id} не найден.")
 
-            if not updates:
+            if not updates and discord_twink_id is None:
                 return DataTypes.Ozernik(current_row)
 
-            new_discord_id = (
-                discord_id
-                if discord_id is not None
-                else current_row["discord_id"]
-            )
-            new_discord_twink_id = (
-                discord_twink_id
-                if discord_twink_id is not None
-                else current_row["discord_twink_id"]
-            )
-            new_telegram_id = (
-                telegram_id
-                if telegram_id is not None
-                else current_row["telegram_id"]
-            )
-            new_telegram_bot_id = (
-                telegram_bot_id
-                if telegram_bot_id is not None
-                else current_row["telegram_bot_id"]
-            )
+            new_discord_id = discord_id if discord_id is not None else current_row["discord_id"]
+            new_telegram_id = telegram_id if telegram_id is not None else current_row["telegram_id"]
+            new_telegram_bot_id = telegram_bot_id if telegram_bot_id is not None else current_row["telegram_bot_id"]
 
-            if new_discord_twink_id is not None and new_discord_id == new_discord_twink_id:
+            if discord_twink_id is not None and new_discord_id == discord_twink_id:
                 raise sqlite3.IntegrityError("Основной Discord ID и Discord ID твинка не могут совпадать.")
 
             if new_telegram_id is not None and new_telegram_id == new_telegram_bot_id:
                 raise sqlite3.IntegrityError("Telegram ID и Telegram Bot ID не могут совпадать.")
 
-            existing_row = self.fetchone("""
+            for checked_id in (new_discord_id, discord_twink_id):
+                if checked_id is not None and self._discord_id_taken(checked_id, except_user_id=user_id):
+                    raise sqlite3.IntegrityError("Один из переданных ID уже привязан к другому пользователю.")
+
+            telegram_taken = self.fetchone("""
                 SELECT id
                 FROM users
                 WHERE id != ?
                   AND (
-                        discord_id IN (?, ?)
-                     OR discord_twink_id IN (?, ?)
-                     OR telegram_id IN (?, ?)
+                        telegram_id IN (?, ?)
                      OR telegram_bot_id IN (?, ?)
                   )
                 LIMIT 1
             """,(
                 user_id,
-                new_discord_id, new_discord_twink_id,
-                new_discord_id, new_discord_twink_id,
                 new_telegram_id, new_telegram_bot_id,
                 new_telegram_id, new_telegram_bot_id,
             ))
 
-            if existing_row is not None:
+            if telegram_taken is not None:
                 raise sqlite3.IntegrityError("Один из переданных ID уже привязан к другому пользователю.")
 
-            values.append(user_id)
+            if discord_twink_id is not None:
+                self.execute("""
+                    INSERT OR IGNORE INTO user_twinks (discord_id, user_id, linked_at)
+                    VALUES (?, ?, ?)
+                """, (discord_twink_id, user_id, now_ms()))
 
-            row = self.fetchone(f"""
-                UPDATE users
-                SET {", ".join(updates)}
-                WHERE id = ?
-                RETURNING *
-            """, tuple(values))
+            if updates:
+                values.append(user_id)
+                row = self.fetchone(f"""
+                    UPDATE users
+                    SET {", ".join(updates)}
+                    WHERE id = ?
+                    RETURNING *
+                """, tuple(values))
+            else:
+                row = current_row
 
         return DataTypes.Ozernik(row)
+
+    def get_twinks(self, user_id: int) -> list[int]:
+        """Discord ID твинков пользователя, в порядке привязки."""
+        rows = self.fetchall("""
+            SELECT discord_id
+            FROM user_twinks
+            WHERE user_id = ?
+            ORDER BY linked_at, discord_id
+        """, (user_id,))
+
+        return [row["discord_id"] for row in rows]
+
+    def get_twink_links(self, user_id: int) -> list[tuple[int, int]]:
+        """
+        Твинки пользователя с временем привязки.
+
+        :return: (Discord ID, когда привязан — мс; 0 у перенесённых из старой колонки) в порядке привязки.
+        """
+        rows = self.fetchall("""
+            SELECT discord_id, linked_at
+            FROM user_twinks
+            WHERE user_id = ?
+            ORDER BY linked_at, discord_id
+        """, (user_id,))
+
+        return [(row["discord_id"], row["linked_at"]) for row in rows]
+
+    def get_discord_ids(self, user_id: int) -> list[int]:
+        """Все Discord-аккаунты пользователя: основной первым, затем твинки."""
+        user = self.get_user(user_id)
+
+        if user is None:
+            return []
+
+        return [user.discord_id, *self.get_twinks(user_id)]
+
+    def is_twink(self, discord_id: int) -> bool:
+        return self.fetchone("SELECT 1 FROM user_twinks WHERE discord_id = ?", (discord_id,)) is not None
+
+    def get_all_twinks(self) -> list[tuple[int, list[int]]]:
+        """
+        Все твинки сервера, сгруппированные по владельцам.
+
+        :return: Список (Discord ID основного аккаунта, [Discord ID твинков]) —
+            владельцы в порядке Discord ID, твинки в порядке привязки.
+        """
+        rows = self.fetchall("""
+            SELECT users.discord_id AS main_id,
+                   user_twinks.discord_id AS twink_id
+            FROM user_twinks
+            JOIN users ON users.id = user_twinks.user_id
+            ORDER BY users.discord_id, user_twinks.linked_at, user_twinks.discord_id
+        """)
+
+        grouped: dict[int, list[int]] = {}
+        for row in rows:
+            grouped.setdefault(row["main_id"], []).append(row["twink_id"])
+
+        return list(grouped.items())
+
+    # Журнал активности
+
+    def add_activity_many(self, rows: list[tuple[int, int, str, int]]) -> None:
+        """
+        Прибавляет к журналу активности одной транзакцией (одна запись на диск ~15 мс).
+
+        :param rows: (внутренний ID пользователя, начало часа в Unix-секундах, вид, сколько).
+        """
+        if not rows:
+            return
+
+        with self.transaction():
+            for user_id, hour, kind, amount in rows:
+                self.execute("""
+                    INSERT INTO activity (user_id, hour, kind, amount)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id, kind, hour) DO UPDATE SET amount = amount + excluded.amount
+                """, (user_id, hour, kind, amount))
+
+    def get_activity(self, user_id: int, kind: str, since: int, until: int) -> list[tuple[int, int]]:
+        """
+        Активность по часам за период [since, until) — Unix-секунды.
+
+        :return: (начало часа, сколько) по возрастанию времени; часы без активности пропущены.
+        """
+        rows = self.fetchall("""
+            SELECT hour, amount
+            FROM activity
+            WHERE user_id = ?
+              AND kind = ?
+              AND hour >= ?
+              AND hour < ?
+            ORDER BY hour
+        """, (user_id, kind, since, until))
+
+        return [(row["hour"], row["amount"]) for row in rows]
+
+    def get_activity_by_day(self, user_id: int, kind: str, since: int, until: int, utc_offset_hours: int = 3) -> dict[str, int]:
+        """
+        Активность по дням (по умолчанию — по московским суткам) за период [since, until).
+
+        :return: {'2026-10-23': сколько, ...}; дни без активности пропущены.
+        """
+        offset = utc_offset_hours * 3600
+        rows = self.fetchall("""
+            SELECT date((hour + ?), 'unixepoch') AS day, SUM(amount) AS amount
+            FROM activity
+            WHERE user_id = ?
+              AND kind = ?
+              AND hour >= ?
+              AND hour < ?
+            GROUP BY day
+            ORDER BY day
+        """, (offset, user_id, kind, since, until))
+
+        return {row["day"]: row["amount"] for row in rows}
 
     def delete_user(self, user_id: int) -> bool:
         """

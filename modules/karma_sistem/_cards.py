@@ -7,37 +7,20 @@
 
 from __future__ import annotations
 
-import asyncio # noqa
-import inspect
+import asyncio
 import random
-import traceback # noqa
-import typing # noqa
-import ast
-import json
-import math
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-from copy import deepcopy
 from io import BytesIO
-from itertools import combinations
-from pathlib import Path # noqa
-from typing import Any # noqa
-from pprint import pformat # noqa
+from pathlib import Path
+from typing import Any
 
-import discord # noqa
-from discord import Interaction, app_commands, Role
-from discord.ext import commands, tasks
-from PIL import Image, ImageDraw, ImageFont, ImageOps # noqa
+import discord
+from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageFont import FreeTypeFont
-from discord.ui import Item, Button, View, LayoutView # noqa
 
-from config import config
 from utilities import *
 
-from typing import TYPE_CHECKING, Literal
-
-if TYPE_CHECKING:
-    from bot import OzernikiBot
+from typing import Literal
 
 from . import _state
 from ._state import *
@@ -52,14 +35,26 @@ def load_icon(path: str | Path, size: tuple[int, int]) -> Image.Image:
             Image.Resampling.LANCZOS,
         )
 
-async def get_discord_avatar(member: discord.Member) -> Image.Image:
-    avatar_bytes = await member.display_avatar.read()
+# Аватары рисуются не больше 220px. По умолчанию discord.py отдаёт 1024px —
+# лишние ~3 МБ на скачивание и ~30 мс на раскодировку каждого.
+AVATAR_FETCH_SIZE = 256
 
+
+def decode_avatar(avatar_bytes: bytes) -> Image.Image:
     with Image.open(BytesIO(avatar_bytes)) as source:
         return source.convert("RGBA").resize(
             (220, 220),
             Image.Resampling.LANCZOS,
         )
+
+
+async def get_discord_avatar(member: discord.Member) -> Image.Image:
+    avatar_bytes = await member.display_avatar.with_size(AVATAR_FETCH_SIZE).read()
+
+    # Раскодировка и сжатие — синхронный Pillow. Раньше шли прямо здесь, в основном
+    # потоке: await был только на скачивании, и на странице ,rc (11 аватаров) бот
+    # стоял до ~0,4 с — не принимал сообщения и не начислял карму. Теперь — в отдельном.
+    return await asyncio.to_thread(decode_avatar, avatar_bytes)
 
 def draw_counter(xy: tuple[int, int], nums: tuple[int, int], fill: Any, main_font: FreeTypeFont, image: Image.Image) -> tuple[int, int, int, int]:
     num1 = nums[0]
@@ -172,10 +167,11 @@ def rounded_gradient(image: Image.Image, box: tuple[int, int, int, int], radius:
         mask,
     )
 
-async def get_full_binds(member: discord.Member, bot, amount: int = 10) -> list[dict[str, Image.Image | str | DataTypes.KarmicBind]]:
-    guild = member.guild
+async def get_full_binds(member: discord.Member, bot, amount: int = 10, offset: int = 0) -> list[dict[str, Image.Image | str | DataTypes.KarmicBind]]:
+    """Связи участника для карточки Кубов: amount штук, начиная с места offset + 1 (страницы)."""
+    guild = bot.guild
     ozernik = _state.db.get_user_by_discord_id(member.id)
-    binds = _state.db.get_user_top_karmic_binds(ozernik.id)
+    binds = _state.db.get_user_top_karmic_binds(ozernik.id)[offset:]
 
     full_binds = []
 
@@ -1268,6 +1264,422 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
             )
 
     # Сохранение изображения
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+# ---------- Страницы статистики карточки Сансары: «Где пишу» / «Где сижу» ----------
+
+STATS_TOP_SIZE = 5
+
+STATS_PAGE_TITLES = {
+    'text': 'ГДЕ ПИШУ',
+    'voice': 'ГДЕ СИЖУ',
+}
+
+# Символ, которого нет в шрифте, Pillow рисует пустым «квадратиком» .notdef.
+# Эмодзи и разделители вроде «・» в названиях каналов Roboto не умеет — их выкидываем.
+_NOTDEF_MASKS: dict[tuple[str, float], tuple] = {}
+
+
+def drop_missing_glyphs(text: str, font: FreeTypeFont) -> str:
+    """Убирает символы, которых нет в шрифте, и обрезает оставшийся по краям мусор."""
+    key = (font.path, font.size)
+    if key not in _NOTDEF_MASKS:
+        mask = font.getmask(chr(0x10FFFF))
+        _NOTDEF_MASKS[key] = (mask.size, bytes(mask))
+
+    notdef = _NOTDEF_MASKS[key]
+
+    def has_glyph(char: str) -> bool:
+        if char.isspace():
+            return True
+        mask = font.getmask(char)
+        return (mask.size, bytes(mask)) != notdef
+
+    kept = ''.join(char for char in text if has_glyph(char))
+    return ' '.join(kept.split()).strip(' -_|.·•:')
+
+
+def fit_text(draw: ImageDraw.ImageDraw, text: str, font: FreeTypeFont, max_length: float) -> str:
+    """Обрезает текст с «...», чтобы он влез в max_length пикселей."""
+    if draw.textlength(text, font=font) <= max_length:
+        return text
+
+    while text:
+        text = text[:-1]
+        if draw.textlength(text.rstrip() + '...', font=font) <= max_length:
+            return text.rstrip() + '...'
+
+    return ''
+
+
+def format_minutes_short(minutes: int) -> str:
+    """Коротко для карточки: «45 мин», «3 ч 20 мин», «120 ч»."""
+    hours, minutes = divmod(minutes, 60)
+
+    if not hours:
+        return f'{minutes} мин'
+    if hours >= 100 or not minutes:
+        return f'{hours} ч'
+    return f'{hours} ч {minutes} мин'
+
+
+def get_channel_stats_page(ozernik_id: int, kind: Literal['text', 'voice'], guild) -> dict:
+    """
+    Данные страницы «Где пишу» / «Где сижу» — собирать в основном потоке (база и сервер).
+
+    Каналы и категории берутся с сервера сейчас: переименованный канал покажется под
+    новым именем, перенесённый в другую категорию — посчитается в новой. Удалённые
+    каналы не показываются: их названия уже не узнать.
+    """
+    channels = []
+    categories: dict[str, int] = {}
+
+    for channel_id, amount in _state.db.get_channel_stats(ozernik_id, kind):
+        channel = guild.get_channel(channel_id) if guild else None
+
+        if channel is None:
+            continue
+
+        channels.append((channel.name, amount))
+
+        category = getattr(channel, 'category', None)
+        category_name = category.name if category else 'Без категории'
+        categories[category_name] = categories.get(category_name, 0) + amount
+
+    top_categories = sorted(categories.items(), key=lambda item: item[1], reverse=True)
+
+    return {
+        'kind': kind,
+        'channels': channels[:STATS_TOP_SIZE],
+        'categories': top_categories[:STATS_TOP_SIZE],
+        'total': sum(amount for _, amount in channels),
+    }
+
+
+PAGE_SIZE = (900, 480)
+PAGE_HEADER_HEIGHT = 120
+PAGE_MAIN_COLOR = "#2A2C30"
+PAGE_SEP_COLOR = "#24272A"
+PAGE_SIGN_COLOR = "#8B8B8B"
+PAGE_TEXT_COLOR = "#BFBFBF"
+
+
+def draw_page_header(image: Image.Image, avatar_image: Image.Image, username: str, color: str, subtitle: str) -> None:
+    """Шапка страниц карточки: аватар, имя цветом ступени, подзаголовок."""
+    width = image.width
+    header_height = PAGE_HEADER_HEIGHT
+    draw = ImageDraw.Draw(image)
+
+    draw.rounded_rectangle((0, 0, width, header_height), radius=20, fill=PAGE_MAIN_COLOR)
+
+    avatar_size = 90
+    avatar_gap = (header_height - avatar_size) // 2
+    avatar = avatar_image.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+    mask = Image.new("L", avatar.size, 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
+    avatar.putalpha(mask)
+    image.paste(avatar, (avatar_gap, avatar_gap), avatar)
+
+    text_x = avatar_gap * 2 + avatar_size
+    name_font = ImageFont.truetype(assets.fonts['Roboto-Bold'], size=40)
+    sign_font = ImageFont.truetype(assets.fonts['Roboto'], size=22)
+
+    draw.text(
+        (text_x, avatar_gap),
+        fit_text(draw, username, name_font, width - text_x - avatar_gap),
+        font=name_font,
+        fill=color,
+        anchor='lt',
+    )
+
+    draw.text(
+        (text_x, header_height - avatar_gap),
+        fit_text(draw, subtitle, sign_font, width - text_x - avatar_gap),
+        font=sign_font,
+        fill=PAGE_SIGN_COLOR,
+        anchor='lb',
+    )
+
+
+def create_stats_card(avatar_image: Image.Image, username: str, color: str, page: dict) -> BytesIO:
+    """Картинка страницы «Где пишу» / «Где сижу»: шапка и две колонки — каналы и категории."""
+    kind = page['kind']
+    format_value = str if kind == 'text' else format_minutes_short
+
+    main_color = PAGE_MAIN_COLOR
+    sep_color = PAGE_SEP_COLOR
+    sign_color = PAGE_SIGN_COLOR
+    text_color = PAGE_TEXT_COLOR
+
+    width, height = PAGE_SIZE
+    gap = 5
+    radius = 20
+    header_height = PAGE_HEADER_HEIGHT
+
+    image = Image.new(mode="RGBA", size=(width, height), color=(0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    if page['total']:
+        total = f'{page["total"]} кармы' if kind == 'text' else format_minutes_short(page['total'])
+        subtitle = f'{STATS_PAGE_TITLES[kind]}  ·  всего {total}'
+    else:
+        subtitle = f'{STATS_PAGE_TITLES[kind]}  ·  статистика собирается с обновления бота'
+
+    draw_page_header(image, avatar_image, username, color, subtitle)
+
+    # Колонки: каналы и категории
+    column_top = header_height + gap
+    column_width = (width - gap) // 2
+    title_font = ImageFont.truetype(assets.fonts['Roboto-Bold'], size=20)
+    row_font = ImageFont.truetype(assets.fonts['Roboto-Bold'], size=24)
+    padding = 20
+    row_height = 62
+
+    columns = (
+        ('КАНАЛЫ', page['channels'], '#' if kind == 'text' else ''),
+        ('КАТЕГОРИИ', page['categories'], ''),
+    )
+
+    for n, (title, rows, prefix) in enumerate(columns):
+        x1 = n * (column_width + gap)
+        x2 = x1 + column_width if n == 0 else width
+        draw.rounded_rectangle((x1, column_top, x2, height), radius=radius, fill=main_color)
+
+        draw.text((x1 + padding, column_top + 18), title, font=title_font, fill=sign_color, anchor='lt')
+
+        if not rows:
+            draw.text(
+                ((x1 + x2) // 2, (column_top + height) // 2),
+                'Пока пусто',
+                font=row_font,
+                fill=sign_color,
+                anchor='mm',
+            )
+            continue
+
+        top_value = rows[0][1] or 1
+        y = column_top + 58
+
+        for name, amount in rows:
+            value = format_value(amount)
+            value_length = draw.textlength(value, font=row_font)
+
+            name = drop_missing_glyphs(name, row_font) or 'канал'
+            name = fit_text(draw, prefix + name, row_font, (x2 - x1) - padding * 3 - value_length)
+
+            draw.text((x1 + padding, y), name, font=row_font, fill=text_color, anchor='lt')
+            draw.text((x2 - padding, y), value, font=row_font, fill=color, anchor='rt')
+
+            # Полоска — доля от первого места
+            bar = (x1 + padding, y + 34, x2 - padding, y + 40)
+            draw.rounded_rectangle(bar, radius=3, fill=sep_color)
+            fill_x = bar[0] + (bar[2] - bar[0]) * min(max(amount / top_value, 0), 1)
+            if fill_x - bar[0] >= 6:
+                draw.rounded_rectangle((bar[0], bar[1], fill_x, bar[3]), radius=3, fill=color)
+
+            y += row_height
+
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+# ---------- Страница «Ивенты» карточки Сансары: карма от администрации ----------
+
+EVENT_AWARDS_ON_PAGE = 5
+
+
+def get_events_page(ozernik_id: int) -> dict:
+    """Данные страницы «Ивенты» — собирать в основном потоке (база)."""
+    total, count = _state.db.get_event_karma(ozernik_id)
+    # Как bot.MOSCOW_TZ: фиксированный UTC+3 (переходов времени в Москве нет с 2014).
+    # ZoneInfo('Europe/Moscow') на Windows без пакета tzdata падает — там нет базы поясов.
+    moscow = timezone(timedelta(hours=3))
+
+    awards = [
+        (
+            award['reason'],
+            award['amount'],
+            datetime.fromtimestamp(award['created_at'] / 1000, moscow).strftime('%d.%m.%Y'),
+            award['id'],
+        )
+        for award in _state.db.get_event_awards(ozernik_id, EVENT_AWARDS_ON_PAGE)
+    ]
+
+    return {'total': total, 'count': count, 'awards': awards}
+
+
+def create_events_card(avatar_image: Image.Image, username: str, color: str, page: dict) -> BytesIO:
+    """Картинка страницы «Ивенты»: сумма кармы за ивенты и последние награды с причинами."""
+    width, height = PAGE_SIZE
+    gap = 5
+    padding = 20
+
+    image = Image.new(mode="RGBA", size=(width, height), color=(0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    if page['total']:
+        subtitle = f'ИВЕНТЫ  ·  карма за ивенты: {page["total"]}  ·  наград: {page["count"]}'
+    else:
+        subtitle = 'ИВЕНТЫ  ·  наград пока нет'
+
+    draw_page_header(image, avatar_image, username, color, subtitle)
+
+    box_top = PAGE_HEADER_HEIGHT + gap
+    draw.rounded_rectangle((0, box_top, width, height), radius=20, fill=PAGE_MAIN_COLOR)
+
+    title_font = ImageFont.truetype(assets.fonts['Roboto-Bold'], size=20)
+    row_font = ImageFont.truetype(assets.fonts['Roboto-Bold'], size=24)
+    small_font = ImageFont.truetype(assets.fonts['Roboto'], size=18)
+
+    draw.text((padding, box_top + 18), 'ПОСЛЕДНИЕ НАГРАДЫ', font=title_font, fill=PAGE_SIGN_COLOR, anchor='lt')
+
+    if not page['awards']:
+        draw.text(
+            (width // 2, (box_top + height) // 2),
+            'Пока пусто',
+            font=row_font,
+            fill=PAGE_SIGN_COLOR,
+            anchor='mm',
+        )
+    else:
+        y = box_top + 56
+        for reason, amount, date, award_id in page['awards']:
+            value = f'+{amount}'
+            value_length = draw.textlength(value, font=row_font)
+
+            reason = drop_missing_glyphs(reason, row_font) or 'Ивент'
+            reason = fit_text(draw, reason, row_font, width - padding * 3 - value_length)
+
+            draw.text((padding, y), reason, font=row_font, fill=PAGE_TEXT_COLOR, anchor='lt')
+            draw.text((width - padding, y), value, font=row_font, fill=color, anchor='rt')
+            draw.text((padding, y + 30), f'{date}  ·  #{award_id}', font=small_font, fill=PAGE_SIGN_COLOR, anchor='lt')
+
+            y += 58
+
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+# ---------- Страница «Другие обличья» карточки Сансары: все аккаунты человека ----------
+
+GUISES_ON_PAGE = 8  # две колонки по четыре
+
+
+def create_guises_card(avatar_image: Image.Image, username: str, color: str, accounts: list[dict]) -> BytesIO:
+    """
+    Картинка страницы «Другие обличья»: основной аккаунт и твинки.
+
+    :param accounts: [{'name', 'avatar' (Image или None), 'main' (bool), 'since' ('23.10.2026' или '')}],
+        основной первым. Аватарки скачаны заранее — здесь только рисование.
+    """
+    width, height = PAGE_SIZE
+    gap = 5
+    padding = 20
+
+    image = Image.new(mode="RGBA", size=(width, height), color=(0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    subtitle = f'ДРУГИЕ ОБЛИЧЬЯ  ·  аккаунтов: {len(accounts)}'
+    draw_page_header(image, avatar_image, username, color, subtitle)
+
+    box_top = PAGE_HEADER_HEIGHT + gap
+    draw.rounded_rectangle((0, box_top, width, height), radius=20, fill=PAGE_MAIN_COLOR)
+
+    name_font = ImageFont.truetype(assets.fonts['Roboto-Bold'], size=26)
+    small_font = ImageFont.truetype(assets.fonts['Roboto'], size=18)
+
+    column_width = width // 2
+    row_height = 82
+    avatar_size = 58
+
+    shown = accounts[:GUISES_ON_PAGE]
+    for n, account in enumerate(shown):
+        column, row = divmod(n, 4)
+        x = column * column_width + padding
+        y = box_top + 16 + row * row_height
+
+        # Аватар (или серый кружок, если аккаунт не найти)
+        if account['avatar'] is not None:
+            avatar = account['avatar'].resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+            mask = Image.new("L", avatar.size, 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
+            avatar.putalpha(mask)
+            image.paste(avatar, (x, y), avatar)
+        else:
+            draw.ellipse((x, y, x + avatar_size, y + avatar_size), fill=PAGE_SEP_COLOR)
+
+        text_x = x + avatar_size + 16
+        max_length = column_width - (text_x - column * column_width) - padding
+
+        name = fit_text(draw, account['name'], name_font, max_length)
+        draw.text((text_x, y + 4), name, font=name_font, fill=color if account['main'] else PAGE_TEXT_COLOR, anchor='lt')
+
+        if account['main']:
+            note = 'основной аккаунт'
+        else:
+            note = f'твинк  ·  с {account["since"]}' if account['since'] else 'твинк'
+        draw.text((text_x, y + 40), note, font=small_font, fill=PAGE_SIGN_COLOR, anchor='lt')
+
+    if len(accounts) > GUISES_ON_PAGE:
+        draw.text(
+            (width - padding, height - 14),
+            f'и ещё {len(accounts) - GUISES_ON_PAGE}',
+            font=small_font,
+            fill=PAGE_SIGN_COLOR,
+            anchor='rb',
+        )
+
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+# ---------- Открытка «новый облик»: основной аккаунт и твинк друг напротив друга ----------
+
+def create_guise_postcard(main_avatar: Image.Image, twink_avatar: Image.Image, stage_tag: str) -> BytesIO:
+    """
+    Как открытка связи: случайный фон, аватары по краям, в центре — иконка ступени
+    Сансары человека (оба облика на одной ступени).
+
+    :param stage_tag: tag_name ступени или статуса (naraka, human, asur, ...).
+    """
+    image = Image.new(mode="RGBA", size=(850, 300), color=(30, 30, 30, 255))
+
+    background = Image.open(random.choice(list(assets.backgrounds.values()))).convert("RGBA")
+    background = background.resize(
+        (image.width, background.height * image.width // background.width),
+        Image.Resampling.LANCZOS,
+    )
+    image.paste(background, (0, random.randint(image.height - background.height, 0)))
+
+    # Аватары по краям
+    for avatar, at_left in ((main_avatar, True), (twink_avatar, False)):
+        avatar = avatar.copy()
+        mask = Image.new("L", avatar.size, 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, avatar.width, avatar.height), fill=255)
+        avatar.putalpha(mask)
+
+        margin = image.height // 2 - avatar.height // 2
+        x = margin if at_left else image.width - margin - avatar.width
+        image.paste(avatar, (x, margin), avatar)
+
+    # Иконка ступени (надпись на деванагари — широкая и низкая) — по центру между аватарами,
+    # с сохранением пропорций; в квадрат, как Куб у связи, она вышла бы мелкой.
+    icon = Image.open(assets.sansara[stage_tag]).convert("RGBA")
+    # Явный resize: thumbnail() только уменьшает, а исходные иконки меньше нужного.
+    scale = min(300 / icon.width, (image.height // 2) / icon.height)
+    icon = icon.resize((round(icon.width * scale), round(icon.height * scale)), Image.Resampling.LANCZOS)
+    image.paste(icon, ((image.width - icon.width) // 2, (image.height - icon.height) // 2), icon)
+
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     buffer.seek(0)

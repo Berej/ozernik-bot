@@ -4,37 +4,13 @@
 
 from __future__ import annotations
 
-import asyncio # noqa
-import inspect
-import random
-import traceback # noqa
-import typing # noqa
 import ast
-import json
-import math
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 from copy import deepcopy
-from io import BytesIO
-from itertools import combinations
-from pathlib import Path # noqa
-from typing import Any # noqa
-from pprint import pformat # noqa
 
-import discord # noqa
-from discord import Interaction, app_commands, Role
-from discord.ext import commands, tasks
-from PIL import Image, ImageDraw, ImageFont, ImageOps # noqa
-from PIL.ImageFont import FreeTypeFont
-from discord.ui import Item, Button, View, LayoutView # noqa
 
-from config import config
 from utilities import *
 
-from typing import TYPE_CHECKING, Literal
-
-if TYPE_CHECKING:
-    from bot import OzernikiBot
+from typing import Literal
 
 from . import _state
 from ._state import *
@@ -362,6 +338,24 @@ def get_level_up_line(level: int) -> str:
     if level <= 80:
         return f'Вы добились {level} уровня.'
     return f'Вы доползли до {level} уровня.'
+
+# Поздравления с особым статусом Сансары (/karma_status), решение Alium 2026-10-23.
+# Заголовок — «Имя возвышается!», ниже — строки отсюда и «Теперь вы @Статус».
+# Текст Дэвы ещё не придуман — пока её выдают молча.
+STATUS_UP_TEXTS = {
+    'asur': ('«Выше людей, но ниже богов»', 'Колесо повернулось.'),
+}
+
+
+def build_status_up_description(status: str) -> str | None:
+    """Текст поздравления со статусом (всё жирным, построчно) или None, если для статуса текста нет."""
+    lines = STATUS_UP_TEXTS.get(status)
+    if lines is None:
+        return None
+
+    role_id = _state.data.karma_roles[status]['role_id']
+    return '\n'.join(f'**{line}**' for line in (*lines, f'Теперь вы <@&{role_id}>'))
+
 
 def build_level_up_description(level: int, previous_karma: int) -> str:
     """

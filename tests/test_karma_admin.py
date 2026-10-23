@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from conftest import FakeChannel, add_ozernik, create_all_roles, make_interaction
+from conftest import FakeChannel, create_all_roles, make_interaction
 
 
 def admin(env, member_id: int = 1):
@@ -59,7 +59,8 @@ class TestKarmaEdit:
         interaction.response.defer.assert_awaited_once_with(ephemeral=True)
         assert answer(interaction) == (
             "**Карма добавлена:** <@2>\n"
-            "Карма: `0` → `150` (уровень 0 → 1)"
+            "Карма: `0` → `150` (уровень 0 → 1)\n"
+            "Причина: Ивент (награда #1)"
         )
 
     async def test_add_congratulates_once(self, env):
@@ -323,3 +324,42 @@ class TestKarmaStatus:
 )
 def test_plural_ru(env, number, word):
     assert env.karma.plural_ru(number, ("связь", "связи", "связей")) == word
+
+
+class TestStatusCongratulation:
+    """Поздравление с Асуром (решение Alium 2026-10-23); Дэве текст ещё не придуман — молча."""
+
+    @pytest.fixture
+    def channel(self, env):
+        env.data.karma_channel_id = env.karma_channel.id
+        create_all_roles(env)
+        return env.karma_channel
+
+    async def give(self, env, target, value):
+        env.db.set_karma(env.bot.db_ensure_user(target).id, env.data.karma_roles["human"]["required_karma"])
+        choice = SimpleNamespace(value=value, name=value)
+        await env.cog.karma_status.callback(env.cog, make_interaction(admin(env), env.guild), target, choice)
+
+    async def test_asur(self, env, channel):
+        target = env.guild.add_member(2)
+
+        await self.give(env, target, "asur")
+
+        embed = channel.send.call_args.kwargs["embed"]
+        asur_role = env.data.karma_roles["asur"]["role_id"]
+        assert channel.send.call_args.args[0] == "<@2>"
+        assert embed.title == "**User 2 возвышается!**"
+        assert embed.description == (
+            "**«Выше людей, но ниже богов»**\n"
+            "**Колесо повернулось.**\n"
+            f"**Теперь вы <@&{asur_role}>**"
+        )
+        assert channel.send.call_args.kwargs["allowed_mentions"].roles is False
+
+    @pytest.mark.parametrize("value", ["deva", "none"])
+    async def test_deva_and_removal_silent(self, env, channel, value):
+        target = env.guild.add_member(2)
+
+        await self.give(env, target, value)
+
+        channel.send.assert_not_awaited()

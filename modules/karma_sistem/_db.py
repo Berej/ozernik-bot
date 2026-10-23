@@ -5,7 +5,6 @@
 живёт в utilities.Database.
 """
 
-import sqlite3
 from typing import Any, Literal
 
 from utilities import Database, DataTypes, now_ms
@@ -92,6 +91,44 @@ KARMA_LEVEL_TEXTS_TABLE_SQL = """
 """
 
 
+# Статистика по каналам для страниц карточки Сансары (решение Alium 2026-10-23):
+# text — сколько кармы человек набрал в текстовом канале, voice — сколько минут провёл
+# в голосовом (на тех же условиях, что и Связь: не один, не заглушён, не AFK).
+# Ветки засчитываются родительскому каналу. Копится с появления таблицы — прошлого нет:
+# старые логи не знают каналов.
+KARMA_CHANNEL_STATS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS karma_channel_stats (
+        user_id INTEGER NOT NULL,
+        channel_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        amount INTEGER NOT NULL DEFAULT 0,
+
+        PRIMARY KEY (user_id, channel_id, kind),
+        CHECK (kind IN ('text', 'voice')),
+
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+"""
+
+
+# «Карма за ивенты» (решение Alium 2026-10-23): каждое начисление /karma_add — награда
+# с причиной. Сумма наград показывается на странице «Ивенты» карточки Сансары.
+# /karma_remove и /karma_set её не меняют — это история наград, а не часть кармы;
+# ошибочную награду админ удаляет из истории командой /karma_event_delete.
+KARMA_EVENT_AWARDS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS karma_event_awards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        amount INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        admin_discord_id INTEGER,
+        created_at INTEGER NOT NULL,
+
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+"""
+
+
 class KarmaDatabase(Database):
     """
     База кармы: общие таблицы (пользователи и т.д.) создаёт Database, свои — этот класс.
@@ -125,6 +162,16 @@ class KarmaDatabase(Database):
 
             # Логи кармической связи
             self.execute(KARMIC_BIND_LOGS_TABLE_SQL)
+
+            # Статистика по каналам
+            self.execute(KARMA_CHANNEL_STATS_TABLE_SQL)
+
+            # Карма за ивенты
+            self.execute(KARMA_EVENT_AWARDS_TABLE_SQL)
+            self.execute("""
+                CREATE INDEX IF NOT EXISTS idx_karma_event_awards_user
+                ON karma_event_awards(user_id, created_at);
+            """)
 
             # Миграция старых баз: вычистить аппендиксы (см. комментарий у констант схемы).
             # Индексы создаются после — пересборка таблицы удаляет её индексы.
@@ -216,7 +263,7 @@ class KarmaDatabase(Database):
             return None
         return DataTypes.Karma(row)
 
-    def add_karma(self, user_id: int, karma: int, weekly: bool = False) -> tuple[DataTypes.Karma, DataTypes.Karma]:
+    def add_karma(self, user_id: int, karma: int, weekly: bool = False, channel_id: int | None = None) -> tuple[DataTypes.Karma, DataTypes.Karma]:
         """
         Добавляет пользователю обычную карму. Если weekly=True, также увеличивает
         weekly_karma.
@@ -224,6 +271,8 @@ class KarmaDatabase(Database):
         :param user_id: Внутренний ID пользователя из таблицы users.
         :param karma: Количество добавляемой кармы.
         :param weekly: Учитывать ли изменение в недельной карме.
+        :param channel_id: Текстовый канал, где набрана карма, — для статистики по каналам
+            (в той же транзакции: лишний коммит на каждое сообщение стоил бы ~15 мс).
         :return: Кортеж из старого объекта и обновлённого объекта ``Karma``.
         :raises ValueError: Если karma меньше или равна нулю.
         """
@@ -245,7 +294,98 @@ class KarmaDatabase(Database):
                 RETURNING *
             """, (karma, karma if weekly else 0, now_ms(), user_id))
 
+            if channel_id is not None:
+                self._add_channel_stat(user_id, channel_id, 'text', karma)
+
         return DataTypes.Karma(old_row), DataTypes.Karma(new_row)
+
+    # Карма за ивенты
+
+    def add_event_karma(self, user_id: int, amount: int, reason: str, admin_discord_id: int | None = None) -> tuple[DataTypes.Karma, DataTypes.Karma, int]:
+        """
+        Начисление от администрации (/karma_add): карма + запись награды с причиной.
+        Недельная карма не меняется. Одной транзакцией — поэтому прямые запросы, без add_karma.
+
+        :return: (карма до, карма после, номер награды).
+        """
+        if amount <= 0:
+            raise ValueError("amount должен быть больше нуля.")
+
+        with self.transaction():
+            self.execute("INSERT INTO karma (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING", (user_id,))
+            old_row = self.fetchone("SELECT * FROM karma WHERE user_id = ?", (user_id,))
+            new_row = self.fetchone("""
+                UPDATE karma
+                SET karma = karma + ?,
+                    karma_updated_at = ?
+                WHERE user_id = ?
+                RETURNING *
+            """, (amount, now_ms(), user_id))
+            award = self.fetchone("""
+                INSERT INTO karma_event_awards (user_id, amount, reason, admin_discord_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                RETURNING id
+            """, (user_id, amount, reason, admin_discord_id, now_ms()))
+
+        return DataTypes.Karma(old_row), DataTypes.Karma(new_row), award["id"]
+
+    def get_event_awards(self, user_id: int, limit: int | None = None) -> list[dict[str, Any]]:
+        """Награды за ивенты, новые первыми."""
+        rows = self.fetchall("""
+            SELECT *
+            FROM karma_event_awards
+            WHERE user_id = ?
+            ORDER BY created_at DESC,
+                     id DESC
+            LIMIT ?
+        """, (user_id, -1 if limit is None else limit))
+
+        return [dict(row) for row in rows]
+
+    def get_event_karma(self, user_id: int) -> tuple[int, int]:
+        """:return: (сумма кармы за ивенты, число наград)."""
+        row = self.fetchone("""
+            SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+            FROM karma_event_awards
+            WHERE user_id = ?
+        """, (user_id,))
+
+        return row["total"], row["count"]
+
+    def delete_event_award(self, award_id: int) -> dict[str, Any] | None:
+        """Удаляет награду из истории (карма не меняется). :return: удалённая награда или None."""
+        with self.transaction():
+            row = self.fetchone("DELETE FROM karma_event_awards WHERE id = ? RETURNING *", (award_id,))
+
+        return dict(row) if row else None
+
+    # Статистика по каналам
+
+    def _add_channel_stat(self, user_id: int, channel_id: int, kind: Literal['text', 'voice'], amount: int) -> None:
+        """Прибавляет к статистике канала. Без своей транзакции — вызывать внутри чужой."""
+        self.execute("""
+            INSERT INTO karma_channel_stats (user_id, channel_id, kind, amount)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, channel_id, kind) DO UPDATE SET amount = amount + excluded.amount
+        """, (user_id, channel_id, kind, amount))
+
+    def get_channel_stats(self, user_id: int, kind: Literal['text', 'voice']) -> list[tuple[int, int]]:
+        """
+        Статистика человека по каналам: text — карма, voice — минуты.
+
+        :return: (ID канала, значение) от большего к меньшему.
+        """
+        rows = self.fetchall("""
+            SELECT channel_id, amount
+            FROM karma_channel_stats
+            WHERE user_id = ?
+              AND kind = ?
+              AND amount > 0
+            ORDER BY amount DESC,
+                     channel_id ASC
+        """, (user_id, kind))
+
+        return [(row['channel_id'], row['amount']) for row in rows]
 
     def remove_karma(self, user_id: int, karma: int, weekly: bool = False) -> DataTypes.Karma:
         """
@@ -312,6 +452,136 @@ class KarmaDatabase(Database):
             """, (karma, now_ms(), weekly, karma, karma, user_id))
 
         return DataTypes.Karma(row)
+
+    # Твинки
+
+    def link_twink(self, user_id: int, twink_discord_id: int) -> dict[str, int]:
+        """
+        Привязывает Discord-аккаунт как твинк пользователя user_id.
+
+        Если у аккаунта уже есть своя запись (успел набрать карму и связи), всё набранное
+        прибавляется к основному (решение Alium): карма и недельная карма складываются,
+        связи с одними и теми же людьми складываются, связь «основной ↔ твинк» пропадает.
+        Запись твинка после этого удаляется.
+
+        Всё одной транзакцией: либо перенеслось всё, либо ничего. Поэтому внутри — только
+        прямые запросы: методы вроде _ensure_karma_row делают свой коммит и разорвали бы транзакцию.
+
+        :return: Сколько перенесено: karma, weekly_karma, binds.
+        :raises ValueError: Если привязать нельзя — с объяснением для человека.
+        """
+        main = self.get_user(user_id)
+
+        if main is None:
+            raise ValueError("Основной аккаунт не найден в базе.")
+
+        if twink_discord_id == main.discord_id:
+            raise ValueError("Нельзя привязать аккаунт к самому себе.")
+
+        if self.is_twink(twink_discord_id):
+            raise ValueError("Этот аккаунт уже привязан как твинк.")
+
+        twink_row = self.fetchone("SELECT * FROM users WHERE discord_id = ?", (twink_discord_id,))
+
+        if twink_row is not None and self.get_twinks(twink_row["id"]):
+            raise ValueError("У этого аккаунта есть свои твинки — сначала их нужно отвязать.")
+
+        moved = {"karma": 0, "weekly_karma": 0, "binds": 0}
+
+        with self.transaction():
+            if twink_row is not None:
+                twink_id = twink_row["id"]
+
+                # Карма
+                self.execute("INSERT INTO karma (user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING", (user_id,))
+                twink_karma = self.fetchone("SELECT * FROM karma WHERE user_id = ?", (twink_id,))
+
+                if twink_karma is not None:
+                    moved["karma"] = twink_karma["karma"]
+                    moved["weekly_karma"] = twink_karma["weekly_karma"]
+                    self.execute("""
+                        UPDATE karma
+                        SET karma = karma + ?,
+                            weekly_karma = weekly_karma + ?,
+                            karma_updated_at = MAX(karma_updated_at, ?)
+                        WHERE user_id = ?
+                    """, (twink_karma["karma"], twink_karma["weekly_karma"], twink_karma["karma_updated_at"], user_id))
+
+                # Связи: с кем был твинк — с тем теперь основной (складываются, если связь уже была).
+                binds = self.fetchall("""
+                    SELECT *
+                    FROM karmic_bind
+                    WHERE user1_id = ? OR user2_id = ?
+                """, (twink_id, twink_id))
+
+                for bind in binds:
+                    other_id = bind["user2_id"] if bind["user1_id"] == twink_id else bind["user1_id"]
+
+                    if other_id == user_id:
+                        continue  # связь «основной ↔ твинк» — это связь с самим собой
+
+                    pair = self._normalize_pair(user_id, other_id)
+                    self.execute("""
+                        INSERT INTO karmic_bind (user1_id, user2_id, bind_karma)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(user1_id, user2_id) DO UPDATE SET bind_karma = bind_karma + excluded.bind_karma
+                    """, (*pair, bind["bind_karma"]))
+                    moved["binds"] += 1
+
+                # Статистика по каналам — складывается с основным.
+                self.execute("""
+                    INSERT INTO karma_channel_stats (user_id, channel_id, kind, amount)
+                    SELECT ?, channel_id, kind, amount
+                    FROM karma_channel_stats
+                    WHERE user_id = ?
+                    ON CONFLICT(user_id, channel_id, kind) DO UPDATE SET amount = amount + excluded.amount
+                """, (user_id, twink_id))
+
+                # Журнал активности — складывается с основным по тем же часам.
+                self.execute("""
+                    INSERT INTO activity (user_id, hour, kind, amount)
+                    SELECT ?, hour, kind, amount
+                    FROM activity
+                    WHERE user_id = ?
+                    ON CONFLICT(user_id, kind, hour) DO UPDATE SET amount = amount + excluded.amount
+                """, (user_id, twink_id))
+
+                # Награды за ивенты — основному.
+                self.execute("UPDATE karma_event_awards SET user_id = ? WHERE user_id = ?", (user_id, twink_id))
+
+                # Сообщения моста ссылаются на пользователя без каскада — переносим, иначе удаление упадёт.
+                self.execute("UPDATE messages SET user_id = ? WHERE user_id = ?", (user_id, twink_id))
+
+                # Telegram-привязки твинка — основному, если у того своих нет.
+                for column in ("telegram_id", "telegram_bot_id"):
+                    if twink_row[column] is not None and getattr(main, column) is None:
+                        self.execute(f"UPDATE users SET {column} = NULL WHERE id = ?", (twink_id,))
+                        self.execute(f"UPDATE users SET {column} = ? WHERE id = ?", (twink_row[column], user_id))
+
+                # Запись твинка (его карма, связи и логи удалятся каскадом — всё уже перенесено).
+                self.execute("DELETE FROM users WHERE id = ?", (twink_id,))
+
+            self.execute("""
+                INSERT INTO user_twinks (discord_id, user_id, linked_at)
+                VALUES (?, ?, ?)
+            """, (twink_discord_id, user_id, now_ms()))
+
+        return moved
+
+    def unlink_twink(self, twink_discord_id: int) -> int | None:
+        """
+        Отвязывает твинк. Карма, набранная за время привязки, остаётся у основного.
+
+        :return: Внутренний ID основного пользователя или None, если аккаунт не был твинком.
+        """
+        with self.transaction():
+            row = self.fetchone("""
+                DELETE FROM user_twinks
+                WHERE discord_id = ?
+                RETURNING user_id
+            """, (twink_discord_id,))
+
+        return row["user_id"] if row else None
 
     def set_karma_status(self, user_id: int, status: Literal['asur', 'deva'] | None) -> DataTypes.Karma:
         """
@@ -698,7 +968,7 @@ class KarmaDatabase(Database):
 
         return DataTypes.KarmicBind(row)
 
-    def add_bind_karma_many(self, pairs: list[tuple[int, int]], karma: int) -> list[DataTypes.KarmicBind]:
+    def add_bind_karma_many(self, pairs: list[tuple[int, int]], karma: int, channel_id: int | None = None) -> list[DataTypes.KarmicBind]:
         """
         То же, что add_bind_karma, но для многих пар одной транзакцией.
 
@@ -707,6 +977,8 @@ class KarmaDatabase(Database):
 
         :param pairs: Пары внутренних ID пользователей.
         :param karma: Сколько кармы связи добавить каждой паре.
+        :param channel_id: Голосовой канал — каждому участнику пар +karma минут
+            в статистику канала (в той же транзакции).
         :return: Обновлённые связи в том же порядке, что и pairs.
         :raises ValueError: Если в паре один и тот же пользователь.
         """
@@ -733,6 +1005,10 @@ class KarmaDatabase(Database):
                 """, (karma, *pair))
 
                 binds.append(DataTypes.KarmicBind(row))
+
+            if channel_id is not None:
+                for user_id in sorted({user_id for pair in normalized for user_id in pair}):
+                    self._add_channel_stat(user_id, channel_id, 'voice', karma)
 
         return binds
 

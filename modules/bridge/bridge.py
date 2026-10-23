@@ -1668,5 +1668,7 @@ class Telegram:
                 return
 
 async def setup(bot):
-    await bot.add_cog(Bridge(bot))
+    # Новый мост выключен (2026-10-23): не дописан, пока работает старый (bridge_main.py).
+    # Включать только вместе с выключением старого — иначе Telegram-боты конфликтуют.
+    # await bot.add_cog(Bridge(bot))
     pass

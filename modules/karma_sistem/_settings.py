@@ -4,34 +4,17 @@
 
 from __future__ import annotations
 
-import asyncio # noqa
-import inspect
-import random
-import traceback # noqa
-import typing # noqa
-import ast
-import json
+import asyncio
+import traceback
 import math
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-from copy import deepcopy
-from io import BytesIO
-from itertools import combinations
-from pathlib import Path # noqa
-from typing import Any # noqa
-from pprint import pformat # noqa
 
-import discord # noqa
-from discord import Interaction, app_commands, Role
-from discord.ext import commands, tasks
-from PIL import Image, ImageDraw, ImageFont, ImageOps # noqa
-from PIL.ImageFont import FreeTypeFont
-from discord.ui import Item, Button, View, LayoutView # noqa
+import discord
+from discord import Interaction
 
 from config import config
 from utilities import *
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from bot import OzernikiBot

@@ -374,7 +374,7 @@ class TestVoiceKarma:
         self.voice(env, *members)
         calls = []
         original = env.db.add_bind_karma_many
-        monkeypatch.setattr(env.db, "add_bind_karma_many", lambda pairs, karma: calls.append(len(pairs)) or original(pairs, karma))
+        monkeypatch.setattr(env.db, "add_bind_karma_many", lambda pairs, karma, **kwargs: calls.append(len(pairs)) or original(pairs, karma, **kwargs))
 
         await env.cog.voice_karma_check()
 
@@ -798,7 +798,8 @@ class TestCommands:
 
         await env.cog.rank_sansara.callback(env.cog, interaction)
 
-        file = interaction.response.send_message.call_args.kwargs["file"]
+        interaction.response.defer.assert_awaited_once()  # картинка может рисоваться дольше 3 секунд
+        file = interaction.followup.send.call_args.kwargs["file"]
         assert file.filename == "user1_sansara_rank.png"
 
     async def test_rank_sansara_for_other_user(self, env):
@@ -809,7 +810,7 @@ class TestCommands:
 
         await env.cog.rank_sansara.callback(env.cog, interaction, other)
 
-        assert interaction.response.send_message.call_args.kwargs["file"].filename == "user2_sansara_rank.png"
+        assert interaction.followup.send.call_args.kwargs["file"].filename == "user2_sansara_rank.png"
 
     async def test_rank_cube(self, env):
         user = env.guild.add_member(1)
@@ -888,13 +889,14 @@ def test_cog_commands(env):
     assert names == {
         "settings_karma", "rank_sansara", "rank_cube",
         "leaderboard", "leaderboard_weekly", "leaderboard_cubes",
-        "karma_add", "karma_remove", "karma_set", "karma_status",
+        "karma_add", "karma_remove", "karma_set", "karma_status", "karma_event_delete",
+        "twink_add", "twink_link", "twink_remove", "twinks", "twinks_all",
     }
 
 
 def test_admin_commands_hidden_from_non_admins(env):
     for command in env.cog.get_app_commands():
-        if command.name.startswith("karma_"):
+        if command.name.startswith("karma_") or command.name in {"twink_link", "twink_remove", "twinks_all"}:
             assert command.default_permissions.administrator is True
 
 
