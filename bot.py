@@ -22,6 +22,9 @@ init()
 
 GUILD_ID = config.GUILD_ID
 MODULES_FOLDER = "modules"
+# Папка бота. Модули ищутся от неё, а не от папки запуска: systemd запускает бота
+# из своей WorkingDirectory, и относительный "modules" указывал не туда (кейс 2026-10-24).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
@@ -43,6 +46,7 @@ class OzernikiBot(commands.Bot):
 
         self.moscow_tz = MOSCOW_TZ
         self.modules_folder = MODULES_FOLDER
+        self.modules_root = BASE_DIR
 
         self.db = Database()
 
@@ -81,8 +85,13 @@ class OzernikiBot(commands.Bot):
         """
         found = set()
 
-        for folder in sorted(os.listdir(self.modules_folder)):
-            folder_path = os.path.join(self.modules_folder, folder)
+        # Путь от папки бота: относительный "modules" считался бы от папки запуска.
+        # Под systemd это была другая папка — бот «не находил» карму, РСН и Зал славы
+        # и вычёркивал их из config.json (кейс 2026-10-24).
+        modules_dir = os.path.join(self.modules_root, self.modules_folder)
+
+        for folder in sorted(os.listdir(modules_dir)):
+            folder_path = os.path.join(modules_dir, folder)
 
             if not os.path.isdir(folder_path):
                 continue
