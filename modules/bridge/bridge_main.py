@@ -1,4 +1,12 @@
+"""
+Старый мост Discord ⇄ Telegram — включён временно (решение Alium 2026-10-23), пока Габ дописывает
+новый (modules/bridge/bridge.py, сейчас выключен). Запускает Telegram-часть и грузит Discord-часть.
+"""
+
 from discord.ext import commands
+
+from modules.bridge.cogs._old_config import config
+from modules.bridge.cogs.bridge_telegram import start_telegram_bot
 
 class BridgeMain(commands.Cog):
     def __init__(self, bot):
@@ -26,5 +34,13 @@ class BridgeMain(commands.Cog):
 
 
 async def setup(bot):
-    # await bot.add_cog(BridgeMain(bot))
-    pass
+    missing = config.missing()
+    if missing:
+        # Без настроек мост молча не работал бы — говорим прямо, чего не хватает.
+        print(
+            f"[Старый мост] Не запущен: не заданы {', '.join(missing)}. "
+            f"См. modules/bridge/cogs/_old_config.py."
+        )
+        return
+
+    await bot.add_cog(BridgeMain(bot))

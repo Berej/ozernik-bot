@@ -151,6 +151,8 @@ class FakeMember:
             url=f"https://cdn.test/{member_id}.png",
             read=AsyncMock(return_value=PNG_BYTES),
         )
+        # Настоящий Asset.with_size возвращает новый Asset; здесь — тот же, чтобы подмена read в тестах действовала.
+        self.display_avatar.with_size = MagicMock(return_value=self.display_avatar)
         self.guild_permissions = SimpleNamespace(administrator=False)
         self.top_role = FakeRole(1, "top")
 
@@ -224,6 +226,8 @@ class FakeBot:
         self.channels: dict[int, FakeChannel] = {}
         self.user = SimpleNamespace(id=1)
         self.fetch_user = AsyncMock(side_effect=lambda user_id: guild.get_member(user_id))
+        self.add_dynamic_items = MagicMock()
+        self.remove_dynamic_items = MagicMock()
 
     def get_channel(self, channel_id):
         return self.channels.get(channel_id)

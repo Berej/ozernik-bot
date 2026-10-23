@@ -1,7 +1,8 @@
 import os, re, html, discord, asyncio, random
 from discord.ext import commands, tasks
 
-from config_loader import config
+# Настройки старого моста: config_loader удалён 2026-09-01, прослойка читает нынешние config.json/.env.
+from modules.bridge.cogs._old_config import config
 from utilities import storage
 
 
@@ -320,8 +321,7 @@ class BridgeDiscord(commands.Cog):
 
 
 async def setup(bot):
-    # await bot.add_cog(BridgeDiscord(bot))
-    pass
+    await bot.add_cog(BridgeDiscord(bot))
 
 class DefaultAvatar:
     _avatars = {

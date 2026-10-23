@@ -189,6 +189,25 @@ class TestNewDataWorker:
         assert json.loads((tmp_path / "x.json").read_text(encoding="utf-8")) == {"a": "текст"}
         await worker.close()
 
+    @staticmethod
+    async def wait_for_file(path, expected, timeout=3.0):
+        """
+        Ждёт, пока фоновая запись дойдёт до файла (но не дольше timeout).
+        Фиксированный sleep(0.1) под нагрузкой (полный прогон, синхронизация OneDrive)
+        иногда не успевал — тест падал без настоящей ошибки.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            try:
+                if json.loads(path.read_text(encoding="utf-8")) == expected:
+                    return True
+            except (OSError, ValueError):
+                pass
+            if loop.time() > deadline:
+                return False
+            await asyncio.sleep(0.02)
+
     async def test_survives_write_error_and_retries(self, tmp_path, monkeypatch):
         """Раньше первая же ошибка убивала задачу-писатель, и правки молча терялись."""
         monkeypatch.setattr(utilities.NewDataWorker, "RETRY_DELAY", 0.05)
@@ -207,14 +226,13 @@ class TestNewDataWorker:
         monkeypatch.setattr(utilities.JsonWorker, "_write_json", flaky)
 
         worker["a"] = "первый"
-        await asyncio.sleep(0.3)
 
+        assert await self.wait_for_file(tmp_path / "x.json", {"a": "первый"})
+        assert calls["n"] >= 2  # первая запись упала, следующая прошла
         assert not worker._commit_task.done()  # задача жива
-        assert json.loads((tmp_path / "x.json").read_text(encoding="utf-8")) == {"a": "первый"}
 
         worker["a"] = "второй"
-        await asyncio.sleep(0.1)
-        assert json.loads((tmp_path / "x.json").read_text(encoding="utf-8")) == {"a": "второй"}
+        assert await self.wait_for_file(tmp_path / "x.json", {"a": "второй"})
         await worker.close()
 
     async def test_close_flushes_last_change(self, tmp_path):
@@ -264,3 +282,40 @@ def test_level_texts_survive_restart(tmp_path):
     db = open_db()   # бот запущен снова, в т.ч. с повторной миграцией схемы
     assert db.get_level_texts() == {1: "Первый", 10: "Десятый"}
     db._con.close()
+
+
+async def test_close_waits_for_write_in_progress(tmp_path, monkeypatch):
+    """
+    Гонка (2026-10-23): отмена фоновой задачи не останавливает уже запущенный поток записи.
+    close() писал «последнюю запись» параллельно с ним — файл портился или старые данные
+    затирали свежие. Теперь close() дожидается идущей записи, а записи идут по одной.
+    """
+    import threading
+    import time
+
+    worker = utilities.NewDataWorker(tmp_path / "x.json", setup={"a": ""})
+    await asyncio.sleep(0.05)
+
+    real_write = utilities.JsonWorker._write_json
+    slow_started = threading.Event()
+
+    def slow_write(self, data):
+        if data.get("a") == "старое":
+            slow_started.set()
+            time.sleep(0.3)  # запись «зависла» в потоке
+        real_write(self, data)
+
+    monkeypatch.setattr(utilities.JsonWorker, "_write_json", slow_write)
+
+    worker["a"] = "старое"
+    for _ in range(100):
+        if slow_started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert slow_started.is_set()
+
+    worker["a"] = "свежее"
+    await worker.close()  # посреди медленной записи старого значения
+    await asyncio.sleep(0.5)  # даём «зависшему» потоку точно закончить — он не должен затереть свежее
+
+    assert json.loads((tmp_path / "x.json").read_text(encoding="utf-8")) == {"a": "свежее"}

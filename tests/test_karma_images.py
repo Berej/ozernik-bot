@@ -139,3 +139,35 @@ def test_cube_card_bind_almost_at_next_level(env, bind_karma):
     full_binds = [{"name": "X", "bind": env.db.get_karmic_bind(me, other), "avatar": avatar()}]
 
     assert_png(env.karma.create_cube_cart(env.db.get_user(me), avatar(), "User", full_binds))
+
+
+class TestAvatarDownload:
+    """
+    Аватар: просим у Discord 256px (по умолчанию 1024 — лишнее), раскодируем в отдельном потоке.
+    Раньше раскодировка шла в основном потоке — на странице ,rc (11 аватаров) бот стоял до ~0,4 с.
+    """
+
+    async def test_asks_256px(self, env):
+        member = env.guild.add_member(1)
+
+        avatar = await env.karma.get_discord_avatar(member)
+
+        member.display_avatar.with_size.assert_called_once_with(256)
+        assert avatar.size == (220, 220)
+
+    async def test_decoded_off_main_thread(self, env, monkeypatch):
+        import threading
+        import modules.karma_sistem._cards as cards
+
+        threads = []
+        original = cards.decode_avatar
+
+        def spy(data):
+            threads.append(threading.get_ident())
+            return original(data)
+
+        monkeypatch.setattr(cards, "decode_avatar", spy)  # подменять там, где используется
+
+        await env.karma.get_discord_avatar(env.guild.add_member(1))
+
+        assert threads and threads[0] != threading.get_ident()
