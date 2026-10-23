@@ -1,4 +1,5 @@
 import asyncio, os, re
+from collections import deque
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, MessageReactionHandler, Application # noqa
 # Настройки старого моста: config_loader удалён 2026-09-01, прослойка читает нынешние config.json/.env.
@@ -8,14 +9,51 @@ from utilities import storage
 first = True
 recent = None
 
+# ID ботов моста — число в начале токена (до двоеточия). Их сообщения — это пересланное
+# из Discord, обратно не пересылаем. Фильтровать «всех ботов» нельзя: сообщения
+# анонимных админов группы Telegram подписывает ботом (GroupAnonymousBot).
+BRIDGE_BOT_IDS: set[int] = set()
+
+# Уже пересланные сообщения (чат, ID): одно сообщение — в Discord не больше одного раза.
+# Кейс 2026-10-24: после перезагрузки модуля Telegram опрашивали две пары ботов с одними
+# токенами, getUpdates отдавал одно и то же обоим — сообщение приходило в Discord дважды.
+_SEEN_LIMIT = 1000
+_seen_order: deque = deque()
+_seen: set[tuple[int, int]] = set()
+
+
+def bot_id_from_token(token: str) -> int | None:
+    head = (token or '').split(':', 1)[0]
+    return int(head) if head.isdigit() else None
+
+
+def is_bridge_bot(user) -> bool:
+    return user is not None and user.id in BRIDGE_BOT_IDS
+
+
+def first_time_seen(chat_id: int, message_id: int) -> bool:
+    """True — сообщение видим впервые (и запоминаем его); False — уже было."""
+    key = (chat_id, message_id)
+    if key in _seen:
+        return False
+
+    _seen.add(key)
+    _seen_order.append(key)
+    if len(_seen_order) > _SEEN_LIMIT:
+        _seen.discard(_seen_order.popleft())
+    return True
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE): # noqa
     global first
-    print(update.effective_chat.id)
-    if update.effective_chat.id != config.BR_TELEGRAM_CHANNEL_ID:
+    message = update.effective_message
+    if message is None or update.effective_chat.id != config.BR_TELEGRAM_CHANNEL_ID:
+        return
+    if message.from_user is None or is_bridge_bot(message.from_user):
+        return
+    if not first_time_seen(update.effective_chat.id, message.message_id):
         return
     first = True
-
-    message = update.message
 
     user = message.from_user
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -250,7 +288,9 @@ async def do_request(bot_list):
 
 async def on_message_edit(update: Update, context: ContextTypes.DEFAULT_TYPE): # noqa
     edited = update.edited_message
-    if not edited:
+    if not edited or update.effective_chat.id != config.BR_TELEGRAM_CHANNEL_ID:
+        return
+    if is_bridge_bot(edited.from_user):
         return
 
     tel_message_id = edited.message_id
@@ -265,6 +305,9 @@ async def on_message_edit(update: Update, context: ContextTypes.DEFAULT_TYPE): #
             reply_hat = link[2]
             break
 
+    if message_id is None:  # сообщение не пересылалось — править в Discord нечего
+        return
+
     storage.add_req({'way':       'discord',
                      'request':   'edit',
                      'message_id': message_id,
@@ -278,7 +321,7 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE): #
     if not reaction.new_reaction:
         return
 
-    if user.id == context.bot.id:
+    if user is None or user.id == context.bot.id or is_bridge_bot(user):
         return
 
     if update.effective_chat.id != config.BR_TELEGRAM_CHANNEL_ID:
@@ -309,30 +352,66 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE): #
         'emoji':      emoji
     })
 
-async def start_telegram_bot():
+class TelegramBridge:
+    """
+    Запущенная Telegram-часть моста: два бота и фоновые задачи. stop() останавливает всё.
+
+    Раньше остановки не было: при выгрузке модуля боты продолжали опрашивать Telegram,
+    а повторная загрузка запускала вторую пару с теми же токенами — отсюда дубли.
+    """
+
+    def __init__(self, apps: list[Application]):
+        self.apps = apps
+        self.tasks: list[asyncio.Task] = []
+
+    async def stop(self) -> None:
+        for task in self.tasks:
+            task.cancel()
+
+        for app in self.apps:
+            # Каждый шаг отдельно: незапущенный опросчик/приложение бросает ошибку — это нормально.
+            for step in (app.updater.stop, app.stop, app.shutdown):
+                try:
+                    await step()
+                except Exception: # noqa
+                    pass
+
+
+async def start_telegram_bot() -> TelegramBridge | None:
     app1 = ApplicationBuilder().token(config.TELEGRAM_TOKEN_1).connect_timeout(30).read_timeout(30).build()
     app2 = ApplicationBuilder().token(config.TELEGRAM_TOKEN_2).connect_timeout(30).read_timeout(30).build()
+
+    BRIDGE_BOT_IDS.clear()
+    BRIDGE_BOT_IDS.update(
+        bot_id for bot_id in map(bot_id_from_token, (config.TELEGRAM_TOKEN_1, config.TELEGRAM_TOKEN_2)) if bot_id
+    )
 
     app1.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE, on_message))
     app1.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, on_message_edit))
     app2.add_handler(MessageReactionHandler(handle_reaction))
 
+    bridge = TelegramBridge([app1, app2])
+
     try:
         await app1.initialize()
         await app1.start()
         await app1.updater.start_polling()
-    except Exception as e:
-        print(f'Error launching Telegram bot 2: {e}')
-        return
 
-    try:
         await app2.initialize()
         await app2.start()
         await app2.updater.start_polling(allowed_updates=["message", "edited_message", "message_reaction", "handle_reply"])
+    except asyncio.CancelledError:
+        # Модуль выгрузили во время запуска — не оставлять полузапущенных ботов.
+        await bridge.stop()
+        raise
     except Exception as e:
-        print(f'Error launching Telegram bot 1: {e}')
-        return
+        print(f'Ошибка запуска Telegram-ботов моста: {e}')
+        await bridge.stop()
+        return None
 
-    asyncio.create_task(send_tel_message([app1.bot, app2.bot]))
-    asyncio.create_task(do_request([app1.bot, app2.bot]))
+    bridge.tasks = [
+        asyncio.create_task(send_tel_message([app1.bot, app2.bot])),
+        asyncio.create_task(do_request([app1.bot, app2.bot])),
+    ]
+    return bridge
 

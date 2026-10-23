@@ -281,7 +281,6 @@ class KarmaSistem(commands.Cog):
         channel = self.bot.get_channel(_state.data.karma_channel_id if _state.data.karma_channel_id else 0)
 
         if not channel:
-            print('no karma channel')
             return
 
         if new_karma <= old_karma:
@@ -289,8 +288,6 @@ class KarmaSistem(commands.Cog):
 
         old_cube = get_cube(old_karma)
         new_cube = get_cube(new_karma)
-
-        print(new_cube['name'], old_cube['name'])
 
         if new_cube['name'] != old_cube['name']:
             ozernik_1 = _state.db.get_user_by_discord_id(member_1.id)
@@ -300,8 +297,6 @@ class KarmaSistem(commands.Cog):
 
             avatar_1, avatar_2 = await asyncio.gather(get_discord_avatar(member_1), get_discord_avatar(member_2))
 
-            print(avatar_1.size)
-            print(avatar_2.size)
 
             # Рисование — в отдельном потоке, чтобы не останавливать бота.
             postcard_bytes = await asyncio.to_thread(
