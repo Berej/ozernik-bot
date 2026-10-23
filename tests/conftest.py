@@ -278,6 +278,18 @@ class LevelTexts:
         self.db.set_level_texts({int(level): text})
 
 
+@pytest.fixture(autouse=True)
+def clear_card_caches():
+    """
+    Память на аватары и на профили ушедших — общая на весь процесс. Без очистки
+    аватар из одного теста попал бы в другой (адреса у фейковых участников одинаковые).
+    """
+    cards = sys.modules["modules.karma_sistem._cards"]
+    cards._avatar_cache.clear()
+    cards._fetched_users.clear()
+    yield
+
+
 @pytest.fixture
 def env(monkeypatch, tmp_path):
     """
