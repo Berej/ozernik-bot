@@ -24,3 +24,6 @@ modules/karma_sistem/data.json
 modules/rsn/rsn.db
 database.db
 /modules/bridge/cogs/temp/
+
+# Бэкапы баз (modules/backup) — копии данных, не в git
+backups/
