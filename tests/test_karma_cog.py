@@ -985,3 +985,20 @@ class TestJoinRoles:
         await env.cog.on_member_join(member)  # не падает
 
         assert env.db.get_user_by_discord_id(1) is not None
+
+
+@pytest.mark.parametrize("karma_channel", [True, False])
+async def test_voice_loop_does_not_flood_log(env, capsys, karma_channel):
+    """
+    Кейс 2026-10-24: голосовой цикл раз в минуту печатал «Синий Куб Синий Куб» на каждую пару
+    (а без канала кармы — «no karma channel») — отладочная печать забивала лог сервера.
+    """
+    if karma_channel:
+        env.data.karma_channel_id = env.karma_channel.id
+    a, b = env.guild.add_member(1), env.guild.add_member(2)
+    env.guild.voice_channels.append(FakeChannel(6000, members=[a, b]))
+
+    for _ in range(3):
+        await env.cog.voice_karma_check()
+
+    assert capsys.readouterr().out == ""
