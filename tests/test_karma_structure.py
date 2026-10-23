@@ -31,7 +31,7 @@ def test_extension_has_setup(env):
     assert callable(env.karma.setup)
 
 
-@pytest.mark.parametrize("helper", ["_db", "_state", "_formulas", "_cards", "_roles", "_settings", "_boards"])
+@pytest.mark.parametrize("helper", ["_db", "_state", "_formulas", "_cards", "_roles", "_settings", "_boards", "_twinks", "_card_pages"])
 def test_helper_files_exist(helper):
     assert (KARMA_DIR / f"{helper}.py").exists()
 

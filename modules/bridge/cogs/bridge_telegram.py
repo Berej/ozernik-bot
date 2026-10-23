@@ -1,7 +1,8 @@
 import asyncio, os, re
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, MessageReactionHandler, Application # noqa
-from config_loader import config
+# Настройки старого моста: config_loader удалён 2026-09-01, прослойка читает нынешние config.json/.env.
+from modules.bridge.cogs._old_config import config
 from utilities import storage
 
 first = True
@@ -41,10 +42,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE): # noqa
 
     # Profile photo:
     try:
-        photos = await context._bot.get_user_profile_photos(user.id, limit=1)
+        photos = await context.bot.get_user_profile_photos(user.id, limit=1)
         if photos.total_count > 0:
             file_id = photos.photos[0][0].file_id
-            file = await context._bot.get_file(file_id)
+            file = await context.bot.get_file(file_id)
             avatar_url = file.file_path
     except Exception as e:
         print(f"Error getting {user.username} avatar: {e}")
@@ -53,21 +54,21 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE): # noqa
     if message.photo:  # Photo
         best_photo = message.photo[-1]
         if best_photo.file_unique_id not in downloaded_ids:
-            tg_file = await context._bot.get_file(best_photo.file_id)
+            tg_file = await context.bot.get_file(best_photo.file_id)
             image_path = f"{base_dir}/temp/{tg_file.file_unique_id}.jpg"
             await tg_file.download_to_drive(image_path)
             files.append(image_path)
             downloaded_ids.add(best_photo.file_unique_id)
 
     if message.video: # Video
-        tg_file = await context._bot.get_file(message.video.file_id)
+        tg_file = await context.bot.get_file(message.video.file_id)
         video_path = f"{base_dir}/temp/{tg_file.file_unique_id}.mp4"
         await tg_file.download_to_drive(video_path)
         files.append(video_path)
 
     if message.animation: # GIF (animation)
         if message.animation.file_unique_id not in downloaded_ids:
-            tg_file = await context._bot.get_file(message.animation.file_id)
+            tg_file = await context.bot.get_file(message.animation.file_id)
             original_ext = os.path.splitext(tg_file.file_path)[1] or ".mp4"
             file_path = f"{base_dir}/temp/{tg_file.file_unique_id}{original_ext}"
             await tg_file.download_to_drive(file_path)
@@ -76,7 +77,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE): # noqa
 
     if message.sticker:
         if message.sticker.file_unique_id not in downloaded_ids:
-            tg_file = await context._bot.get_file(message.sticker.file_id)
+            tg_file = await context.bot.get_file(message.sticker.file_id)
             ext = ".tgs" if message.sticker.is_animated else ".webp"
             file_path = f"{base_dir}/temp/{message.sticker.file_unique_id}{ext}"
             await tg_file.download_to_drive(file_path)
@@ -85,20 +86,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE): # noqa
 
     if message.document: # Document (any file)
         if message.document.file_unique_id not in downloaded_ids:
-            tg_file = await context._bot.get_file(message.document.file_id)
+            tg_file = await context.bot.get_file(message.document.file_id)
             file_path = f"{base_dir}/temp/{tg_file.file_unique_id}_{message.document.file_name}"
             await tg_file.download_to_drive(file_path)
             files.append(file_path)
             downloaded_ids.add(message.document.file_unique_id)
 
     if message.voice: # Voice message
-        tg_file = await context._bot.get_file(message.voice.file_id)
+        tg_file = await context.bot.get_file(message.voice.file_id)
         voice_path = f"{base_dir}/temp/{tg_file.file_unique_id}.ogg"
         await tg_file.download_to_drive(voice_path)
         files.append(voice_path)
 
     if message.video_note: # Video circle # noqa
-        tg_file = await context._bot.get_file(message.video_note.file_id)
+        tg_file = await context.bot.get_file(message.video_note.file_id)
         vnote_path = f"{base_dir}/temp/{tg_file.file_unique_id}.mp4" # noqa
         await tg_file.download_to_drive(vnote_path)
         files.append(vnote_path)
@@ -277,7 +278,7 @@ async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE): #
     if not reaction.new_reaction:
         return
 
-    if user.id == context._bot.id:
+    if user.id == context.bot.id:
         return
 
     if update.effective_chat.id != config.BR_TELEGRAM_CHANNEL_ID:

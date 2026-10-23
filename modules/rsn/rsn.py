@@ -326,37 +326,116 @@ class RsnCog(commands.Cog):
         except Exception as e:
             print(f"[RSN] Error notifying moderators: {e}")
 
+    # ===== Твинки =====
+    # Человек со всеми своими аккаунтами — один подсудимый: личное дело, баллы и наказание
+    # ведутся на основной аккаунт, роль мута ложится на все аккаунты. Какие аккаунты чьи —
+    # знает общая база бота (users + user_twinks, привязка — в модуле кармы).
+
+    def _accounts(self, user_id: int) -> tuple[int, list[int]]:
+        """(основной аккаунт, все аккаунты человека — основной первым)."""
+        ozernik = self.bot.db.get_user_by_discord_id(user_id)
+        if ozernik is None or ozernik.discord_id is None:
+            return user_id, [user_id]
+        return ozernik.discord_id, self.bot.db.get_discord_ids(ozernik.id)
+
+    def _case_owner(self, user_id: int) -> int:
+        """
+        ID, на который ведётся личное дело (основной аккаунт). Заодно переносит на него
+        дела, заведённые на твинки до привязки.
+        """
+        main_id, account_ids = self._accounts(user_id)
+        for account_id in account_ids:
+            if account_id != main_id:
+                self.db.merge_user(account_id, main_id)
+        return main_id
+
+    def _guild_members(self, user_id: int) -> list:
+        """Все аккаунты человека, которые сейчас на сервере."""
+        guild = self.bot.get_guild(GUILD_ID)
+        if not guild:
+            return []
+        _, account_ids = self._accounts(user_id)
+        return [member for member in map(guild.get_member, account_ids) if member is not None]
+
+    def _accounts_note(self, user_id: int) -> str:
+        """Строка со всеми аккаунтами человека (пусто, если аккаунт один)."""
+        _, account_ids = self._accounts(user_id)
+        if len(account_ids) < 2:
+            return ""
+        return "\nАккаунты: " + ", ".join(f"<@{account_id}>" for account_id in account_ids)
+
+    def _mute_role(self):
+        guild = self.bot.get_guild(GUILD_ID)
+        mute_role_id = RSN_DATA.get("mute_role_id", 0)
+        return guild.get_role(mute_role_id) if guild and mute_role_id else None
+
+    async def _sync_twinks(self):
+        """
+        Дела твинков — на основной аккаунт, роль мута — на все аккаунты замученного.
+        Ловит твинки, привязанные или зашедшие на сервер уже во время мута, и перезаход.
+        """
+        for user_id in self.db.get_all_user_ids():
+            if self._accounts(user_id)[0] != user_id:
+                self._case_owner(user_id)
+
+        role = self._mute_role()
+        if not role:
+            return
+
+        for punishment in self.db.get_active_punishments("mute"):
+            for member in self._guild_members(punishment["user_id"]):
+                if role not in member.roles:
+                    try:
+                        await member.add_roles(role, reason="Мут действует на все аккаунты человека")
+                        print(f"[RSN] Mute role given to account {member.id} of muted user {punishment['user_id']}")
+                    except Exception as e:
+                        print(f"[RSN] Failed to give mute role to {member.id}: {e}")
+
+    @commands.Cog.listener("on_member_join")
+    async def _mute_on_join(self, member: discord.Member):
+        """Замученный (или его твинк) перезашёл на сервер — роль мута возвращается сразу."""
+        if member.guild.id != GUILD_ID or member.bot:
+            return
+
+        punishment = self.db.get_active_punishment(self._case_owner(member.id))
+        role = self._mute_role()
+        if not punishment or punishment["kind"] != "mute" or not role:
+            return
+
+        try:
+            await member.add_roles(role, reason="Мут ещё действует")
+        except Exception as e:
+            print(f"[RSN] Failed to give mute role on join to {member.id}: {e}")
+
     async def _remove_mute_role(self, user_id: int) -> bool:
-        """Снять роль мута с участника (best-effort). Возвращает True при успехе."""
+        """Снять роль мута со всех аккаунтов человека (best-effort). True — если ни с кем не сорвалось."""
         mute_role_id = RSN_DATA.get("mute_role_id", 0)
         if not mute_role_id:
             print("[RSN] Mute role ID is not configured")
             return False
 
-        guild = self.bot.get_guild(GUILD_ID)
-        if not guild:
-            return False
-
-        member = guild.get_member(user_id)
-        if not member:
-            print(f"[RSN] Member {user_id} not found in guild, cannot remove mute role")
-            return False
-
-        role = guild.get_role(mute_role_id)
+        role = self._mute_role()
         if not role:
             print(f"[RSN] Mute role {mute_role_id} not found on guild")
             return False
 
-        if role not in member.roles:
-            return True
-
-        try:
-            await member.remove_roles(role, reason="Срок мута истёк")
-            print(f"[RSN] Removed mute role {mute_role_id} from user {user_id}")
-            return True
-        except Exception as e:
-            print(f"[RSN] Failed to remove mute role from {user_id}: {e}")
+        members = self._guild_members(user_id)
+        if not members:
+            print(f"[RSN] Member {user_id} not found in guild, cannot remove mute role")
             return False
+
+        success = True
+        for member in members:
+            if role not in member.roles:
+                continue
+            try:
+                await member.remove_roles(role, reason="Срок мута истёк")
+                print(f"[RSN] Removed mute role {mute_role_id} from user {member.id}")
+            except Exception as e:
+                print(f"[RSN] Failed to remove mute role from {member.id}: {e}")
+                success = False
+
+        return success
 
     async def _process_expired_punishment(self, punishment: dict):
         """Обработать истёкшее наказание.
@@ -392,7 +471,7 @@ class RsnCog(commands.Cog):
             )
             await self._notify_moderators(
                 f"Бан пользователя <@{user_id}> (`{user_id}`) истёк "
-                f"(дело #{record_id}). Разбаньте вручную."
+                f"(дело #{record_id}). Разбаньте вручную.{self._accounts_note(user_id)}"
             )
         else:
             await self._send_dm(
@@ -484,13 +563,15 @@ class RsnCog(commands.Cog):
         try:
             # Если user не указан, смотрим своё дело
             target_user = user or interaction.user
-            
-            # Проверка: если это не свой аккаунт и не админ/модератор - запретить
-            if target_user.id != interaction.user.id:
+            # Дело ведётся на основной аккаунт: по твинку открывается дело основного.
+            owner_id = self._case_owner(target_user.id)
+
+            # Проверка: если это не свой аккаунт (с учётом твинков) и не админ/модератор - запретить
+            if owner_id != self._case_owner(interaction.user.id):
                 if not await self._check_permissions(interaction):
                     return
 
-            score = self.db.get_score(target_user.id)
+            score = self.db.get_score(owner_id)
             if not score or score['active'] == 0:
                 embed = discord.Embed(
                     title=f"Личное дело — {target_user.name}",
@@ -529,7 +610,7 @@ class RsnCog(commands.Cog):
             )
 
             # Список нарушений
-            records = self.db.get_user_records(target_user.id)
+            records = self.db.get_user_records(owner_id)
             if records:
                 # Использоват пагинацию при 6+ делах
                 if len(records) >= 6:
@@ -614,8 +695,9 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            self.db.set_points(user.id, points)
-            self.db.set_active(user.id, 1)
+            owner_id = self._case_owner(user.id)
+            self.db.set_points(owner_id, points)
+            self.db.set_active(owner_id, 1)
 
             embed = discord.Embed(
                 title="✓ Баллы установлены",
@@ -627,7 +709,7 @@ class RsnCog(commands.Cog):
             await self._log_action(
                 "Установка баллов",
                 f"Пользователю {user.mention} установлено **{points}** баллов",
-                user.id,
+                owner_id,
                 interaction.user.id
             )
 
@@ -662,7 +744,8 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            score = self.db.ensure_score(user.id)
+            owner_id = self._case_owner(user.id)
+            score = self.db.ensure_score(owner_id)
             new_points = score['points'] + amount
             
             # Валидация диапазона [0; 50]
@@ -679,8 +762,8 @@ class RsnCog(commands.Cog):
                 )
                 return
             
-            self.db.set_points(user.id, new_points)
-            self.db.set_active(user.id, 1)
+            self.db.set_points(owner_id, new_points)
+            self.db.set_active(owner_id, 1)
 
             embed = discord.Embed(
                 title="✓ Баллы добавлены",
@@ -692,7 +775,7 @@ class RsnCog(commands.Cog):
             await self._log_action(
                 "Добавление баллов",
                 f"{user.mention}: +{amount} (итого: {new_points})",
-                user.id,
+                owner_id,
                 interaction.user.id
             )
 
@@ -727,7 +810,8 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            score = self.db.ensure_score(user.id)
+            owner_id = self._case_owner(user.id)
+            score = self.db.ensure_score(owner_id)
             new_points = score['points'] - amount
             
             # Валидация диапазона [0; 50]
@@ -738,8 +822,8 @@ class RsnCog(commands.Cog):
                 )
                 return
             
-            self.db.set_points(user.id, new_points)
-            self.db.set_active(user.id, 1)
+            self.db.set_points(owner_id, new_points)
+            self.db.set_active(owner_id, 1)
 
             embed = discord.Embed(
                 title="✓ Баллы сняты",
@@ -751,7 +835,7 @@ class RsnCog(commands.Cog):
             await self._log_action(
                 "Снятие баллов",
                 f"{user.mention}: -{amount} (итого: {new_points})",
-                user.id,
+                owner_id,
                 interaction.user.id
             )
 
@@ -923,8 +1007,11 @@ class RsnCog(commands.Cog):
                 )
                 return
 
+            # Дело, баллы и наказание — на основной аккаунт, роль мута — на все аккаунты человека
+            owner_id = self._case_owner(user.id)
+
             # Проверка: у пользователя не должно быть активного мута
-            active_punishment = self.db.get_active_punishment(user.id)
+            active_punishment = self.db.get_active_punishment(owner_id)
             if active_punishment and active_punishment['kind'] == 'mute':
                 await interaction.response.send_message(
                     f"❌ На {user.mention} уже наложен мут.",
@@ -949,9 +1036,9 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            # Получить участника сервера (для выдачи роли мута)
-            member = interaction.guild.get_member(user.id)
-            if not member:
+            # Аккаунты человека на сервере (для выдачи роли мута)
+            members = self._guild_members(owner_id)
+            if not members:
                 await interaction.response.send_message(
                     f"❌ {user.mention} не найден на сервере.",
                     ephemeral=True
@@ -984,7 +1071,7 @@ class RsnCog(commands.Cog):
                 return
 
             # Гарантировать запись о пользователе
-            score = self.db.ensure_score(user.id)
+            score = self.db.ensure_score(owner_id)
             current_points = score['points']
 
             # Определить множитель по ТЕКУЩИМ баллам (перед списанием)
@@ -997,12 +1084,17 @@ class RsnCog(commands.Cog):
             expires_at = int(time.time()) + (actual_minutes * 60)
             print(f"[RSN] Mute calculation: duration={total_minutes}m, multiplier={multiplier}, actual={actual_minutes}m, expires_at={expires_at}")
 
-            # Выдать роль мута (реальная модерация)
-            try:
-                await member.add_roles(mute_role, reason=reason)
-                print(f"[RSN] Assigned mute role {mute_role_id} to user {user.id}")
-            except Exception:
-                print(f"[RSN] Failed to assign mute role to {user.id}: {traceback.format_exc()}")
+            # Выдать роль мута всем аккаунтам (реальная модерация)
+            muted = 0
+            for member in members:
+                try:
+                    await member.add_roles(mute_role, reason=reason)
+                    muted += 1
+                    print(f"[RSN] Assigned mute role {mute_role_id} to user {member.id}")
+                except Exception:
+                    print(f"[RSN] Failed to assign mute role to {member.id}: {traceback.format_exc()}")
+
+            if not muted:
                 await interaction.response.send_message(
                     "❌ Не удалось выдать роль мута. Проверьте права бота.",
                     ephemeral=True
@@ -1013,12 +1105,12 @@ class RsnCog(commands.Cog):
             new_points = current_points - points
             if new_points < 0:
                 new_points = 0
-            self.db.set_points(user.id, new_points)
-            self.db.set_active(user.id, 1)
+            self.db.set_points(owner_id, new_points)
+            self.db.set_active(owner_id, 1)
 
             # Создать запись
             record_id = self.db.create_record(
-                user_id=user.id,
+                user_id=owner_id,
                 kind="mute",
                 reason=reason,
                 duration_hours=actual_duration,
@@ -1031,7 +1123,7 @@ class RsnCog(commands.Cog):
             if new_points <= ban_trigger:
                 # Перманентное наказание (expires_at = None)
                 self.db.create_or_update_punishment(
-                    user_id=user.id,
+                    user_id=owner_id,
                     kind="mute",
                     expires_at=None,
                     record_id=record_id
@@ -1054,17 +1146,18 @@ class RsnCog(commands.Cog):
             else:
                 # Обычный таймер мута
                 self.db.create_or_update_punishment(
-                    user_id=user.id,
+                    user_id=owner_id,
                     kind="mute",
                     expires_at=expires_at,
                     record_id=record_id
                 )
-                print(f"[RSN] Created mute punishment for user {user.id}: expires_at={expires_at}")
+                print(f"[RSN] Created mute punishment for user {owner_id}: expires_at={expires_at}")
 
             embed = discord.Embed(
                 title="✓ Мут выдан",
                 description=f"**Дело #{record_id}**\n{user.mention}: **{format_duration(actual_duration)}** (x{multiplier})\n"
-                          f"Причина: {reason}\nБаллы: {current_points} → {new_points}",
+                          f"Причина: {reason}\nБаллы: {current_points} → {new_points}"
+                          f"{self._accounts_note(owner_id)}",
                 color=0x2F3136
             )
             await interaction.response.send_message(embed=embed, ephemeral=False)
@@ -1072,14 +1165,14 @@ class RsnCog(commands.Cog):
             await self._log_action(
                 "Выдача мута",
                 f"**Дело #{record_id}** | {user.mention}: {reason}\nДлит: {format_duration(actual_duration)} "
-                f"(x{multiplier})\nБаллы: {current_points} → {new_points}",
-                user.id,
+                f"(x{multiplier})\nБаллы: {current_points} → {new_points}{self._accounts_note(owner_id)}",
+                owner_id,
                 interaction.user.id
             )
 
-            # Отправить ЛС пользователю (best-effort)
+            # Отправить ЛС пользователю (best-effort) — на основной аккаунт
             try:
-                dm_user = await self.bot.fetch_user(user.id)
+                dm_user = await self.bot.fetch_user(owner_id)
                 dm = await dm_user.create_dm()
                 await dm.send(
                     f"⚠️ Вам выдан мут на сервере.\n"
@@ -1113,8 +1206,10 @@ class RsnCog(commands.Cog):
             if not await self._check_permissions(interaction):
                 return
 
+            owner_id = self._case_owner(user.id)
+
             # Получить активное наказание
-            punishment = self.db.get_active_punishment(user.id)
+            punishment = self.db.get_active_punishment(owner_id)
             if not punishment:
                 await interaction.response.send_message(
                     f"❌ У {user.mention} нет активного мута.",
@@ -1122,11 +1217,12 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            # Снять роль мута (best-effort)
-            removed = await self._remove_mute_role(user.id)
+            # Удалить из активных наказаний (баллы НЕ меняются) — до снятия роли,
+            # чтобы синхронизация твинков не вернула роль обратно
+            self.db.delete_active_punishment(owner_id)
 
-            # Удалить из активных наказаний (баллы НЕ меняются)
-            self.db.delete_active_punishment(user.id)
+            # Снять роль мута со всех аккаунтов (best-effort)
+            removed = await self._remove_mute_role(owner_id)
 
             embed = discord.Embed(
                 title="✓ Мут снят",
@@ -1139,13 +1235,13 @@ class RsnCog(commands.Cog):
                 "Снятие мута",
                 f"{user.mention} освобожден"
                 + ("" if removed else " (роль мута не была снята)"),
-                user.id,
+                owner_id,
                 interaction.user.id
             )
 
             # Отправить ЛС пользователю (best-effort)
             try:
-                dm_user = await self.bot.fetch_user(user.id)
+                dm_user = await self.bot.fetch_user(owner_id)
                 dm = await dm_user.create_dm()
                 await dm.send(
                     f"✓ Ваш мут на сервере был снят."
@@ -1176,7 +1272,8 @@ class RsnCog(commands.Cog):
             if not await self._check_permissions(interaction):
                 return
 
-            punishment = self.db.get_active_punishment(user.id)
+            owner_id = self._case_owner(user.id)
+            punishment = self.db.get_active_punishment(owner_id)
             if not punishment or punishment['kind'] != 'ban':
                 await interaction.response.send_message(
                     f"❌ У {user.mention} нет активного бана.",
@@ -1184,10 +1281,10 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            self.db.delete_active_punishment(user.id)
+            self.db.delete_active_punishment(owner_id)
 
             if reset_points:
-                self.db.set_points(user.id, RESET_POINTS_ON_RETURN)
+                self.db.set_points(owner_id, RESET_POINTS_ON_RETURN)
 
             description = f"{user.mention}: освобождён"
             if reset_points:
@@ -1202,13 +1299,13 @@ class RsnCog(commands.Cog):
 
             await self._log_action(
                 "Досрочное снятие бана",
-                f"{user.mention} освобождён",
-                user.id,
+                f"{user.mention} освобождён{self._accounts_note(owner_id)}",
+                owner_id,
                 interaction.user.id
             )
 
             await self._send_dm(
-                user.id,
+                owner_id,
                 "✓ Ваш бан на сервере был снят."
             )
 
@@ -1247,8 +1344,11 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            # Преобразовать строку ID в число для БД
-            user_id_int = int(user_id)
+            # Преобразовать строку ID в число для БД; дело — на основной аккаунт человека
+            user_id_int = self._case_owner(int(user_id))
+            accounts_note = self._accounts_note(user_id_int)
+            if accounts_note:
+                accounts_note += "\n**Забаньте все аккаунты.**"
 
             # Валидация времени наказания (минуты/часы, только положительные)
             # duration = None означает перманентное наказание
@@ -1293,7 +1393,7 @@ class RsnCog(commands.Cog):
             user_info = f"{username} ({user_id})" if username else user_id
             embed = discord.Embed(
                 title="✓ Бан записан в БД",
-                description=f"**Дело #{record_id}**\nПользователь: `{user_info}`\n**Длительность:** {duration_str}\nПричина: {reason}",
+                description=f"**Дело #{record_id}**\nПользователь: `{user_info}`\n**Длительность:** {duration_str}\nПричина: {reason}{accounts_note}",
                 color=0x2F3136
             )
             await interaction.response.send_message(embed=embed, ephemeral=False)
@@ -1302,7 +1402,7 @@ class RsnCog(commands.Cog):
             
             await self._log_action(
                 "Запись бана в БД",
-                f"**Дело #{record_id}** | {user_info_log} | {reason}\\nДлительность: {duration_str}",
+                f"**Дело #{record_id}** | {user_info_log} | {reason}\\nДлительность: {duration_str}{accounts_note}",
                 user_id_int,
                 interaction.user.id
             )
@@ -1472,9 +1572,8 @@ class RsnCog(commands.Cog):
                 if current_points >= scale_max:
                     continue
 
-                # Проверить, что пользователь на сервере
-                member = guild.get_member(user_id)
-                if not member:
+                # Проверить, что пользователь на сервере (хоть одним из своих аккаунтов)
+                if not self._guild_members(user_id):
                     continue
 
                 # Начислить баллы (с защитой диапазона)
@@ -1510,12 +1609,13 @@ class RsnCog(commands.Cog):
                 return
 
             expired = self.db.get_expired_punishments()
-            if not expired:
-                return
+            if expired:
+                print(f"[RSN] Found {len(expired)} expired punishments to process")
+                for punishment in expired:
+                    await self._process_expired_punishment(punishment)
 
-            print(f"[RSN] Found {len(expired)} expired punishments to process")
-            for punishment in expired:
-                await self._process_expired_punishment(punishment)
+            # После истёкших — чтобы не вернуть роль тому, у кого мут только что кончился
+            await self._sync_twinks()
 
         except Exception:
             print(f"[RSN] Error in check_expired_punishments: {traceback.format_exc()}")

@@ -273,3 +273,80 @@ class RsnDatabase:
         )
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # ===== Твинки =====
+
+    def get_all_user_ids(self) -> List[int]:
+        """Все ID, на которые в базе что-то записано (баллы, дела, наказания)."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT user_id FROM rsn_score
+            UNION SELECT user_id FROM rsn_records
+            UNION SELECT user_id FROM rsn_active_punishments
+        """)
+        return [row["user_id"] for row in cursor.fetchall()]
+
+    def get_active_punishments(self, kind: str) -> List[dict]:
+        """Все действующие наказания данного типа ('mute' / 'ban')."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM rsn_active_punishments WHERE kind = ?", (kind,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def _strictness(punishment: dict) -> tuple:
+        """Чем больше, тем строже: бан строже мута, бессрочное строже срочного, позднее строже раннего."""
+        return (
+            punishment["kind"] == "ban",
+            punishment["expires_at"] is None,
+            punishment["expires_at"] or 0,
+        )
+
+    def merge_user(self, from_id: int, to_id: int) -> bool:
+        """
+        Перенести личное дело твинка (from_id) на основной аккаунт (to_id) — одной транзакцией.
+
+        - баллы — меньшие из двух (худшая репутация), дело активно, если было активно у любого;
+        - все записи о нарушениях переходят к основному;
+        - действующее наказание — более строгое из двух.
+
+        :return: True, если было что переносить.
+        """
+        source = self.get_score(from_id)
+        source_punishment = self.get_active_punishment(from_id)
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT 1 FROM rsn_records WHERE user_id = ? LIMIT 1", (from_id,))
+        has_records = cursor.fetchone() is not None
+
+        if source is None and source_punishment is None and not has_records:
+            return False
+
+        target = self.get_score(to_id)
+        target_punishment = self.get_active_punishment(to_id)
+
+        # Внутри — только execute: методы выше с собственным commit() закоммитили бы посередине.
+        with self.conn:
+            if source is not None:
+                if target is None:
+                    self.conn.execute(
+                        "INSERT INTO rsn_score (user_id, points, active) VALUES (?, ?, ?)",
+                        (to_id, source["points"], source["active"])
+                    )
+                else:
+                    self.conn.execute(
+                        "UPDATE rsn_score SET points = ?, active = ? WHERE user_id = ?",
+                        (min(source["points"], target["points"]), max(source["active"], target["active"]), to_id)
+                    )
+                self.conn.execute("DELETE FROM rsn_score WHERE user_id = ?", (from_id,))
+
+            self.conn.execute("UPDATE rsn_records SET user_id = ? WHERE user_id = ?", (to_id, from_id))
+
+            if source_punishment is not None:
+                if target_punishment is None or self._strictness(source_punishment) > self._strictness(target_punishment):
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO rsn_active_punishments (user_id, kind, expires_at, record_id) "
+                        "VALUES (?, ?, ?, ?)",
+                        (to_id, source_punishment["kind"], source_punishment["expires_at"], source_punishment["record_id"])
+                    )
+                self.conn.execute("DELETE FROM rsn_active_punishments WHERE user_id = ?", (from_id,))
+
+        return True
