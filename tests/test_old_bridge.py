@@ -102,9 +102,11 @@ def test_discord_part_registers():
     assert "add_cog" in ast.unparse(setup)
 
 
-def test_new_bridge_disabled():
-    """Новый мост не регистрируется: с теми же Telegram-ботами он конфликтовал бы со старым."""
-    tree = ast.parse((BRIDGE_DIR / "bridge.py").read_text(encoding="utf-8"))
-    setup = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup")
+def test_only_old_bridge_in_folder():
+    """
+    Новый мост (bridge.py) убран по просьбе Berej 2026-10-24: выключенный, он всё равно
+    висел в списке модулей. Его код — в истории git (29e7c3d:modules/bridge/bridge.py).
+    """
+    extensions = sorted(p.stem for p in BRIDGE_DIR.glob("*.py") if not p.name.startswith("_"))
 
-    assert "add_cog" not in ast.unparse(setup)  # ast.unparse отбрасывает комментарии
+    assert extensions == ["bridge_main"]
