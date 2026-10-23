@@ -77,7 +77,10 @@ class OzernikiBot(commands.Bot):
         """
         Находит Python-модули в папке modules
         и добавляет их в конфигурацию.
+        Модули, чьих файлов больше нет, из конфигурации убирает.
         """
+        found = set()
+
         for folder in sorted(os.listdir(self.modules_folder)):
             folder_path = os.path.join(self.modules_folder, folder)
 
@@ -100,7 +103,16 @@ class OzernikiBot(commands.Bot):
                     f"{filename[:-3]}"
                 )
 
+                found.add(module_path)
                 config.module_add(module_path)
+
+        # config.json помнит модули между запусками. Без этой чистки удалённый файл
+        # оставался бы в списке: бот при каждом запуске пытался бы его загрузить
+        # (ошибка в консоли), а /modules_control продолжал бы его показывать.
+        for module_path in list(config.MODULES):
+            if module_path.startswith(f"{self.modules_folder}.") and module_path not in found:
+                config.module_remove(module_path)
+                print(f"Модуль {module_path} больше не существует — убран из config.json.")
 
     async def load_configured_extensions(self) -> None:
         """
