@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -48,13 +50,55 @@ def decode_avatar(avatar_bytes: bytes) -> Image.Image:
         )
 
 
+# Память на аватары: адрес → готовая картинка 220×220 (~190 КБ). При листании карточек
+# одни и те же аватары нужны снова и снова — без памяти каждое нажатие качало их заново.
+# В адресе есть хэш картинки: сменил человек аватар — адрес новый, скачается свежий.
+AVATAR_CACHE_SIZE = 100  # ~19 МБ; самые давно не нужные вытесняются
+_avatar_cache: OrderedDict[str, Image.Image] = OrderedDict()
+
+
 async def get_discord_avatar(member: discord.Member) -> Image.Image:
-    avatar_bytes = await member.display_avatar.with_size(AVATAR_FETCH_SIZE).read()
+    asset = member.display_avatar.with_size(AVATAR_FETCH_SIZE)
+
+    cached = _avatar_cache.get(asset.url)
+    if cached is not None:
+        _avatar_cache.move_to_end(asset.url)
+        # Копия: карточки меняют полученную картинку (putalpha), память портить нельзя.
+        return cached.copy()
+
+    avatar_bytes = await asset.read()
 
     # Раскодировка и сжатие — синхронный Pillow. Раньше шли прямо здесь, в основном
     # потоке: await был только на скачивании, и на странице ,rc (11 аватаров) бот
     # стоял до ~0,4 с — не принимал сообщения и не начислял карму. Теперь — в отдельном.
-    return await asyncio.to_thread(decode_avatar, avatar_bytes)
+    avatar = await asyncio.to_thread(decode_avatar, avatar_bytes)
+
+    _avatar_cache[asset.url] = avatar
+    if len(_avatar_cache) > AVATAR_CACHE_SIZE:
+        _avatar_cache.popitem(last=False)
+
+    return avatar.copy()
+
+
+# Ушедших с сервера бот берёт запросом fetch_user — отдельный запрос к Discord с лимитами.
+# Запоминаем на 10 минут (имя и аватар могут смениться, поэтому не навсегда).
+FETCHED_USER_TTL = 600
+_fetched_users: dict[int, tuple[float, discord.abc.User]] = {}
+
+
+async def get_user_anywhere(bot, discord_id: int) -> discord.abc.User:
+    """Участник сервера, а если ушёл — пользователь Discord (запросом, с памятью на 10 минут)."""
+    member = bot.guild.get_member(discord_id)
+    if member is not None:
+        return member
+
+    saved = _fetched_users.get(discord_id)
+    if saved is not None and time.monotonic() - saved[0] < FETCHED_USER_TTL:
+        return saved[1]
+
+    user = await bot.fetch_user(discord_id)
+    _fetched_users[discord_id] = (time.monotonic(), user)
+    return user
 
 def draw_counter(xy: tuple[int, int], nums: tuple[int, int], fill: Any, main_font: FreeTypeFont, image: Image.Image) -> tuple[int, int, int, int]:
     num1 = nums[0]
@@ -126,6 +170,29 @@ def draw_counter(xy: tuple[int, int], nums: tuple[int, int], fill: Any, main_fon
 
     return full_box
 
+def box_strip_mask(image: Image.Image, box, radius: float, strip_height: float):
+    """
+    Маска нижней полоски закруглённой плашки box — размером с плашку, а не со всю картинку.
+
+    Раньше на каждую полоску карточки Кубов (их ~20) создавалась маска 1200×800 и вставка
+    цвета проходила по всей картинке — две трети времени отрисовки. Здесь маска рисуется
+    в координатах плашки, а вставка идёт только в её область; картинка выходит та же.
+
+    :return: (область вставки, маска, её ImageDraw — чтобы вырезать ещё, сдвиг по x — box[0]).
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    # Pillow рисует прямоугольник включая правый и нижний край — маска на пиксель шире,
+    # но не за краем картинки (правая колонка плашек кончается ровно на нём).
+    region = (x0, y0, min(x1 + 1, image.width), min(y1 + 1, image.height))
+    mask = Image.new("L", (region[2] - x0, region[3] - y0), 0)
+    mask_draw = ImageDraw.Draw(mask)
+
+    mask_draw.rounded_rectangle((0, 0, x1 - x0, y1 - y0), radius=radius, fill=255)
+    mask_draw.rectangle((0, 0, x1 - x0, (y1 - strip_height) - y0), fill=0)
+
+    return region, mask, mask_draw
+
+
 def rounded_gradient(image: Image.Image, box: tuple[int, int, int, int], radius: int, start_color: str, end_color: str):
     x1, y1, x2, y2 = box
     width = x2 - x1
@@ -169,31 +236,20 @@ def rounded_gradient(image: Image.Image, box: tuple[int, int, int, int], radius:
 
 async def get_full_binds(member: discord.Member, bot, amount: int = 10, offset: int = 0) -> list[dict[str, Image.Image | str | DataTypes.KarmicBind]]:
     """Связи участника для карточки Кубов: amount штук, начиная с места offset + 1 (страницы)."""
-    guild = bot.guild
     ozernik = _state.db.get_user_by_discord_id(member.id)
-    binds = _state.db.get_user_top_karmic_binds(ozernik.id)[offset:]
+    binds = _state.db.get_user_top_karmic_binds(ozernik.id)[offset:offset + amount]
 
-    full_binds = []
-
-    n = 0
-    for _ozernik, bind in binds:
-        n += 1
-
-        _member = guild.get_member(_ozernik.discord_id)
-
-        if _member is None:
-            _member = await bot.fetch_user(_ozernik.discord_id)
-
-        full_binds.append({
-            'name': _member.display_name,
+    async def load(other: DataTypes.Ozernik, bind: DataTypes.KarmicBind) -> dict:
+        user = await get_user_anywhere(bot, other.discord_id)
+        return {
+            'name': user.display_name,
             'bind': bind,
-            'avatar': await get_discord_avatar(_member),
-        })
+            'avatar': await get_discord_avatar(user),
+        }
 
-        if n >= amount:
-            break
-
-    return full_binds
+    # Все связи — одновременно: раньше аватары качались по очереди, и 10 скачиваний
+    # складывались в секунду с лишним на каждое нажатие ◀ ▶. gather сохраняет порядок.
+    return list(await asyncio.gather(*(load(other, bind) for other, bind in binds)))
 
 def get_card_stats(ozernik_id: int) -> dict:
     """
@@ -895,25 +951,9 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
         full_bind['box'] = bind_boxes[n]
 
     for bind_box in bind_boxes:
-        mask = Image.new("L", image.size, 0)
-        mask_draw = ImageDraw.Draw(mask)
+        region, mask, _ = box_strip_mask(image, bind_box, radius, bind_box_height / 13)
 
-        mask_draw.rounded_rectangle(
-            bind_box,
-            radius=radius,
-            fill=255,
-        )
-
-        mask_draw.rectangle(
-            (bind_box[0], bind_box[1], bind_box[2], bind_box[3] - bind_box_height / 13),
-            fill=0,
-        )
-
-        image.paste(
-            sep_color,
-            (0, 0, image.width, image.height),
-            mask,
-        )  # Незаполненная часть полоски
+        image.paste(sep_color, region, mask)  # Незаполненная часть полоски
 
         avatar_center_xy = (
             bind_box[0] + bind_box_height // 2,
@@ -1157,36 +1197,14 @@ def create_cube_cart(ozernik: DataTypes.Ozernik, avatar_image: Image.Image, user
             box = full_bind['box']
             fill_x = box[0] + (box[2] - box[0]) * min(max(progress_factor, 0), 1)
 
-            mask = Image.new("L", image.size, 0)
-            mask_draw = ImageDraw.Draw(mask)
+            region, mask, mask_draw = box_strip_mask(image, box, radius, bind_box_height / 13)
 
-            mask_draw.rounded_rectangle(
-                full_bind['box'],
-                radius=radius,
-                fill=255,
-            )
+            image.paste(sep_color, region, mask)  # Незаполненная часть полоски
 
-            mask_draw.rectangle(
-                (full_bind['box'][0], full_bind['box'][1], full_bind['box'][2], full_bind['box'][3] - bind_box_height / 13),
-                fill=0,
-            )
+            # Справа от fill_x — не заливать (координаты маски — от левого края плашки).
+            mask_draw.rectangle((fill_x - region[0], 0, box[2] - region[0], box[3] - region[1]), fill=0)
 
-            image.paste(
-                sep_color,
-                (0, 0, image.width, image.height),
-                mask,
-            )  # Незаполненная часть полоски
-
-            mask_draw.rectangle(
-                (fill_x, full_bind['box'][1], full_bind['box'][2], full_bind['box'][3]),
-                fill=0,
-            )
-
-            image.paste(
-                bind_color,
-                (0, 0, image.width, image.height),
-                mask,
-            )  # Заполненная часть полоски
+            image.paste(bind_color, region, mask)  # Заполненная часть полоски
         else:
             rounded_gradient(
                 image,

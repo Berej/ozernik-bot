@@ -298,8 +298,7 @@ class KarmaSistem(commands.Cog):
 
             bind = _state.db.get_karmic_bind(ozernik_1.id, ozernik_2.id)
 
-            avatar_1 = await get_discord_avatar(member_1)
-            avatar_2 = await get_discord_avatar(member_2)
+            avatar_1, avatar_2 = await asyncio.gather(get_discord_avatar(member_1), get_discord_avatar(member_2))
 
             print(avatar_1.size)
             print(avatar_2.size)
@@ -348,8 +347,8 @@ class KarmaSistem(commands.Cog):
         )
 
     async def get_user_anywhere(self, discord_id: int) -> discord.abc.User:
-        """Участник сервера, а если ушёл — пользователь Discord (запросом)."""
-        return self.bot.guild.get_member(discord_id) or await self.bot.fetch_user(discord_id)
+        """Участник сервера, а если ушёл — пользователь Discord (запросом, с памятью на 10 минут)."""
+        return await get_user_anywhere(self.bot, discord_id)
 
     async def give_guise_message(self, main_id: int, twink_id: int) -> None:
         """
@@ -365,13 +364,11 @@ class KarmaSistem(commands.Cog):
 
         # Открытка — по возможности: если аватар не скачать, объявление всё равно выйдет.
         try:
-            main = await self.get_user_anywhere(main_id)
-            twink = await self.get_user_anywhere(twink_id)
+            main, twink = await asyncio.gather(self.get_user_anywhere(main_id), self.get_user_anywhere(twink_id))
             ozernik = _state.db.get_user_by_discord_id(main_id)
             stage = get_status(_state.db.get_karma(ozernik.id))['tag_name']
 
-            main_avatar = await get_discord_avatar(main)
-            twink_avatar = await get_discord_avatar(twink)
+            main_avatar, twink_avatar = await asyncio.gather(get_discord_avatar(main), get_discord_avatar(twink))
 
             # Рисование — в отдельном потоке, чтобы не останавливать бота.
             postcard = await asyncio.to_thread(create_guise_postcard, main_avatar, twink_avatar, stage)
@@ -774,27 +771,29 @@ class KarmaSistem(commands.Cog):
         moscow = self.bot.moscow_tz
 
         links = [(ozernik.discord_id, None)] + _state.db.get_twink_links(ozernik.id)
-        accounts = []
 
-        for n, (discord_id, linked_at) in enumerate(links[:GUISES_ON_PAGE]):
+        async def load(n: int, discord_id: int, linked_at: int | None) -> dict:
             # Аккаунт мог уйти с сервера — тогда берём его как пользователя Discord.
-            user = self.bot.guild.get_member(discord_id)
-            if user is None:
-                try:
-                    user = await self.bot.fetch_user(discord_id)
-                except discord.HTTPException:
-                    user = None
+            try:
+                user = await self.get_user_anywhere(discord_id)
+            except discord.HTTPException:
+                user = None
 
             since = ''
             if linked_at:
                 since = datetime.fromtimestamp(linked_at / 1000, moscow).strftime('%d.%m.%Y')
 
-            accounts.append({
+            return {
                 'name': user.display_name if user else f'ID {discord_id}',
                 'avatar': await get_discord_avatar(user) if user else None,
                 'main': n == 0,
                 'since': since,
-            })
+            }
+
+        # Все аккаунты — одновременно (по очереди скачивания складывались).
+        accounts = list(await asyncio.gather(
+            *(load(n, discord_id, linked_at) for n, (discord_id, linked_at) in enumerate(links[:GUISES_ON_PAGE]))
+        ))
 
         # Оставшиеся (больше восьми) не рисуются — только их число («и ещё N»).
         accounts += [{'name': '', 'avatar': None, 'main': False, 'since': ''}] * (len(links) - len(accounts))
@@ -846,7 +845,7 @@ class KarmaSistem(commands.Cog):
         # Картинка (и аватарки связей) готовится дольше 3 секунд, которые Discord ждёт ответа.
         await interaction.response.defer()
 
-        target = self.bot.guild.get_member(user_id) or await self.bot.fetch_user(user_id)
+        target = await self.get_user_anywhere(user_id)
         file, view = await self.build_card_page(card, target, page)
 
         await interaction.edit_original_response(attachments=[file], **view)

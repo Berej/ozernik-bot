@@ -1,7 +1,12 @@
 """Проверки, что карточки Pillow рисуются без ошибок в разных состояниях пользователя."""
 
+import asyncio
+import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
 
 from conftest import PNG_BYTES, add_ozernik, make_png_bytes
 
@@ -171,3 +176,128 @@ class TestAvatarDownload:
         await env.karma.get_discord_avatar(env.guild.add_member(1))
 
         assert threads and threads[0] != threading.get_ident()
+
+
+# ---------- УСКОРЕНИЕ КАРТОЧЕК (2026-10-24) -----------
+
+cards = sys.modules["modules.karma_sistem._cards"]
+
+
+class TestAvatarCache:
+    async def test_second_time_from_memory(self, env):
+        member = env.guild.add_member(1)
+
+        await env.karma.get_discord_avatar(member)
+        await env.karma.get_discord_avatar(member)
+
+        assert member.display_avatar.read.await_count == 1
+
+    async def test_new_avatar_downloaded_again(self, env):
+        """Сменил аватар — у Discord новый адрес (в нём хэш картинки) — качаем заново."""
+        member = env.guild.add_member(1)
+        await env.karma.get_discord_avatar(member)
+
+        member.display_avatar.url = "https://cdn.test/1-new.png"
+        await env.karma.get_discord_avatar(member)
+
+        assert member.display_avatar.read.await_count == 2
+
+    async def test_returns_copy(self, env):
+        """Карточки меняют полученную картинку (putalpha) — память от этого портиться не должна."""
+        member = env.guild.add_member(1)
+        first = await env.karma.get_discord_avatar(member)
+        first.putalpha(0)
+
+        second = await env.karma.get_discord_avatar(member)
+
+        assert second.getpixel((110, 110))[3] == 255
+
+    async def test_old_avatars_evicted(self, env, monkeypatch):
+        monkeypatch.setattr(cards, "AVATAR_CACHE_SIZE", 2)
+        members = [env.guild.add_member(n) for n in (1, 2, 3)]
+        for member in members:
+            await env.karma.get_discord_avatar(member)
+
+        await env.karma.get_discord_avatar(members[0])  # вытеснен — качается заново
+
+        assert members[0].display_avatar.read.await_count == 2
+        assert len(cards._avatar_cache) == 2
+
+
+class TestFetchedUsers:
+    async def test_left_member_remembered_for_ten_minutes(self, env, monkeypatch):
+        gone = SimpleNamespace(id=55, display_name="Ушёл")
+        env.bot.fetch_user = AsyncMock(return_value=gone)
+        now = {"t": 1000.0}
+        monkeypatch.setattr(cards.time, "monotonic", lambda: now["t"])
+
+        assert await cards.get_user_anywhere(env.bot, 55) is gone
+        now["t"] += 599
+        await cards.get_user_anywhere(env.bot, 55)
+        assert env.bot.fetch_user.await_count == 1
+
+        now["t"] += 2  # прошло больше 10 минут
+        await cards.get_user_anywhere(env.bot, 55)
+        assert env.bot.fetch_user.await_count == 2
+
+    async def test_member_on_server_not_fetched(self, env):
+        member = env.guild.add_member(1)
+        env.bot.fetch_user = AsyncMock()
+
+        assert await cards.get_user_anywhere(env.bot, 1) is member
+        env.bot.fetch_user.assert_not_awaited()
+
+
+async def test_bind_avatars_downloaded_at_once(env):
+    """Аватары связей качаются одновременно, а не по очереди (было ~1,4 с на страницу ,rc)."""
+    me_member = env.guild.add_member(1)
+    me = env.bot.db_ensure_user(me_member).id
+    state = {"now": 0, "max": 0}
+
+    async def slow_read():
+        state["now"] += 1
+        state["max"] = max(state["max"], state["now"])
+        await asyncio.sleep(0.02)
+        state["now"] -= 1
+        return PNG_BYTES
+
+    for n in range(2, 8):
+        member = env.guild.add_member(n)
+        member.display_avatar.read = AsyncMock(side_effect=slow_read)
+        env.db.add_bind_karma(me, env.bot.db_ensure_user(member).id, 100 - n)
+
+    binds = await env.karma.get_full_binds(me_member, env.bot)
+
+    assert state["max"] == 6
+    assert [b["name"] for b in binds] == [f"User {n}" for n in range(2, 8)]  # порядок сохранён
+
+
+@pytest.mark.parametrize("box", [(0, 170, 597, 291), (603, 170, 1200, 291), (603, 655, 1200, 776)])
+@pytest.mark.parametrize("fill_x", [None, 0.0, 333.7, 1200])
+def test_box_strip_mask_same_pixels_as_full_mask(box, fill_x):
+    """
+    Маска размером с плашку даёт ровно то же, что прежняя маска во всю картинку
+    (прежний способ воспроизведён здесь), только в разы быстрее.
+    """
+    size, radius, strip = (1200, 800), 40, 121 / 13
+    if fill_x is not None:
+        fill_x = min(max(fill_x, box[0]), box[2])
+
+    old = Image.new("RGBA", size, (10, 20, 30, 255))
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle(box, radius=radius, fill=255)
+    draw.rectangle((box[0], box[1], box[2], box[3] - strip), fill=0)
+    old.paste("#24272A", (0, 0, *size), mask)
+    if fill_x is not None:
+        draw.rectangle((fill_x, box[1], box[2], box[3]), fill=0)
+        old.paste("#FFD700", (0, 0, *size), mask)
+
+    new = Image.new("RGBA", size, (10, 20, 30, 255))
+    region, mask, draw = cards.box_strip_mask(new, box, radius, strip)
+    new.paste("#24272A", region, mask)
+    if fill_x is not None:
+        draw.rectangle((fill_x - region[0], 0, box[2] - region[0], box[3] - region[1]), fill=0)
+        new.paste("#FFD700", region, mask)
+
+    assert ImageChops.difference(old, new).getbbox() is None
