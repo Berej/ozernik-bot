@@ -198,18 +198,40 @@ class TestCreate:
         assert channel.overwrites_for(isolation) == ISOLATION_OVERWRITE
 
     async def test_members_get_connect_only_not_view(self, voice_env):
-        """Личное разрешение сильнее запрета роли: с view_channel «Изоляция» допущенного увидела бы войс."""
+        """
+        Личное разрешение сильнее запрета роли: с view_channel «Изоляция» допущенного увидела бы войс.
+        Исключение — владелец (кейс 2026-11-14): см. test_owner_with_forbidden_role_sees_own_voice.
+        """
         me = voice_env.add_member(1)
         voice_env.add_member(2)
         owner = voice_env.db.add_user(discord_id=1)
         voice_env.db.save_personal_voice_settings(owner, None, 0, True, [2])
+        voice_env.db.link_twink(owner, 11)
+        voice_env.add_member(11)
 
         await enter(voice_env, me, voice_env.entry)
 
         channel = voice_env.created[0]
         for target, overwrite in channel.overwrites.items():
-            if isinstance(target, FakeMember) and target.id != voice_env.guild.me.id:
+            if isinstance(target, FakeMember) and target.id not in (voice_env.guild.me.id, me.id):
                 assert overwrite.view_channel is None, target
+        assert channel.overwrites_for(me).view_channel is True
+
+    async def test_owner_with_forbidden_role_sees_own_voice(self, voice_env):
+        """
+        Кейс 2026-11-14 (Бердж): у владельца роль из FORBIDDEN_ROLE_IDS (запрет видеть) — без личного
+        view_channel он не видел бы собственный войс, Discord выкидывал бы его, и войс сразу «пустел».
+        Личное разрешение сильнее запрета роли — владелец видит свой войс.
+        """
+        forbidden = FakeRole(vm.FORBIDDEN_ROLE_IDS[0], "Полный мут", guild=voice_env.guild)
+        voice_env.guild.roles[forbidden.id] = forbidden
+        me = voice_env.add_member(1, roles=[forbidden])
+
+        await enter(voice_env, me, voice_env.entry)
+
+        channel = voice_env.created[0]
+        assert channel.overwrites_for(forbidden).view_channel is False
+        assert channel.overwrites_for(me).view_channel is True and channel.overwrites_for(me).connect is True
 
     async def test_punished_member_kicked_from_personal_voice(self, voice_env):
         mute_role = FakeRole(777, "Мут", guild=voice_env.guild)
@@ -244,6 +266,8 @@ class TestCleanup:
         await enter(voice_env, me, None)
 
         channel.delete.assert_awaited_once()  # музыкальный бот войс не держит
+        # Причина в журнале аудита — по ней видно, какая проверка удалила войс
+        assert channel.delete.call_args.kwargs["reason"] == "Личный войс опустел: вышел последний"
         assert voice_env.db.get_personal_voice(channel.id)["deleted_at"] is not None
         assert voice_env.db.get_live_personal_voice(person(voice_env, 1)) is None
 
@@ -294,6 +318,7 @@ class TestCleanup:
         await voice_env.cog.voice_tick()
 
         channel.delete.assert_awaited_once()
+        assert channel.delete.call_args.kwargs["reason"] == "Личный войс опустел (проверка раз в минуту)"
 
     async def test_fresh_voice_not_in_cache_not_marked_deleted(self, voice_env):
         """Канал только что создан, событие «канал создан» ещё не обработано — не считать его удалённым."""
@@ -346,6 +371,7 @@ class TestCleanup:
 
         channel = voice_env.created[0]
         channel.delete.assert_awaited_once()
+        assert channel.delete.call_args.kwargs["reason"] == "Личный войс: не удалось перенести владельца"
         assert voice_env.db.get_personal_voice(channel.id)["deleted_at"] is not None
 
     async def test_deleted_by_hand_marked(self, voice_env):

@@ -160,7 +160,11 @@ class VoiceManager(commands.Cog):
             if account is not None:
                 overwrites[account] = discord.PermissionOverwrite(connect=True)
 
-        overwrites[member] = discord.PermissionOverwrite(connect=True, manage_channels=True)
+        # Владелец — видит, входит, управляет. view_channel ему нужен (кейс 2026-11-14): с ролью, которой
+        # запрещено видеть личные войсы, он не видел бы собственный войс — Discord выкидывает из
+        # канала, который человек не видит, и войс сразу «пустел». Для РСН это безопасно: замученный
+        # не попадёт и в канал-вход (/rsn_setup), а в личном войсе его отключит _kick_if_punished.
+        overwrites[member] = discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
         if guild.me:
             overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
         return overwrites
@@ -173,7 +177,11 @@ class VoiceManager(commands.Cog):
             return  # включил микрофон, заглушился и т.п. — не переход
 
         if before.channel is not None:
-            await self._cleanup(before.channel)
+            if self._is_live_voice(before.channel.id):
+                where = f"в {after.channel.id}" if after.channel else "из голоса"
+                print(f"[Войсы] {member} ({member.id}) вышел из войса {before.channel.id} {where}; "
+                      f"там по кэшу: {[m.id for m in before.channel.members]}")
+            await self._cleanup(before.channel, "Личный войс опустел: вышел последний")
 
         if after.channel is None or member.bot:
             return
@@ -181,6 +189,10 @@ class VoiceManager(commands.Cog):
             await self._open_voice(member)
         else:
             await self._kick_if_punished(member, after.channel)
+
+    def _is_live_voice(self, channel_id: int) -> bool:
+        voice = self.db.get_personal_voice(channel_id)
+        return voice is not None and voice["deleted_at"] is None
 
     async def _kick_if_punished(self, member, channel) -> None:
         """
@@ -193,6 +205,7 @@ class VoiceManager(commands.Cog):
         punish_roles = {role for role, _ in self._rsn_overwrites()}
         if not punish_roles.intersection(member.roles):
             return
+        print(f"[Войсы] {member} ({member.id}) под наказанием РСН — отключаю из личного войса {channel.id}")
         try:
             await member.move_to(None, reason="РСН: наказание действует — в войс нельзя")
         except discord.HTTPException as error:
@@ -238,6 +251,7 @@ class VoiceManager(commands.Cog):
 
             try:
                 await member.move_to(channel)
+                print(f"[Войсы] Создан войс {channel.id} для {member} ({member.id}), владелец перенесён")
             except discord.HTTPException as error:
                 # Перенос не удался (например, ушёл из канала-входа, пока войс создавался) — значит,
                 # владельца там нет, и войс пуст наверняка: удаляем, не спрашивая отстающий кэш.
@@ -258,18 +272,20 @@ class VoiceManager(commands.Cog):
         except asyncio.TimeoutError:
             print(f"[Войсы] Канал {channel_id} не появился в кэше за {CACHE_WAIT_SECONDS} с — переношу так.")
 
-    async def _cleanup(self, channel) -> None:
+    async def _cleanup(self, channel, reason: str) -> None:
         """
         Личный войс без людей — удалить. Не личный или уже удалённый — не трогать.
         Пустоту проверяет по кэшу: вызывать, когда кэш свежий (событие «вышел из войса»),
-        или для войсов старше FRESH_SECONDS (цикл).
+        или для войсов старше FRESH_SECONDS (цикл). reason — в журнал аудита: по нему видно,
+        какая проверка удалила войс.
         """
         voice = self.db.get_personal_voice(channel.id)
         if voice is None or voice["deleted_at"] is not None or humans(channel):
             return
-        await self._delete(channel, "Личный войс опустел")
+        await self._delete(channel, reason)
 
     async def _delete(self, channel, reason: str) -> None:
+        print(f"[Войсы] Удаляю войс {channel.id}: {reason}")
         try:
             await channel.delete(reason=reason)
         except discord.NotFound:
@@ -325,7 +341,7 @@ class VoiceManager(commands.Cog):
             present = humans(channel)
             if not present:
                 if not fresh:
-                    await self._cleanup(channel)
+                    await self._cleanup(channel, "Личный войс опустел (проверка раз в минуту)")
                 continue
 
             for member in present:
