@@ -42,13 +42,19 @@ RECORDS_TABLE_SQL = """
 """
 
 
+# Путь — от папки модуля, а не от папки запуска: относительный «modules/rsn/rsn.db» Python ищет
+# от текущей рабочей папки процесса. Запущенный не оттуда бот завёл бы новую пустую базу рядом.
+# На сервере (systemd: WorkingDirectory = папка бота, проверено 2026-11-14) оба пути совпадают.
+DEFAULT_DB_PATH = str(Path(__file__).resolve().parent / "rsn.db")
+
+
 class RsnDatabase:
     """
     Собственный слой SQLite для модуля RSN.
-    БД: modules/rsn/rsn.db
+    БД: modules/rsn/rsn.db (рядом с этим файлом)
     """
 
-    def __init__(self, db_path: str = "modules/rsn/rsn.db"):
+    def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
         self.conn: Optional[sqlite3.Connection] = None
         self._initialize()
