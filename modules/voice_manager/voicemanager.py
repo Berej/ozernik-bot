@@ -48,6 +48,21 @@ EDIT_TIMEOUT = 15
 
 NO_VOICE_TEXT = f"У вас сейчас нет личного войса. Зайдите в <#{VOICE_ID}> — бот создаст его."
 
+# «Кто сейчас в канале» (channel.members) discord.py берёт из своего кэша, а кэш обновляют события
+# шлюза — они приходят отдельно от ответов на HTTP-запросы и позже них. move_to возвращается,
+# когда Discord принял перенос, но событие «человек в войсе» ещё в пути — в этот момент войс
+# по кэшу пуст. Кейс 2026-11-14: бот создал войс, перенёс Берджа и тут же удалил «опустевший».
+# Поэтому свежий войс первые FRESH_SECONDS цикл не трогает — кэш успевает догнать.
+FRESH_SECONDS = 30
+# Новый канал попадает в кэш только с событием «канал создан» (create_voice_channel его туда не
+# кладёт). Перенос до этого события discord.py не сопоставит с каналом и решит, что человек вышел
+# из голоса совсем. Поэтому перед переносом ждём, пока канал появится в кэше.
+CACHE_WAIT_SECONDS = 5
+
+
+def is_fresh(voice: dict) -> bool:
+    return time.time() - voice["created_at"] < FRESH_SECONDS
+
 
 def humans(channel) -> list:
     """Участники войса без ботов: войс «пустой», когда людей нет, даже если там сидит музыкальный бот."""
@@ -96,6 +111,8 @@ class VoiceManager(commands.Cog):
             return None
         channel = guild.get_channel(live["channel_id"])
         if channel is None:
+            if is_fresh(live):
+                return None  # только что создан и ещё не в кэше — не считать удалённым
             self.db.mark_personal_voice_deleted(live["channel_id"])
             return self._live_channel(guild, user_id)
         return channel
@@ -217,24 +234,44 @@ class VoiceManager(commands.Cog):
                 return
 
             self.db.add_personal_voice(channel.id, owner.id, category.id if category else None)
+            await self._wait_in_cache(guild, channel.id)
 
             try:
                 await member.move_to(channel)
             except discord.HTTPException as error:
-                # Ушёл из канала-входа, пока войс создавался, — пустой войс не оставляем.
+                # Перенос не удался (например, ушёл из канала-входа, пока войс создавался) — значит,
+                # владельца там нет, и войс пуст наверняка: удаляем, не спрашивая отстающий кэш.
                 print(f"[Войсы] Не перенести {member.id} в новый войс {channel.id}: {error}")
-                await self._cleanup(channel)
+                await self._delete(channel, "Личный войс: не удалось перенести владельца")
         finally:
             self._creating.discard(owner.id)
 
+    async def _wait_in_cache(self, guild, channel_id: int) -> None:
+        """Дождаться события «канал создан» (не дольше CACHE_WAIT_SECONDS)."""
+        if guild.get_channel(channel_id) is not None:
+            return
+        # Между проверкой выше и подпиской ниже нет await — событие не может проскочить посередине.
+        try:
+            await self.bot.wait_for(
+                "guild_channel_create", check=lambda created: created.id == channel_id, timeout=CACHE_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            print(f"[Войсы] Канал {channel_id} не появился в кэше за {CACHE_WAIT_SECONDS} с — переношу так.")
+
     async def _cleanup(self, channel) -> None:
-        """Личный войс без людей — удалить. Не личный или уже удалённый — не трогать."""
+        """
+        Личный войс без людей — удалить. Не личный или уже удалённый — не трогать.
+        Пустоту проверяет по кэшу: вызывать, когда кэш свежий (событие «вышел из войса»),
+        или для войсов старше FRESH_SECONDS (цикл).
+        """
         voice = self.db.get_personal_voice(channel.id)
         if voice is None or voice["deleted_at"] is not None or humans(channel):
             return
+        await self._delete(channel, "Личный войс опустел")
 
+    async def _delete(self, channel, reason: str) -> None:
         try:
-            await channel.delete(reason="Личный войс опустел")
+            await channel.delete(reason=reason)
         except discord.NotFound:
             pass  # уже удалили
         except discord.HTTPException as error:
@@ -277,14 +314,18 @@ class VoiceManager(commands.Cog):
 
         minutes = []
         for voice in self.db.get_live_personal_voices():
+            # Свежий войс: кэш мог ещё не узнать ни о канале, ни о том, что владелец внутри.
+            fresh = is_fresh(voice)
             channel = guild.get_channel(voice["channel_id"])
             if channel is None:
-                self.db.mark_personal_voice_deleted(voice["channel_id"])
+                if not fresh:
+                    self.db.mark_personal_voice_deleted(voice["channel_id"])
                 continue
 
             present = humans(channel)
             if not present:
-                await self._cleanup(channel)
+                if not fresh:
+                    await self._cleanup(channel)
                 continue
 
             for member in present:

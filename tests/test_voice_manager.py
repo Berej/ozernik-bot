@@ -5,7 +5,7 @@
 """
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
@@ -122,6 +122,12 @@ async def enter(voice_env, member, channel):
 
 def person(voice_env, discord_id):
     return voice_env.db.get_user_by_discord_id(discord_id).id
+
+
+def age(voice_env, seconds=vm.FRESH_SECONDS + 1):
+    """Войсы «созданы» seconds секунд назад — цикл перестаёт считать их свежими."""
+    with voice_env.db.transaction():
+        voice_env.db.execute("UPDATE personal_voice_channels SET created_at = created_at - ?", (seconds,))
 
 
 # ---------- СОЗДАНИЕ ----------
@@ -258,12 +264,89 @@ class TestCleanup:
         join(me, None)  # вышел, пока бот лежал: события не было
         owner = person(voice_env, 1)
         voice_env.db.add_personal_voice(424242, owner, vm.CATEGORY_ID)  # удалён руками, пока бот лежал
+        age(voice_env)
 
         restarted = vm.VoiceManager(voice_env.bot)  # память пуста — всё из базы
         await restarted.voice_tick()
 
         channel.delete.assert_awaited_once()
         assert voice_env.db.get_live_personal_voices() == []
+
+    async def test_fresh_voice_survives_lagging_cache(self, voice_env):
+        """
+        Кейс 2026-11-14 (Бердж): move_to вернулся, а событие «владелец в войсе» ещё не пришло —
+        по кэшу войс пуст. Цикл в этот момент не должен удалять свежий войс.
+        """
+        me = voice_env.add_member(1)
+        me.move_to = AsyncMock()  # перенос принят Discord, но кэш (channel.members) ещё не знает
+        join(me, voice_env.entry)
+        await voice_env.cog.on_voice_state_update(me, SimpleNamespace(channel=None), SimpleNamespace(channel=voice_env.entry))
+        channel = voice_env.created[0]
+        assert channel.members == []
+
+        await voice_env.cog.voice_tick()
+
+        channel.delete.assert_not_awaited()
+        assert voice_env.db.get_personal_voice(channel.id)["deleted_at"] is None
+
+        # Прошло больше FRESH_SECONDS, а людей так и нет — это уже правда пустой войс.
+        age(voice_env)
+        await voice_env.cog.voice_tick()
+
+        channel.delete.assert_awaited_once()
+
+    async def test_fresh_voice_not_in_cache_not_marked_deleted(self, voice_env):
+        """Канал только что создан, событие «канал создан» ещё не обработано — не считать его удалённым."""
+        owner = voice_env.db.add_user(discord_id=1)
+        voice_env.db.add_personal_voice(55555, owner, vm.CATEGORY_ID)  # в кэше сервера его пока нет
+
+        await voice_env.cog.voice_tick()
+
+        assert voice_env.db.get_personal_voice(55555)["deleted_at"] is None
+
+    async def test_waits_for_channel_in_cache_before_move(self, voice_env):
+        """Перенос — только когда канал в кэше: иначе discord.py решит, что человек вышел из голоса."""
+        order = []
+        create = voice_env.guild.create_voice_channel.side_effect
+
+        async def create_not_cached(*args, **kwargs):
+            channel = await create(*args, **kwargs)
+            del voice_env.guild.channels[channel.id]  # как в discord.py: в кэш — только с событием
+            return channel
+
+        async def wait_for(event, check, timeout):
+            channel = voice_env.created[-1]
+            assert event == "guild_channel_create" and check(channel) and timeout == vm.CACHE_WAIT_SECONDS
+            voice_env.guild.channels[channel.id] = channel  # пришло событие «канал создан»
+            order.append("в кэше")
+            return channel
+
+        voice_env.guild.create_voice_channel.side_effect = create_not_cached
+        voice_env.bot.wait_for = AsyncMock(side_effect=wait_for)
+        me = voice_env.add_member(1)
+        move = me.move_to.side_effect
+
+        async def logged_move(channel, reason=None):
+            order.append("перенос")
+            await move(channel, reason)
+
+        me.move_to.side_effect = logged_move
+
+        await enter(voice_env, me, voice_env.entry)
+
+        assert order == ["в кэше", "перенос"]
+        assert me in voice_env.created[0].members
+
+    async def test_failed_move_deletes_new_voice(self, voice_env):
+        me = voice_env.add_member(1)
+        me.move_to = AsyncMock(side_effect=discord.HTTPException(MagicMock(status=400), "Target user is not connected to voice."))
+        join(me, voice_env.entry)
+
+        await voice_env.cog.on_voice_state_update(me, SimpleNamespace(channel=None), SimpleNamespace(channel=voice_env.entry))
+
+        channel = voice_env.created[0]
+        channel.delete.assert_awaited_once()
+        assert voice_env.db.get_personal_voice(channel.id)["deleted_at"] is not None
 
     async def test_deleted_by_hand_marked(self, voice_env):
         me = voice_env.add_member(1)
