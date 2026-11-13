@@ -83,42 +83,18 @@ def messages_of(env, discord_id):
 
 
 class TestActivityCollection:
-    async def test_every_message_counted_even_on_cooldown(self, env, fixed_hour):
+    """
+    Карма пишет в журнал только минуты Связи. Сообщения с 2026-11-14 пишет модуль статистики
+    (решение Alium: в плашку *i — все сообщения, не только дающие карму) — tests/test_stats.py.
+    """
+
+    async def test_karma_does_not_write_messages(self, env, fixed_hour):
         member = env.guild.add_member(1)
-        for _ in range(3):  # карма — только за первое (задержка), активность — за все
-            await env.cog.on_message(make_message(member, FakeChannel(3000), env.guild))
-
-        assert messages_of(env, 1) == []  # пока только в памяти
-        env.cog.flush_activity()
-
-        assert messages_of(env, 1) == [(fixed_hour["hour"], 3)]
-        assert env.db.get_karma(env.db.get_user_by_discord_id(1).id).karma == 1
-
-    @pytest.mark.parametrize("case", ["blocked_channel", "blocked_user", "shortcut", "bot"])
-    async def test_not_counted(self, env, fixed_hour, case):
-        member = env.guild.add_member(1, bot=case == "bot")
-        content = ",lb" if case == "shortcut" else "привет"
-        if case == "blocked_channel":
-            env.data.blocked_channels_id = [3000]
-        if case == "blocked_user":
-            env.data.blocked_users_id = [1]
-
-        await env.cog.on_message(make_message(member, FakeChannel(3000), env.guild, content=content))
+        await env.cog.on_message(make_message(member, FakeChannel(3000), env.guild))
         env.cog.flush_activity()
 
         assert messages_of(env, 1) == []
-
-    async def test_hours_kept_apart(self, env, fixed_hour):
-        member = env.guild.add_member(1)
-        await env.cog.on_message(make_message(member, FakeChannel(3000), env.guild))
-        fixed_hour["hour"] += HOUR
-        env.cog.delays.clear()
-        await env.cog.on_message(make_message(member, FakeChannel(3000), env.guild))
-
-        env.cog.flush_activity()
-
-        start = OCT_23_MSK + 10 * HOUR
-        assert messages_of(env, 1) == [(start, 1), (start + HOUR, 1)]
+        assert env.db.get_karma(env.db.get_user_by_discord_id(1).id).karma == 1  # карма — как раньше
 
     async def test_voice_minutes_flushed_by_voice_loop(self, env, fixed_hour):
         a, b, alone = env.guild.add_member(1), env.guild.add_member(2), env.guild.add_member(3)
@@ -132,19 +108,9 @@ class TestActivityCollection:
         lonely = env.db.get_user_by_discord_id(3)
         assert lonely is None or env.db.get_activity(lonely.id, "voice_minutes", 0, 2**40) == []
 
-    async def test_twink_activity_goes_to_main(self, env, fixed_hour):
-        main = env.guild.add_member(1)
-        twink = env.guild.add_member(11)
-        env.db.link_twink(env.bot.db_ensure_user(main).id, 11)
-
-        await env.cog.on_message(make_message(twink, FakeChannel(3000), env.guild))
-        env.cog.flush_activity()
-
-        assert messages_of(env, 1) == [(fixed_hour["hour"], 1)]
-
     async def test_failed_write_kept_for_retry(self, env, fixed_hour):
-        member = env.guild.add_member(1)
-        await env.cog.on_message(make_message(member, FakeChannel(3000), env.guild))
+        me = env.bot.db_ensure_user(env.guild.add_member(1)).id
+        env.cog.note_activity(me, "voice_minutes")
 
         def broken(rows):
             raise RuntimeError("database is locked")
@@ -157,13 +123,13 @@ class TestActivityCollection:
         del env.db.add_activity_many  # снова метод класса
         env.cog.flush_activity()
 
-        assert messages_of(env, 1) == [(fixed_hour["hour"], 1)]
+        assert env.db.get_activity(me, "voice_minutes", 0, 2**40) == [(fixed_hour["hour"], 1)]
         assert env.cog.activity == {}
 
     async def test_flushed_on_unload(self, env, fixed_hour):
-        member = env.guild.add_member(1)
-        await env.cog.on_message(make_message(member, FakeChannel(3000), env.guild))
+        me = env.bot.db_ensure_user(env.guild.add_member(1)).id
+        env.cog.note_activity(me, "voice_minutes")
 
         await env.cog.cog_unload()
 
-        assert messages_of(env, 1) == [(fixed_hour["hour"], 1)]
+        assert env.db.get_activity(me, "voice_minutes", 0, 2**40) == [(fixed_hour["hour"], 1)]

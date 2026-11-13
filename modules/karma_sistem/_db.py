@@ -91,26 +91,6 @@ KARMA_LEVEL_TEXTS_TABLE_SQL = """
 """
 
 
-# Статистика по каналам для страниц карточки Сансары (решение Alium 2026-10-23):
-# text — сколько кармы человек набрал в текстовом канале, voice — сколько минут провёл
-# в голосовом (на тех же условиях, что и Связь: не один, не заглушён, не AFK).
-# Ветки засчитываются родительскому каналу. Копится с появления таблицы — прошлого нет:
-# старые логи не знают каналов.
-KARMA_CHANNEL_STATS_TABLE_SQL = """
-    CREATE TABLE IF NOT EXISTS karma_channel_stats (
-        user_id INTEGER NOT NULL,
-        channel_id INTEGER NOT NULL,
-        kind TEXT NOT NULL,
-        amount INTEGER NOT NULL DEFAULT 0,
-
-        PRIMARY KEY (user_id, channel_id, kind),
-        CHECK (kind IN ('text', 'voice')),
-
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-"""
-
-
 # «Карма за ивенты» (решение Alium 2026-10-23): каждое начисление /karma_add — награда
 # с причиной. Сумма наград показывается на странице «Ивенты» карточки Сансары.
 # /karma_remove и /karma_set её не меняют — это история наград, а не часть кармы;
@@ -163,8 +143,9 @@ class KarmaDatabase(Database):
             # Логи кармической связи
             self.execute(KARMIC_BIND_LOGS_TABLE_SQL)
 
-            # Статистика по каналам
-            self.execute(KARMA_CHANNEL_STATS_TABLE_SQL)
+            # Статистика по каналам (karma_channel_stats) больше не ведётся: страницы «Где пишу/сижу»
+            # заменила плашка *i (модуль stats, своя таблица channel_activity). Старая таблица в
+            # базах, где она есть, остаётся нетронутой.
 
             # Карма за ивенты
             self.execute(KARMA_EVENT_AWARDS_TABLE_SQL)
@@ -263,7 +244,7 @@ class KarmaDatabase(Database):
             return None
         return DataTypes.Karma(row)
 
-    def add_karma(self, user_id: int, karma: int, weekly: bool = False, channel_id: int | None = None) -> tuple[DataTypes.Karma, DataTypes.Karma]:
+    def add_karma(self, user_id: int, karma: int, weekly: bool = False) -> tuple[DataTypes.Karma, DataTypes.Karma]:
         """
         Добавляет пользователю обычную карму. Если weekly=True, также увеличивает
         weekly_karma.
@@ -271,8 +252,6 @@ class KarmaDatabase(Database):
         :param user_id: Внутренний ID пользователя из таблицы users.
         :param karma: Количество добавляемой кармы.
         :param weekly: Учитывать ли изменение в недельной карме.
-        :param channel_id: Текстовый канал, где набрана карма, — для статистики по каналам
-            (в той же транзакции: лишний коммит на каждое сообщение стоил бы ~15 мс).
         :return: Кортеж из старого объекта и обновлённого объекта ``Karma``.
         :raises ValueError: Если karma меньше или равна нулю.
         """
@@ -293,9 +272,6 @@ class KarmaDatabase(Database):
                 WHERE user_id = ?
                 RETURNING *
             """, (karma, karma if weekly else 0, now_ms(), user_id))
-
-            if channel_id is not None:
-                self._add_channel_stat(user_id, channel_id, 'text', karma)
 
         return DataTypes.Karma(old_row), DataTypes.Karma(new_row)
 
@@ -358,34 +334,6 @@ class KarmaDatabase(Database):
             row = self.fetchone("DELETE FROM karma_event_awards WHERE id = ? RETURNING *", (award_id,))
 
         return dict(row) if row else None
-
-    # Статистика по каналам
-
-    def _add_channel_stat(self, user_id: int, channel_id: int, kind: Literal['text', 'voice'], amount: int) -> None:
-        """Прибавляет к статистике канала. Без своей транзакции — вызывать внутри чужой."""
-        self.execute("""
-            INSERT INTO karma_channel_stats (user_id, channel_id, kind, amount)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id, channel_id, kind) DO UPDATE SET amount = amount + excluded.amount
-        """, (user_id, channel_id, kind, amount))
-
-    def get_channel_stats(self, user_id: int, kind: Literal['text', 'voice']) -> list[tuple[int, int]]:
-        """
-        Статистика человека по каналам: text — карма, voice — минуты.
-
-        :return: (ID канала, значение) от большего к меньшему.
-        """
-        rows = self.fetchall("""
-            SELECT channel_id, amount
-            FROM karma_channel_stats
-            WHERE user_id = ?
-              AND kind = ?
-              AND amount > 0
-            ORDER BY amount DESC,
-                     channel_id ASC
-        """, (user_id, kind))
-
-        return [(row['channel_id'], row['amount']) for row in rows]
 
     def remove_karma(self, user_id: int, karma: int, weekly: bool = False) -> DataTypes.Karma:
         """
@@ -528,15 +476,6 @@ class KarmaDatabase(Database):
                     """, (*pair, bind["bind_karma"]))
                     moved["binds"] += 1
 
-                # Статистика по каналам — складывается с основным.
-                self.execute("""
-                    INSERT INTO karma_channel_stats (user_id, channel_id, kind, amount)
-                    SELECT ?, channel_id, kind, amount
-                    FROM karma_channel_stats
-                    WHERE user_id = ?
-                    ON CONFLICT(user_id, channel_id, kind) DO UPDATE SET amount = amount + excluded.amount
-                """, (user_id, twink_id))
-
                 # Журнал активности — складывается с основным по тем же часам.
                 self.execute("""
                     INSERT INTO activity (user_id, hour, kind, amount)
@@ -546,11 +485,20 @@ class KarmaDatabase(Database):
                     ON CONFLICT(user_id, kind, hour) DO UPDATE SET amount = amount + excluded.amount
                 """, (user_id, twink_id))
 
+                # Учёт по каналам (плашка *i) — складывается с основным по тем же часам.
+                self.execute("""
+                    INSERT INTO channel_activity (user_id, channel_id, hour, kind, amount)
+                    SELECT ?, channel_id, hour, kind, amount
+                    FROM channel_activity
+                    WHERE user_id = ?
+                    ON CONFLICT(user_id, kind, hour, channel_id) DO UPDATE SET amount = amount + excluded.amount
+                """, (user_id, twink_id))
+
                 # Награды за ивенты — основному.
                 self.execute("UPDATE karma_event_awards SET user_id = ? WHERE user_id = ?", (user_id, twink_id))
 
                 # Личные войсы: настройки — основному, если своих нет; каналы — основному
-                # (статистика каналов — по владельцу); минуты складываются —
+                # (плашка *i покажет их как войс основного); минуты складываются —
                 # и в войсах твинка, и твинка в чужих войсах.
                 self.execute("""
                     INSERT OR IGNORE INTO personal_voices (user_id, name, user_limit, locked, allowed, saved_at)
@@ -988,7 +936,7 @@ class KarmaDatabase(Database):
 
         return DataTypes.KarmicBind(row)
 
-    def add_bind_karma_many(self, pairs: list[tuple[int, int]], karma: int, channel_id: int | None = None) -> list[DataTypes.KarmicBind]:
+    def add_bind_karma_many(self, pairs: list[tuple[int, int]], karma: int) -> list[DataTypes.KarmicBind]:
         """
         То же, что add_bind_karma, но для многих пар одной транзакцией.
 
@@ -997,8 +945,6 @@ class KarmaDatabase(Database):
 
         :param pairs: Пары внутренних ID пользователей.
         :param karma: Сколько кармы связи добавить каждой паре.
-        :param channel_id: Голосовой канал — каждому участнику пар +karma минут
-            в статистику канала (в той же транзакции).
         :return: Обновлённые связи в том же порядке, что и pairs.
         :raises ValueError: Если в паре один и тот же пользователь.
         """
@@ -1025,10 +971,6 @@ class KarmaDatabase(Database):
                 """, (karma, *pair))
 
                 binds.append(DataTypes.KarmicBind(row))
-
-            if channel_id is not None:
-                for user_id in sorted({user_id for pair in normalized for user_id in pair}):
-                    self._add_channel_stat(user_id, channel_id, 'voice', karma)
 
         return binds
 
