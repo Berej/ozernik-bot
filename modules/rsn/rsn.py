@@ -16,7 +16,11 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
+import sys
+
 from ._rsn_db import RsnDatabase
+from ._rsn_levels import level_for, MUTE_OVERWRITE, ISOLATION_OVERWRITE, plan_overwrites
+from ._rsn_cases import CaseMixin, BanTermButton, RESET_POINTS_AFTER_BAN, format_minutes, parse_term
 
 GUILD_ID = cfg.GUILD_ID
 
@@ -50,18 +54,17 @@ RESET_POINTS_ON_RETURN = 10  # Points reset on unban
 
 # === HELPER FUNCTION ===
 def get_multiplier_for_points(points: int) -> int:
-    """
-    Получить множитель длительности на основе текущих баллов.
-    OLD: Was using get_multiplier_for_points()
-    """
-    if points >= SCALE_THRESHOLDS["isolator"][0]:
-        return DURATION_MULTIPLIER["isolator"]
-    elif points >= SCALE_THRESHOLDS["restricted"][0]:
-        return DURATION_MULTIPLIER["restricted"]
-    elif points > SCALE_THRESHOLDS["ban_trigger"]:
-        return DURATION_MULTIPLIER["critical"]
-    else:
-        return DURATION_MULTIPLIER["critical"]
+    """Множитель срока мута по очкам до списания (РСН 2.0: _rsn_levels.level_for)."""
+    return level_for(points).multiplier
+
+
+def record_term(record: dict) -> str:
+    """Срок записи для личного дела: у записи без мута срока нет, бан без срока — навсегда."""
+    if record["kind"] == "warn":
+        return "без мута"
+    if record["kind"] == "ban":
+        return "бан " + (format_duration(record["duration_hours"]) if record["duration_hours"] else "навсегда")
+    return format_duration(record["duration_hours"])
 
 
 # === DURATION PARSING (minutes / hours only) ===
@@ -209,7 +212,7 @@ class CaseViewPagination(discord.ui.View):
             if len(record["reason"]) > MAX_REASON_LENGTH:
                 reason += "..."
             
-            duration_str = format_duration(record['duration_hours'])
+            duration_str = record_term(record)
             
             created_dt = datetime.fromtimestamp(
                 record['created_at'],
@@ -224,7 +227,7 @@ class CaseViewPagination(discord.ui.View):
                 mod_name = f"ID:{record['moderator_id']}"
             
             violation = (
-                f"**Дело #{record['id']}** — {reason} | {duration_str}\n"
+                f"**Дело #{record.get('case_id') or record['id']}** — {reason} | {duration_str}\n"
                 f"   Баллы: {record['points_delta']} | {mod_name} | {date_str}"
             )
             violations.append(violation)
@@ -248,23 +251,66 @@ class CaseViewPagination(discord.ui.View):
         return embed
 
 
-class RsnCog(commands.Cog):
-    """Система наказаний (баллы честности, мут, бан)."""
+class SetupConfirmView(discord.ui.View):
+    """Подтверждение /rsn_setup: применить запреты на каналах. Нажимать может только вызвавший."""
+
+    def __init__(self, author_id: int, plan: list):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.plan = plan
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.author_id
+
+    @discord.ui.button(label="Применить", style=discord.ButtonStyle.danger)
+    async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content=f"Ставлю запреты… ({len(self.plan)})", view=None)
+        done = failed = 0
+        # По одному: у Discord лимиты на правку каналов, discord.py сам выдерживает паузы.
+        for channel, role, overwrite in self.plan:
+            try:
+                await channel.set_permissions(role, overwrite=overwrite, reason="РСН: настройка ролей наказания")
+                done += 1
+            except discord.HTTPException as e:
+                failed += 1
+                print(f"[RSN] setup: {channel} / {role}: {e}")
+        result = f"✓ Готово: поставлено запретов — {done}."
+        if failed:
+            result += f" Не удалось — {failed} (скорее всего, у бота нет прав на эти каналы; см. консоль)."
+        await interaction.edit_original_response(content=result)
+        self.stop()
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Отменено.", view=None)
+        self.stop()
+
+
+class RsnCog(CaseMixin, commands.Cog):
+    """Система наказаний (баллы честности, дела, мут, бан). Логика дел — в _rsn_cases.CaseMixin."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.db = RsnDatabase()
-        
+        self.guild_id = GUILD_ID
+        self.rsn_data = RSN_DATA
+        self.save_rsn_config = save_rsn_config
+
         # Запуск фоновых задач
         self._weekly_gain_task.start()
         self._check_expired_punishments_task.start()
         self._monthly_export_reminder_task.start()
+
+    async def cog_load(self):
+        # Кнопки срока бана (0 очков) работают и после перезапуска: чей бан и срок — в custom_id.
+        self.bot.add_dynamic_items(BanTermButton)
 
     def cog_unload(self):
         """Остановить фоновые задачи при выгрузке."""
         self._weekly_gain_task.cancel()
         self._check_expired_punishments_task.cancel()
         self._monthly_export_reminder_task.cancel()
+        self.bot.remove_dynamic_items(BanTermButton)
         self.db.close()
 
     @commands.Cog.listener("on_ready")
@@ -364,127 +410,90 @@ class RsnCog(commands.Cog):
             return ""
         return "\nАккаунты: " + ", ".join(f"<@{account_id}>" for account_id in account_ids)
 
-    def _mute_role(self):
-        guild = self.bot.get_guild(GUILD_ID)
-        mute_role_id = RSN_DATA.get("mute_role_id", 0)
-        return guild.get_role(mute_role_id) if guild and mute_role_id else None
-
     async def _sync_twinks(self):
         """
-        Дела твинков — на основной аккаунт, роль мута — на все аккаунты замученного.
+        Дела твинков — на основной аккаунт, роль наказания — на все аккаунты замученного.
         Ловит твинки, привязанные или зашедшие на сервер уже во время мута, и перезаход.
         """
         for user_id in self.db.get_all_user_ids():
             if self._accounts(user_id)[0] != user_id:
                 self._case_owner(user_id)
 
-        role = self._mute_role()
-        if not role:
-            return
-
         for punishment in self.db.get_active_punishments("mute"):
-            for member in self._guild_members(punishment["user_id"]):
-                if role not in member.roles:
-                    try:
-                        await member.add_roles(role, reason="Мут действует на все аккаунты человека")
-                        print(f"[RSN] Mute role given to account {member.id} of muted user {punishment['user_id']}")
-                    except Exception as e:
-                        print(f"[RSN] Failed to give mute role to {member.id}: {e}")
+            record = self.db.get_record(punishment["record_id"])
+            role = self._punish_role(record.get("points_before") if record else None)
+            if role:
+                await self._give_role(punishment["user_id"], role, "Мут действует на все аккаунты человека")
 
     @commands.Cog.listener("on_member_join")
     async def _mute_on_join(self, member: discord.Member):
-        """Замученный (или его твинк) перезашёл на сервер — роль мута возвращается сразу."""
+        """Замученный (или его твинк) перезашёл — роль наказания и метка 1–10 возвращаются сразу."""
         if member.guild.id != GUILD_ID or member.bot:
             return
 
-        punishment = self.db.get_active_punishment(self._case_owner(member.id))
-        role = self._mute_role()
-        if not punishment or punishment["kind"] != "mute" or not role:
-            return
+        owner_id = self._case_owner(member.id)
+        punishment = self.db.get_active_punishment(owner_id)
+        if punishment and punishment["kind"] == "mute":
+            record = self.db.get_record(punishment["record_id"])
+            role = self._punish_role(record.get("points_before") if record else None)
+            if role:
+                try:
+                    await member.add_roles(role, reason="Мут ещё действует")
+                except discord.HTTPException as e:
+                    print(f"[RSN] Failed to give mute role on join to {member.id}: {e}")
 
-        try:
-            await member.add_roles(role, reason="Мут ещё действует")
-        except Exception as e:
-            print(f"[RSN] Failed to give mute role on join to {member.id}: {e}")
-
-    async def _remove_mute_role(self, user_id: int) -> bool:
-        """Снять роль мута со всех аккаунтов человека (best-effort). True — если ни с кем не сорвалось."""
-        mute_role_id = RSN_DATA.get("mute_role_id", 0)
-        if not mute_role_id:
-            print("[RSN] Mute role ID is not configured")
-            return False
-
-        role = self._mute_role()
-        if not role:
-            print(f"[RSN] Mute role {mute_role_id} not found on guild")
-            return False
-
-        members = self._guild_members(user_id)
-        if not members:
-            print(f"[RSN] Member {user_id} not found in guild, cannot remove mute role")
-            return False
-
-        success = True
-        for member in members:
-            if role not in member.roles:
-                continue
-            try:
-                await member.remove_roles(role, reason="Срок мута истёк")
-                print(f"[RSN] Removed mute role {mute_role_id} from user {member.id}")
-            except Exception as e:
-                print(f"[RSN] Failed to remove mute role from {member.id}: {e}")
-                success = False
-
-        return success
+        await self._sync_marker(owner_id)
 
     async def _process_expired_punishment(self, punishment: dict):
-        """Обработать истёкшее наказание.
-
-        - мут: снять роль мута (если участник на сервере) и очистить наказание;
-        - бан: снять наказание в БД, сбросить баллы и уведомить модераторов
-          (разбан выполняется вручную);
-        - отправить ЛС пользователю и залогировать действие.
         """
-        user_id = punishment['user_id']
-        kind = punishment['kind']
-        record_id = punishment.get('record_id')
+        Срок наказания истёк: мут — снять роли и доступ к чату дела (последний — дело закрывается
+        с логом); бан — бот сам разбанивает все аккаунты, человек выходит ровно с 10 очками.
+        """
+        owner_id = punishment["user_id"]
+        kind = punishment["kind"]
+        record = await self._release(owner_id, None)
+        case_id = record.get("case_id") if record else punishment.get("record_id")
 
-        self.db.delete_active_punishment(user_id)
-
-        if kind == 'ban':
-            try:
-                self.db.set_points(user_id, RESET_POINTS_ON_RETURN)
-                print(f"[RSN] Reset points for user {user_id} to {RESET_POINTS_ON_RETURN}")
-            except Exception as points_error:
-                print(f"[RSN] Failed to reset points for {user_id}: {points_error}")
-        else:
-            # Автоматическое снятие роли мута (best-effort)
-            await self._remove_mute_role(user_id)
-
-        kind_ru = "мут" if kind == "mute" else "бан"
-        print(f"[RSN] Expired {kind} punishment for user {user_id} processed")
-
-        if kind == 'ban':
+        if kind == "ban":
             await self._send_dm(
-                user_id,
-                "✓ Срок вашего бана истёк. Разбан будет выполнен модератором вручную."
-            )
-            await self._notify_moderators(
-                f"Бан пользователя <@{user_id}> (`{user_id}`) истёк "
-                f"(дело #{record_id}). Разбаньте вручную.{self._accounts_note(user_id)}"
+                owner_id,
+                f"✓ Срок вашего бана истёк — вы разбанены. Очков порядочности: {RESET_POINTS_AFTER_BAN}."
             )
         else:
-            await self._send_dm(
-                user_id,
-                "✓ Срок вашего мута истёк, роль мута снята автоматически."
-            )
+            await self._send_dm(owner_id, "✓ Срок вашего мута истёк, ограничения сняты.")
 
         await self._log_action(
             "Истечение срока наказания",
-            f"**Дело #{record_id}** | <@{user_id}> (`{user_id}`) | тип: {kind_ru}",
-            user_id,
+            f"**Дело #{case_id}** | <@{owner_id}> (`{owner_id}`) | тип: {'бан' if kind == 'ban' else 'мут'}",
+            owner_id,
             self.bot.user.id if self.bot.user else 0
         )
+
+    async def _check_admin(self, interaction: discord.Interaction) -> bool:
+        """Только роли из admin_role_ids (бан, разбан, настройка). Важны роли, а не тип объекта."""
+        if self._is_admin(interaction.user):
+            return True
+        await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
+        return False
+
+    @staticmethod
+    async def _reply_error(interaction: discord.Interaction, text: str):
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+
+    async def _chat_intro(self, channel, case_id: int, owner_id: int, what: str, reason: str, before: int, after: int):
+        """Первое сообщение участнику в чате дела."""
+        try:
+            await channel.send(
+                f"**Дело #{case_id}** · <@{owner_id}> — {what}.\n"
+                f"Причина: {reason}\nБаллы: {before} → {after}\n"
+                f"-# Здесь можно поговорить с администрацией. Переписка сохраняется в лог дела.",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        except discord.HTTPException as e:
+            print(f"[RSN] Чат дела #{case_id}: {e}")
 
     async def _check_permissions(self, interaction: discord.Interaction) -> bool:
         """Проверить, есть ли у пользователя права администратора или модератора."""
@@ -633,7 +642,7 @@ class RsnCog(commands.Cog):
                         except:
                             mod_name = f"ID:{record['moderator_id']}"
                         
-                        duration_str = format_duration(record['duration_hours'])
+                        duration_str = record_term(record)
                         created_dt = datetime.fromtimestamp(
                             record['created_at'],
                             tz=timezone.utc
@@ -641,7 +650,7 @@ class RsnCog(commands.Cog):
                         date_str = created_dt.strftime("%d.%m.%Y %H:%M")
 
                         violation = (
-                            f"**Дело #{record['id']}** — {record['reason']} | {duration_str}\n"
+                            f"**Дело #{record.get('case_id') or record['id']}** — {record['reason']} | {duration_str}\n"
                             f"   Баллы: {record['points_delta']} | {mod_name} | {date_str}"
                         )
                         violations.append(violation)
@@ -698,6 +707,7 @@ class RsnCog(commands.Cog):
             owner_id = self._case_owner(user.id)
             self.db.set_points(owner_id, points)
             self.db.set_active(owner_id, 1)
+            await self._sync_marker(owner_id)
 
             embed = discord.Embed(
                 title="✓ Баллы установлены",
@@ -764,6 +774,7 @@ class RsnCog(commands.Cog):
             
             self.db.set_points(owner_id, new_points)
             self.db.set_active(owner_id, 1)
+            await self._sync_marker(owner_id)
 
             embed = discord.Embed(
                 title="✓ Баллы добавлены",
@@ -824,6 +835,7 @@ class RsnCog(commands.Cog):
             
             self.db.set_points(owner_id, new_points)
             self.db.set_active(owner_id, 1)
+            await self._sync_marker(owner_id)
 
             embed = discord.Embed(
                 title="✓ Баллы сняты",
@@ -848,33 +860,49 @@ class RsnCog(commands.Cog):
 
     # ===== Commands: Case Management =====
 
+    def _resolve_record(self, case_id: int, user: Optional[discord.User]):
+        """
+        Запись участника дела по номеру дела (номер видят люди; у дела может быть несколько
+        участников). :return: (запись, None) или (None, текст ошибки).
+        """
+        records = self.db.get_case_records(case_id)
+        if not records:
+            return None, f"❌ Дело #{case_id} не найдено."
+        if user is not None:
+            owner_id = self._case_owner(user.id)
+            records = [r for r in records if r["user_id"] == owner_id]
+            if not records:
+                return None, f"❌ {user.mention} не участник дела #{case_id}."
+        elif len({r["user_id"] for r in records}) > 1:
+            return None, f"❌ В деле #{case_id} несколько участников — укажите, чью запись (`user`)."
+        return records[-1], None
+
     @app_commands.command(
         name="rsn_case_edit",
-        description="Отредактировать запись в личном деле"
+        description="Отредактировать запись участника дела"
     )
     @app_commands.guilds(GUILD_ID)
+    @app_commands.describe(case="Номер дела", reason="Причина", points_delta="Сколько баллов снято",
+                           duration="Срок мута: 30m или 2h (для мута)", user="Чья запись (если участников несколько)")
     async def case_edit(
         self,
         interaction: discord.Interaction,
-        record_id: int,
+        case: int,
         reason: str,
         points_delta: int,
-        duration: str
+        duration: Optional[str] = None,
+        user: Optional[discord.User] = None
     ):
         """Отредактировать запись."""
         try:
             if not await self._check_permissions(interaction):
                 return
 
-            record = self.db.get_record(record_id)
-            if not record:
-                await interaction.response.send_message(
-                    f"❌ Запись #{record_id} не найдена.",
-                    ephemeral=True
-                )
+            record, error = self._resolve_record(case, user)
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
                 return
 
-            # Валидация введённых данных
             if points_delta < 0:
                 await interaction.response.send_message(
                     "❌ Баллы должны быть неотрицательным числом (≥ 0).",
@@ -882,25 +910,22 @@ class RsnCog(commands.Cog):
                 )
                 return
 
-            total_minutes = parse_duration(duration)
-            if total_minutes is None:
-                await interaction.response.send_message(
-                    DURATION_FORMAT_HINT,
-                    ephemeral=True
-                )
-                return
-            duration_hours = total_minutes / 60
+            duration_hours = None
+            if record['kind'] == 'mute' and duration is not None:
+                total_minutes = parse_duration(duration)
+                if total_minutes is None:
+                    await interaction.response.send_message(DURATION_FORMAT_HINT, ephemeral=True)
+                    return
+                duration_hours = total_minutes / 60
 
-            # Обработать знак баллов в зависимости от типа нарушения
-            if record['kind'] == 'mute':
-                # Для мута баллы должны быть отрицательными (списание)
-                points_delta = abs(points_delta) * (-1) if points_delta != 0 else 0
-            elif record['kind'] == 'ban':
-                # Для бана баллы всегда 0 (баллы не списываются)
+            # Знак баллов по виду записи: мут и запись без мута — списание, бан — без баллов
+            if record['kind'] == 'ban':
                 points_delta = 0
+            else:
+                points_delta = -abs(points_delta)
 
             self.db.edit_record(
-                record_id=record_id,
+                record_id=record['id'],
                 reason=reason,
                 points_delta=points_delta,
                 duration_hours=duration_hours
@@ -908,292 +933,223 @@ class RsnCog(commands.Cog):
 
             embed = discord.Embed(
                 title="✓ Запись отредактирована",
-                description=f"Запись #{record_id} обновлена",
+                description=f"Дело #{case} · <@{record['user_id']}>",
                 color=0x2F3136
             )
             await interaction.response.send_message(embed=embed, ephemeral=False)
 
             await self._log_action(
                 "Редактирование записи",
-                f"**Дело #{record_id}** изменена",
+                f"**Дело #{case}** | <@{record['user_id']}>: запись изменена",
                 record['user_id'],
                 interaction.user.id
             )
 
-        except Exception as e:
+        except Exception:
             print(f"[RSN] Error in case_edit: {traceback.format_exc()}")
-            await interaction.response.send_message(
-                "❌ Ошибка при редактировании записи.",
-                ephemeral=True
-            )
-
+            await self._reply_error(interaction, "❌ Ошибка при редактировании записи.")
 
     @app_commands.command(
         name="rsn_case_delete",
-        description="Удалить запись из личного дела"
+        description="Удалить запись участника из дела"
     )
     @app_commands.guilds(GUILD_ID)
+    @app_commands.describe(case="Номер дела", user="Чья запись (если участников несколько)")
     async def case_delete(
         self,
         interaction: discord.Interaction,
-        record_id: int
+        case: int,
+        user: Optional[discord.User] = None
     ):
-        """Удалить запись."""
+        """Удалить запись. Было действующее наказание по ней — снимаются роли."""
         try:
             if not await self._check_permissions(interaction):
                 return
 
-            record = self.db.get_record(record_id)
-            if not record:
-                await interaction.response.send_message(
-                    f"❌ Запись #{record_id} не найдена.",
-                    ephemeral=True
-                )
+            record, error = self._resolve_record(case, user)
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
                 return
 
-            user_id = record['user_id']
-            self.db.delete_record(record_id)
+            await interaction.response.defer()
 
-            # Если активного мута больше нет — снять роль мута (best-effort)
-            active_punishment = self.db.get_active_punishment(user_id)
-            if not active_punishment or active_punishment['kind'] != 'mute':
-                await self._remove_mute_role(user_id)
+            owner_id = record['user_id']
+            punishment = self.db.get_active_punishment(owner_id)
+            was_active = bool(punishment and punishment['record_id'] == record['id'])
+
+            self.db.delete_record(record['id'])
+
+            if was_active:
+                if punishment['kind'] == 'ban':
+                    await self._unban_accounts(owner_id, "РСН: запись о бане удалена")
+                else:
+                    await self._remove_punish_roles(owner_id, "РСН: запись о муте удалена")
+                await self._remove_from_case_chat(case, owner_id)
+            await self._sync_marker(owner_id)
+
+            if not self.db.get_case_records(case):
+                await self._close_case(case, interaction.user.id)
+            else:
+                await self._close_case_if_done(case, interaction.user.id)
 
             embed = discord.Embed(
                 title="✓ Запись удалена",
-                description=f"Запись #{record_id} удалена",
+                description=f"Дело #{case} · <@{owner_id}>",
                 color=0x2F3136
             )
-            await interaction.response.send_message(embed=embed, ephemeral=False)
+            await interaction.followup.send(embed=embed)
 
             await self._log_action(
                 "Удаление записи",
-                f"**Дело #{record_id}** удалена",
-                user_id,
+                f"**Дело #{case}** | <@{owner_id}>: запись удалена",
+                owner_id,
                 interaction.user.id
             )
 
-        except Exception as e:
+        except Exception:
             print(f"[RSN] Error in case_delete: {traceback.format_exc()}")
-            await interaction.response.send_message(
-                "❌ Ошибка при удалении записи.",
-                ephemeral=True
-            )
+            await self._reply_error(interaction, "❌ Ошибка при удалении записи.")
 
-    
     @app_commands.command(
         name="rsn_mute",
-        description="Выдать мут пользователю с автоматическим расчётом длительности"
+        description="Мут: роль по уровню, срок ×1/×2/×3 по очкам, чат дела"
     )
     @app_commands.guilds(GUILD_ID)
+    @app_commands.describe(user="Кого", duration="Срок: 30m или 2h (умножается по уровню)", reason="Причина",
+                           points="Сколько баллов снять", case="Номер открытого дела — добавить в него (необязательно)")
     async def mute(
         self,
         interaction: discord.Interaction,
         user: discord.User,
         duration: str,
         reason: str,
-        points: int
+        points: int,
+        case: Optional[int] = None
     ):
-        """Выдать мут. Множитель длительности определяется по баллам ДО списания."""
+        """
+        Мут (РСН 2.0). Уровень — по очкам ДО списания: 31–50 «Мут» ×1, 11–30 «Изоляция» ×2,
+        0–10 «Изоляция» ×3. Участник получает доступ к чату дела (нет чата — создаётся).
+        Дошёл до 0 — мут бессрочный, админам уходит запрос срока бана.
+        """
         try:
             if not await self._check_permissions(interaction):
                 return
 
-            # Проверка: пользователь не должен быть ботом
             if user.bot:
-                await interaction.response.send_message(
-                    "❌ Нельзя мутить ботов.",
-                    ephemeral=True
-                )
+                await interaction.response.send_message("❌ Нельзя мутить ботов.", ephemeral=True)
                 return
 
-            # Дело, баллы и наказание — на основной аккаунт, роль мута — на все аккаунты человека
+            # Дело, баллы и наказание — на основной аккаунт, роли и чат — всем аккаунтам человека
             owner_id = self._case_owner(user.id)
 
-            # Проверка: у пользователя не должно быть активного мута
-            active_punishment = self.db.get_active_punishment(owner_id)
-            if active_punishment and active_punishment['kind'] == 'mute':
-                await interaction.response.send_message(
-                    f"❌ На {user.mention} уже наложен мут.",
-                    ephemeral=True
-                )
+            active = self.db.get_active_punishment(owner_id)
+            if active:
+                kind = "мут" if active['kind'] == 'mute' else "бан"
+                await interaction.response.send_message(f"❌ На {user.mention} уже наложен {kind}.", ephemeral=True)
                 return
 
-            # Валидация времени наказания (минуты/часы, только положительные)
             total_minutes = parse_duration(duration)
             if total_minutes is None:
-                await interaction.response.send_message(
-                    DURATION_FORMAT_HINT,
-                    ephemeral=True
-                )
+                await interaction.response.send_message(DURATION_FORMAT_HINT, ephemeral=True)
                 return
 
-            # Валидация баллов для списания
             if points <= 0:
                 await interaction.response.send_message(
-                    "❌ Баллы для списания должны быть положительными (> 0).",
-                    ephemeral=True
+                    "❌ Баллы для списания должны быть положительными (> 0).", ephemeral=True
                 )
                 return
 
-            # Аккаунты человека на сервере (для выдачи роли мута)
-            members = self._guild_members(owner_id)
-            if not members:
-                await interaction.response.send_message(
-                    f"❌ {user.mention} не найден на сервере.",
-                    ephemeral=True
-                )
+            if case is not None:
+                case_row = self.db.get_case(case)
+                if not case_row or case_row['status'] != 'open':
+                    await interaction.response.send_message(f"❌ Открытого дела #{case} нет.", ephemeral=True)
+                    return
+
+            if not self._guild_members(owner_id):
+                await interaction.response.send_message(f"❌ {user.mention} не найден на сервере.", ephemeral=True)
                 return
 
-            # Получить роль мута из конфига
-            mute_role_id = RSN_DATA.get("mute_role_id", 0)
-            if not mute_role_id:
-                await interaction.response.send_message(
-                    "❌ Роль мута не настроена (mute_role_id в rsn_data.json).",
-                    ephemeral=True
-                )
-                return
-
-            mute_role = interaction.guild.get_role(mute_role_id)
-            if not mute_role:
-                await interaction.response.send_message(
-                    f"❌ Роль мута с ID `{mute_role_id}` не найдена на сервере.",
-                    ephemeral=True
-                )
-                return
-
-            # Проверить иерархию ролей бота
-            if mute_role >= interaction.guild.me.top_role:
-                await interaction.response.send_message(
-                    "❌ Не удалось выдать мут: роль мута выше роли бота.",
-                    ephemeral=True
-                )
-                return
-
-            # Гарантировать запись о пользователе
             score = self.db.ensure_score(owner_id)
-            current_points = score['points']
+            before = score['points']
+            level = level_for(before)
+            role = self._punish_role(before)
 
-            # Определить множитель по ТЕКУЩИМ баллам (перед списанием)
-            # OLD: multiplier = get_multiplier_for_points(current_points)
-            multiplier = get_multiplier_for_points(current_points)
-
-            # Итоговая длительность (целочисленная арифметика в минутах)
-            actual_minutes = total_minutes * multiplier
-            actual_duration = actual_minutes / 60
-            expires_at = int(time.time()) + (actual_minutes * 60)
-            print(f"[RSN] Mute calculation: duration={total_minutes}m, multiplier={multiplier}, actual={actual_minutes}m, expires_at={expires_at}")
-
-            # Выдать роль мута всем аккаунтам (реальная модерация)
-            muted = 0
-            for member in members:
-                try:
-                    await member.add_roles(mute_role, reason=reason)
-                    muted += 1
-                    print(f"[RSN] Assigned mute role {mute_role_id} to user {member.id}")
-                except Exception:
-                    print(f"[RSN] Failed to assign mute role to {member.id}: {traceback.format_exc()}")
-
-            if not muted:
+            if role is None:
                 await interaction.response.send_message(
-                    "❌ Не удалось выдать роль мута. Проверьте права бота.",
-                    ephemeral=True
+                    "❌ Роли наказания не настроены — администратору: `/rsn_setup`.", ephemeral=True
                 )
                 return
 
-            # Списать баллы (с валидацией диапазона)
-            new_points = current_points - points
-            if new_points < 0:
-                new_points = 0
-            self.db.set_points(owner_id, new_points)
+            if role >= interaction.guild.me.top_role:
+                await interaction.response.send_message(
+                    f"❌ Роль {role.mention} выше роли бота — бот не может её выдать.", ephemeral=True
+                )
+                return
+
+            # Дальше — создание канала и роли: дольше 3 секунд, которые Discord ждёт ответа.
+            await interaction.response.defer()
+
+            if not await self._give_role(owner_id, role, reason):
+                await interaction.followup.send("❌ Не удалось выдать роль. Проверьте права бота.", ephemeral=True)
+                return
+
+            actual_minutes = total_minutes * level.multiplier
+            hours = actual_minutes / 60
+            after = max(before - points, 0)
+            self.db.set_points(owner_id, after)
             self.db.set_active(owner_id, 1)
 
-            # Создать запись
+            case_id = case if case is not None else self.db.create_case(created_by=interaction.user.id)
             record_id = self.db.create_record(
-                user_id=owner_id,
-                kind="mute",
-                reason=reason,
-                duration_hours=actual_duration,
-                points_delta=-points,
-                moderator_id=interaction.user.id
+                owner_id, "mute", reason, hours, -points, interaction.user.id,
+                case_id=case_id, points_before=before,
             )
 
-            # Если баллы <= ban_trigger (0), записать перманентное наказание
-            ban_trigger = SCALE_THRESHOLDS.get("ban_trigger", 0)
-            if new_points <= ban_trigger:
-                # Перманентное наказание (expires_at = None)
-                self.db.create_or_update_punishment(
-                    user_id=owner_id,
-                    kind="mute",
-                    expires_at=None,
-                    record_id=record_id
-                )
+            # 0 очков — мут до решения админов о бане
+            expires_at = None if after <= 0 else int(time.time()) + actual_minutes * 60
+            self.db.create_or_update_punishment(owner_id, "mute", expires_at, record_id)
 
-                # Отправить уведомление в admin_notify_channel_id
-                notify_channel_id = RSN_DATA.get("admin_notify_channel_id", 0)
-                if notify_channel_id:
-                    notify_channel = self.bot.get_channel(notify_channel_id)
-                    if notify_channel:
-                        embed = discord.Embed(
-                            title="⚠️ Критический уровень",
-                            description=f"{user.mention}: {new_points} ≤ {ban_trigger}",
-                            color=0x8B0000
-                        )
-                        try:
-                            await notify_channel.send(embed=embed)
-                        except:
-                            pass
-            else:
-                # Обычный таймер мута
-                self.db.create_or_update_punishment(
-                    user_id=owner_id,
-                    kind="mute",
-                    expires_at=expires_at,
-                    record_id=record_id
-                )
-                print(f"[RSN] Created mute punishment for user {owner_id}: expires_at={expires_at}")
+            channel = await self._add_to_case_chat(case_id, owner_id)
+            await self._sync_marker(owner_id)
 
+            term = format_duration(hours) if expires_at else "до решения администрации"
+            what = f"мут {term} (уровень {level.name}, ×{level.multiplier})"
+            if channel:
+                await self._chat_intro(channel, case_id, owner_id, what, reason, before, after)
+            if after <= 0:
+                await self._ask_ban(owner_id, case_id)
+
+            chat_line = f"\nЧат дела: {channel.mention}" if channel else ""
             embed = discord.Embed(
                 title="✓ Мут выдан",
-                description=f"**Дело #{record_id}**\n{user.mention}: **{format_duration(actual_duration)}** (x{multiplier})\n"
-                          f"Причина: {reason}\nБаллы: {current_points} → {new_points}"
-                          f"{self._accounts_note(owner_id)}",
+                description=f"**Дело #{case_id}**\n{user.mention}: **{term}** (уровень {level.name}, ×{level.multiplier})\n"
+                            f"Причина: {reason}\nБаллы: {before} → {after}{chat_line}{self._accounts_note(owner_id)}",
                 color=0x2F3136
             )
-            await interaction.response.send_message(embed=embed, ephemeral=False)
+            await interaction.followup.send(embed=embed)
 
             await self._log_action(
                 "Выдача мута",
-                f"**Дело #{record_id}** | {user.mention}: {reason}\nДлит: {format_duration(actual_duration)} "
-                f"(x{multiplier})\nБаллы: {current_points} → {new_points}{self._accounts_note(owner_id)}",
+                f"**Дело #{case_id}** | {user.mention}: {reason}\nСрок: {term} (уровень {level.name}, ×{level.multiplier})\n"
+                f"Баллы: {before} → {after}{self._accounts_note(owner_id)}",
                 owner_id,
                 interaction.user.id
             )
 
-            # Отправить ЛС пользователю (best-effort) — на основной аккаунт
-            try:
-                dm_user = await self.bot.fetch_user(owner_id)
-                dm = await dm_user.create_dm()
-                await dm.send(
-                    f"⚠️ Вам выдан мут на сервере.\n"
-                    f"**Дело:** #{record_id}\n"
-                    f"**Причина:** {reason}\n"
-                    f"**Длительность:** {format_duration(actual_duration)}\n"
-                    f"**Баллы:** {current_points} → {new_points}"
-                )
-            except Exception as dm_error:
-                print(f"[RSN] Could not send DM to user {user.id}: {dm_error}")
-
-        except Exception as e:
-            print(f"[RSN] Error in mute: {traceback.format_exc()}")
-            await interaction.response.send_message(
-                "❌ Ошибка при выдаче мута.",
-                ephemeral=True
+            await self._send_dm(
+                owner_id,
+                f"⚠️ Вам выдан мут на сервере.\n**Дело:** #{case_id}\n**Причина:** {reason}\n"
+                f"**Срок:** {term}\n**Баллы:** {before} → {after}"
+                + (f"\nПоговорить с администрацией можно в чате дела: {channel.mention}" if channel else "")
             )
+
+        except Exception:
+            print(f"[RSN] Error in mute: {traceback.format_exc()}")
+            await self._reply_error(interaction, "❌ Ошибка при выдаче мута.")
 
     @app_commands.command(
         name="rsn_unmute",
-        description="Снять мут пользователю досрочно"
+        description="Снять мут досрочно"
     )
     @app_commands.guilds(GUILD_ID)
     async def unmute(
@@ -1201,120 +1157,323 @@ class RsnCog(commands.Cog):
         interaction: discord.Interaction,
         user: discord.User
     ):
-        """Снять мут досрочно (баллы НЕ меняются)."""
+        """Снять мут досрочно (баллы НЕ меняются). Освобождение записывается — кто и когда."""
         try:
             if not await self._check_permissions(interaction):
                 return
 
             owner_id = self._case_owner(user.id)
-
-            # Получить активное наказание
             punishment = self.db.get_active_punishment(owner_id)
-            if not punishment:
-                await interaction.response.send_message(
-                    f"❌ У {user.mention} нет активного мута.",
-                    ephemeral=True
-                )
+            if not punishment or punishment['kind'] != 'mute':
+                hint = " Он забанен — `/rsn_unban`." if punishment else ""
+                await interaction.response.send_message(f"❌ У {user.mention} нет активного мута.{hint}", ephemeral=True)
                 return
 
-            # Удалить из активных наказаний (баллы НЕ меняются) — до снятия роли,
-            # чтобы синхронизация твинков не вернула роль обратно
-            self.db.delete_active_punishment(owner_id)
-
-            # Снять роль мута со всех аккаунтов (best-effort)
-            removed = await self._remove_mute_role(owner_id)
+            await interaction.response.defer()
+            record = await self._release(owner_id, interaction.user.id)
+            case_id = record.get('case_id') if record else None
 
             embed = discord.Embed(
                 title="✓ Мут снят",
-                description=f"{user.mention}: освобожден",
+                description=f"**Дело #{case_id}**\n{user.mention}: освобождён досрочно",
                 color=0x2F3136
             )
-            await interaction.response.send_message(embed=embed, ephemeral=False)
+            await interaction.followup.send(embed=embed)
 
             await self._log_action(
                 "Снятие мута",
-                f"{user.mention} освобожден"
-                + ("" if removed else " (роль мута не была снята)"),
+                f"**Дело #{case_id}** | {user.mention} освобождён досрочно",
                 owner_id,
                 interaction.user.id
             )
 
-            # Отправить ЛС пользователю (best-effort)
-            try:
-                dm_user = await self.bot.fetch_user(owner_id)
-                dm = await dm_user.create_dm()
-                await dm.send(
-                    f"✓ Ваш мут на сервере был снят."
-                )
-            except Exception as dm_error:
-                print(f"[RSN] Could not send DM to user {user.id}: {dm_error}")
+            await self._send_dm(owner_id, "✓ Ваш мут на сервере был снят.")
 
-        except Exception as e:
+        except Exception:
             print(f"[RSN] Error in unmute: {traceback.format_exc()}")
-            await interaction.response.send_message(
-                "❌ Ошибка при снятии мута.",
-                ephemeral=True
-            )
+            await self._reply_error(interaction, "❌ Ошибка при снятии мута.")
+
+    @app_commands.command(
+        name="rsn_ban",
+        description="Забанить (все аккаунты человека). Только для администраторов"
+    )
+    @app_commands.guilds(GUILD_ID)
+    @app_commands.describe(user="Кого (можно ID)", reason="Причина",
+                           duration="Срок: 12h, 7d… Пусто — навсегда")
+    async def ban(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User,
+        reason: str,
+        duration: Optional[str] = None
+    ):
+        """Бан через бота: все аккаунты (твинки), по сроку бот сам разбанит, человек выйдет с 10 очками."""
+        try:
+            if not await self._check_admin(interaction):
+                return
+
+            if user.bot:
+                await interaction.response.send_message("❌ Нельзя банить ботов.", ephemeral=True)
+                return
+
+            minutes = None
+            if duration is not None:
+                minutes = parse_term(duration)
+                if minutes is None:
+                    await interaction.response.send_message(
+                        "❌ Не понял срок. Пример: `30m`, `12h`, `14d` (или пусто — навсегда).", ephemeral=True
+                    )
+                    return
+
+            owner_id = self._case_owner(user.id)
+            active = self.db.get_active_punishment(owner_id)
+            if active and active['kind'] == 'ban':
+                await interaction.response.send_message(f"❌ {user.mention} уже забанен.", ephemeral=True)
+                return
+
+            await interaction.response.defer()
+            record_id = await self._ban(owner_id, minutes, reason, interaction.user.id)
+            case_id = self.db.get_record(record_id)['case_id']
+
+            text = f"**Дело #{case_id}**\n{user.mention}: бан {format_minutes(minutes)}\nПричина: {reason}{self._accounts_note(owner_id)}"
+            await interaction.followup.send(embed=discord.Embed(title="🚫 Бан", description=text, color=0x8B0000))
+            await self._log_action("Бан", text, owner_id, interaction.user.id)
+
+        except Exception:
+            print(f"[RSN] Error in ban: {traceback.format_exc()}")
+            await self._reply_error(interaction, "❌ Ошибка при бане.")
 
     @app_commands.command(
         name="rsn_unban",
-        description="Зафиксировать досрочное снятие бана (вручную)"
+        description="Разбанить досрочно (все аккаунты, 10 очков). Только для администраторов"
     )
     @app_commands.guilds(GUILD_ID)
     async def unban(
         self,
         interaction: discord.Interaction,
-        user: discord.User,
-        reset_points: bool = True
+        user: discord.User
     ):
-        """Досрочное снятие бана: убрать активное наказание из БД (без действий в Discord)."""
+        """Досрочный разбан: бот снимает бан со всех аккаунтов, человек выходит ровно с 10 очками."""
         try:
-            if not await self._check_permissions(interaction):
+            if not await self._check_admin(interaction):
                 return
 
             owner_id = self._case_owner(user.id)
             punishment = self.db.get_active_punishment(owner_id)
             if not punishment or punishment['kind'] != 'ban':
+                await interaction.response.send_message(f"❌ У {user.mention} нет активного бана.", ephemeral=True)
+                return
+
+            await interaction.response.defer()
+            record = await self._release(owner_id, interaction.user.id)
+            case_id = record.get('case_id') if record else None
+
+            text = f"**Дело #{case_id}**\n{user.mention}: разбанен, очков — **{RESET_POINTS_AFTER_BAN}**{self._accounts_note(owner_id)}"
+            await interaction.followup.send(embed=discord.Embed(title="✓ Бан снят", description=text, color=0x2F3136))
+            await self._log_action("Досрочное снятие бана", text, owner_id, interaction.user.id)
+            await self._send_dm(owner_id, "✓ Ваш бан на сервере был снят.")
+
+        except Exception:
+            print(f"[RSN] Error in unban: {traceback.format_exc()}")
+            await self._reply_error(interaction, "❌ Ошибка при снятии бана.")
+
+    @app_commands.command(
+        name="rsn_case",
+        description="Дело без мута: запись с причиной и баллами (0 — предупреждение), по желанию с чатом"
+    )
+    @app_commands.guilds(GUILD_ID)
+    @app_commands.describe(user="Кого", reason="Причина", points="Сколько баллов снять (0 — предупреждение)",
+                           chat="Открыть чат дела для разговора (без мута)",
+                           case="Номер открытого дела — добавить в него (необязательно)")
+    async def case_record(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User,
+        reason: str,
+        points: int = 0,
+        chat: bool = False,
+        case: Optional[int] = None
+    ):
+        """Запись в дело без мута. Чат без мута закрывается командой /rsn_case_close (с логом)."""
+        try:
+            if not await self._check_permissions(interaction):
+                return
+
+            if user.bot:
+                await interaction.response.send_message("❌ Нельзя заводить дела на ботов.", ephemeral=True)
+                return
+
+            if points < 0:
+                await interaction.response.send_message("❌ Баллы — неотрицательное число.", ephemeral=True)
+                return
+
+            case_row = None
+            if case is not None:
+                case_row = self.db.get_case(case)
+                if not case_row or case_row['status'] != 'open':
+                    await interaction.response.send_message(f"❌ Открытого дела #{case} нет.", ephemeral=True)
+                    return
+
+            owner_id = self._case_owner(user.id)
+            await interaction.response.defer()
+
+            score = self.db.ensure_score(owner_id)
+            before = score['points']
+            after = max(before - points, 0)
+            self.db.set_points(owner_id, after)
+            self.db.set_active(owner_id, 1)
+
+            case_id = case if case is not None else self.db.create_case(created_by=interaction.user.id, manual_chat=chat)
+            self.db.create_record(
+                owner_id, "warn", reason, None, -points, interaction.user.id,
+                case_id=case_id, points_before=before,
+            )
+
+            channel = None
+            if chat or (case_row and case_row['channel_id']):
+                channel = await self._add_to_case_chat(case_id, owner_id)
+            if channel is None and case is None:
+                self.db.close_case(case_id, interaction.user.id)  # просто запись — дело сразу закрыто
+
+            await self._sync_marker(owner_id)
+
+            what = "предупреждение" if points == 0 else f"снято {points} баллов"
+            if channel:
+                await self._chat_intro(channel, case_id, owner_id, what, reason, before, after)
+
+            active = self.db.get_active_punishment(owner_id)
+            if after <= 0 < points and not (active and active['kind'] == 'ban'):
+                await self._ask_ban(owner_id, case_id)
+
+            chat_line = f"\nЧат дела: {channel.mention}" if channel else ""
+            text = f"**Дело #{case_id}**\n{user.mention}: {what}\nПричина: {reason}\nБаллы: {before} → {after}{chat_line}"
+            await interaction.followup.send(embed=discord.Embed(title="✓ Запись в деле", description=text, color=0x2F3136))
+            await self._log_action("Дело без мута", text, owner_id, interaction.user.id)
+            await self._send_dm(
+                owner_id,
+                f"⚠️ В ваше личное дело внесена запись.\n**Дело:** #{case_id}\n**Причина:** {reason}\n"
+                f"**Баллы:** {before} → {after}" + (f"\nЧат дела: {channel.mention}" if channel else "")
+            )
+
+        except Exception:
+            print(f"[RSN] Error in case_record: {traceback.format_exc()}")
+            await self._reply_error(interaction, "❌ Ошибка при записи в дело.")
+
+    @app_commands.command(
+        name="rsn_case_close",
+        description="Закрыть дело: лог переписки в канал логов, чат удаляется"
+    )
+    @app_commands.guilds(GUILD_ID)
+    @app_commands.describe(case="Номер дела")
+    async def case_close(self, interaction: discord.Interaction, case: int):
+        """Закрыть дело, по которому никто не наказан (обычно — чат без мута)."""
+        try:
+            if not await self._check_permissions(interaction):
+                return
+
+            case_row = self.db.get_case(case)
+            if not case_row or case_row['status'] != 'open':
+                await interaction.response.send_message(f"❌ Открытого дела #{case} нет.", ephemeral=True)
+                return
+
+            active = self.db.get_case_active_users(case, kinds=("mute",))
+            if active:
+                who = ", ".join(f"<@{user_id}>" for user_id in active)
                 await interaction.response.send_message(
-                    f"❌ У {user.mention} нет активного бана.",
+                    f"❌ По делу #{case} ещё действует наказание: {who}. Сначала снимите мут (`/rsn_unmute`).",
                     ephemeral=True
                 )
                 return
 
-            self.db.delete_active_punishment(owner_id)
+            await interaction.response.defer()
+            await self._close_case(case, interaction.user.id)
+            await interaction.followup.send(f"✓ Дело #{case} закрыто, лог — в канале логов РСН.")
+            await self._log_action("Закрытие дела", f"**Дело #{case}** закрыто", 0, interaction.user.id)
 
-            if reset_points:
-                self.db.set_points(owner_id, RESET_POINTS_ON_RETURN)
+        except Exception:
+            print(f"[RSN] Error in case_close: {traceback.format_exc()}")
+            await self._reply_error(interaction, "❌ Ошибка при закрытии дела.")
 
-            description = f"{user.mention}: освобождён"
-            if reset_points:
-                description += " | Баллы восстановлены: **" + str(RESET_POINTS_ON_RETURN) + "**"
+    # ===== Commands: Setup =====
 
-            embed = discord.Embed(
-                title="✓ Бан снят",
-                description=description,
-                color=0x2F3136
+    def _add_marker_to_karma(self, marker) -> str:
+        """Метка 1–10 — в заблокированные роли кармы (карма знает о метке сама; решение Alium)."""
+        # Без импорта: если модуль кармы не загружен, импорт создал бы его базу и файлы.
+        karma_state = sys.modules.get("modules.karma_sistem._state")
+        data = getattr(karma_state, "data", None)
+        if data is None:
+            return "⚠️ Модуль кармы не загружен — добавьте метку в заблокированные роли кармы вручную (/settings_karma)."
+        ids = list(data.blocked_roles_id or [])
+        if marker.id in ids:
+            return "Метка уже в заблокированных ролях кармы."
+        ids.append(marker.id)
+        data.blocked_roles_id = ids
+        return "Метка добавлена в заблокированные роли кармы — карма ей не начисляется."
+
+    @app_commands.command(
+        name="rsn_setup",
+        description="Настроить роли наказания и запреты на каналах. Только для администраторов"
+    )
+    @app_commands.guilds(GUILD_ID)
+    async def setup_roles(self, interaction: discord.Interaction):
+        """
+        Создаёт роли «Мут», «Изоляция», «Порицание» (если их нет) и показывает, сколько запретов
+        поставит на категориях и каналах. Применяет по кнопке. Можно повторять после новых каналов.
+        """
+        try:
+            if not await self._check_admin(interaction):
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            guild = interaction.guild
+            created = []
+
+            async def ensure(key: str, name: str):
+                role = self._role(key)
+                if role is None:
+                    role = await guild.create_role(name=name, reason="РСН: роль наказания (/rsn_setup)")
+                    RSN_DATA[key] = role.id
+                    created.append(role.mention)
+                return role
+
+            mute = await ensure("mute_role_id", "Мут")
+            isolation = await ensure("isolation_role_id", "Изоляция")
+            marker = await ensure("marker_role_id", "Порицание")
+            save_rsn_config()
+
+            karma_note = self._add_marker_to_karma(marker)
+
+            case_channels = {row["channel_id"] for row in map(dict, self.db.conn.execute(
+                "SELECT channel_id FROM rsn_cases WHERE status = 'open' AND channel_id IS NOT NULL"
+            ))}
+            plan = plan_overwrites(
+                guild.channels,
+                [(mute, MUTE_OVERWRITE), (isolation, ISOLATION_OVERWRITE)],
+                skip_channel_ids=case_channels,
             )
-            await interaction.response.send_message(embed=embed, ephemeral=False)
 
-            await self._log_action(
-                "Досрочное снятие бана",
-                f"{user.mention} освобождён{self._accounts_note(owner_id)}",
-                owner_id,
-                interaction.user.id
+            header = (
+                f"Роли: «Мут» {mute.mention} · «Изоляция» {isolation.mention} · «Порицание» {marker.mention}"
+                + (f"\nСозданы: {', '.join(created)}" if created else "")
+                + f"\n{karma_note}"
             )
 
-            await self._send_dm(
-                owner_id,
-                "✓ Ваш бан на сервере был снят."
+            if not plan:
+                await interaction.followup.send(header + "\n\n✓ Запреты на всех каналах уже стоят.", ephemeral=True)
+                return
+
+            channels = len({channel.id for channel, _, _ in plan})
+            view = SetupConfirmView(interaction.user.id, plan)
+            await interaction.followup.send(
+                header + f"\n\nБудет поставлено запретов: **{len(plan)}** (каналов и категорий: **{channels}**). "
+                         f"«Мут» — не писать, не реагировать, не заходить в войс; «Изоляция» — не видеть. Применить?",
+                view=view,
+                ephemeral=True,
             )
 
         except Exception:
-            print(f"[RSN] Error in unban: {traceback.format_exc()}")
-            await interaction.response.send_message(
-                "❌ Ошибка при снятии бана.",
-                ephemeral=True
-            )
+            print(f"[RSN] Error in setup_roles: {traceback.format_exc()}")
+            await self._reply_error(interaction, "❌ Ошибка настройки.")
 
     # ===== Commands: Manual Ban Recording =====
 
@@ -1466,7 +1625,7 @@ class RsnCog(commands.Cog):
             output = io.StringIO()
             writer = csv.writer(output)
             writer.writerow([
-                "ID", "User ID", "Kind", "Reason", "Duration (h)",
+                "ID", "Case", "User ID", "Kind", "Reason", "Duration (h)",
                 "Points Delta", "Moderator ID", "Created At"
             ])
 
@@ -1477,6 +1636,7 @@ class RsnCog(commands.Cog):
                 )
                 writer.writerow([
                     r['id'],
+                    r.get('case_id'),
                     r['user_id'],
                     r['kind'],
                     r['reason'],
@@ -1616,6 +1776,9 @@ class RsnCog(commands.Cog):
 
             # После истёкших — чтобы не вернуть роль тому, у кого мут только что кончился
             await self._sync_twinks()
+
+            # Метка 1–10: выдать тем, у кого ≤ 10, снять у тех, у кого стало больше (недельный +1)
+            await self._sync_all_markers()
 
         except Exception:
             print(f"[RSN] Error in check_expired_punishments: {traceback.format_exc()}")
