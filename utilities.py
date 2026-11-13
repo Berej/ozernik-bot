@@ -472,6 +472,57 @@ class Database:
                 ON activity(kind, hour);
             """)
 
+            # Личные войсы (решения Alium 2026-11-08, модуль voice_manager). Всё ведётся на
+            # человека (users.id), а не на аккаунт: войс с твинка — войс основного.
+            #
+            # Сохранённые настройки (/voice_save): следующий войс создаётся с ними.
+            # allowed — JSON-список Discord ID, кого пускать в закрытый войс.
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS personal_voices (
+                    user_id INTEGER PRIMARY KEY,
+                    name TEXT,
+                    user_limit INTEGER NOT NULL DEFAULT 0,
+                    locked INTEGER NOT NULL DEFAULT 0,
+                    allowed TEXT NOT NULL DEFAULT '[]',
+                    saved_at INTEGER NOT NULL DEFAULT 0,
+
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+            """)
+
+            # Каждый созданный личный войс: чей он. deleted_at IS NULL — канал жив.
+            # Строки не удаляются вместе с каналом: по ним статистика каналов сможет
+            # показывать удалённый войс как «Войс Имя». Поэтому и без внешнего ключа на users:
+            # история не должна пропадать (и не должна мешать удалить пользователя).
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS personal_voice_channels (
+                    channel_id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    category_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    deleted_at INTEGER
+                );
+            """)
+
+            self.execute("""
+                CREATE INDEX IF NOT EXISTS idx_personal_voice_channels_user
+                ON personal_voice_channels(user_id, deleted_at);
+            """)
+
+            # Кто сколько минут сидел в чьих личных войсах (owner — владелец войса, visitor —
+            # кто сидел, включая самого владельца). Пока только копится — показ в будущей плашке.
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS personal_voice_minutes (
+                    owner_id INTEGER NOT NULL,
+                    visitor_id INTEGER NOT NULL,
+                    minutes INTEGER NOT NULL DEFAULT 0,
+
+                    PRIMARY KEY (owner_id, visitor_id),
+                    FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY (visitor_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+            """)
+
             # Таблица мостов
             self.execute("""
                 CREATE TABLE IF NOT EXISTS chat_links (
@@ -882,6 +933,140 @@ class Database:
         """, (offset, user_id, kind, since, until))
 
         return {row["day"]: row["amount"] for row in rows}
+
+    # Личные войсы
+
+    def get_personal_voice_settings(self, user_id: int) -> dict | None:
+        """Сохранённые настройки войса человека: name (None — стандартное), user_limit, locked, allowed."""
+        row = self.fetchone("SELECT * FROM personal_voices WHERE user_id = ?", (user_id,))
+
+        if row is None:
+            return None
+
+        settings = dict(row)
+        settings["locked"] = bool(settings["locked"])
+        settings["allowed"] = json.loads(settings["allowed"] or "[]")
+        return settings
+
+    def save_personal_voice_settings(self, user_id: int, name: str | None, user_limit: int,
+                                     locked: bool, allowed: list[int]) -> None:
+        with self.transaction():
+            self.execute("""
+                INSERT INTO personal_voices (user_id, name, user_limit, locked, allowed, saved_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    name = excluded.name,
+                    user_limit = excluded.user_limit,
+                    locked = excluded.locked,
+                    allowed = excluded.allowed,
+                    saved_at = excluded.saved_at
+            """, (user_id, name, user_limit, int(locked), json.dumps(sorted(set(allowed))), int(time.time())))
+
+    def delete_personal_voice_settings(self, user_id: int) -> bool:
+        with self.transaction():
+            row = self.fetchone("DELETE FROM personal_voices WHERE user_id = ? RETURNING user_id", (user_id,))
+        return row is not None
+
+    def add_personal_voice(self, channel_id: int, user_id: int, category_id: int | None) -> None:
+        with self.transaction():
+            self.execute("""
+                INSERT OR REPLACE INTO personal_voice_channels (channel_id, user_id, category_id, created_at, deleted_at)
+                VALUES (?, ?, ?, ?, NULL)
+            """, (channel_id, user_id, category_id, int(time.time())))
+
+    def get_personal_voice(self, channel_id: int) -> dict | None:
+        row = self.fetchone("SELECT * FROM personal_voice_channels WHERE channel_id = ?", (channel_id,))
+        return dict(row) if row else None
+
+    def get_live_personal_voice(self, user_id: int) -> dict | None:
+        """Живой (не удалённый) войс человека; если их почему-то несколько — последний созданный."""
+        row = self.fetchone("""
+            SELECT *
+            FROM personal_voice_channels
+            WHERE user_id = ?
+              AND deleted_at IS NULL
+            ORDER BY created_at DESC, channel_id DESC
+            LIMIT 1
+        """, (user_id,))
+        return dict(row) if row else None
+
+    def get_live_personal_voices(self) -> list[dict]:
+        rows = self.fetchall("SELECT * FROM personal_voice_channels WHERE deleted_at IS NULL ORDER BY channel_id")
+        return [dict(row) for row in rows]
+
+    def set_personal_voice_owner(self, channel_id: int, user_id: int) -> None:
+        with self.transaction():
+            self.execute("UPDATE personal_voice_channels SET user_id = ? WHERE channel_id = ?", (user_id, channel_id))
+
+    def mark_personal_voice_deleted(self, channel_id: int) -> None:
+        with self.transaction():
+            self.execute("""
+                UPDATE personal_voice_channels
+                SET deleted_at = ?
+                WHERE channel_id = ?
+                  AND deleted_at IS NULL
+            """, (int(time.time()), channel_id))
+
+    def get_personal_voice_owners(self, channel_ids: list[int]) -> dict[int, dict]:
+        """
+        Какие из каналов — личные войсы (живые и удалённые).
+
+        :return: {ID канала: {'user_id': владелец, 'category_id': категория}}.
+        """
+        if not channel_ids:
+            return {}
+
+        result = {}
+        ids = list(channel_ids)
+        # SQLite ограничивает число параметров в запросе — берём пачками.
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            rows = self.fetchall(f"""
+                SELECT channel_id, user_id, category_id
+                FROM personal_voice_channels
+                WHERE channel_id IN ({", ".join("?" * len(chunk))})
+            """, tuple(chunk))
+            for row in rows:
+                result[row["channel_id"]] = {"user_id": row["user_id"], "category_id": row["category_id"]}
+
+        return result
+
+    def add_personal_voice_minutes_many(self, rows: list[tuple[int, int, int]]) -> None:
+        """
+        Прибавляет минуты одной транзакцией.
+
+        :param rows: (владелец войса, кто сидел, минут) — внутренние ID.
+        """
+        if not rows:
+            return
+
+        with self.transaction():
+            for owner_id, visitor_id, minutes in rows:
+                self.execute("""
+                    INSERT INTO personal_voice_minutes (owner_id, visitor_id, minutes)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(owner_id, visitor_id) DO UPDATE SET minutes = minutes + excluded.minutes
+                """, (owner_id, visitor_id, minutes))
+
+    def get_personal_voice_visitors(self, owner_id: int) -> list[tuple[int, int]]:
+        """Кто сколько минут сидел в войсах человека: (внутренний ID, минут), от большего."""
+        rows = self.fetchall("""
+            SELECT visitor_id, minutes
+            FROM personal_voice_minutes
+            WHERE owner_id = ?
+            ORDER BY minutes DESC, visitor_id
+        """, (owner_id,))
+        return [(row["visitor_id"], row["minutes"]) for row in rows]
+
+    def get_personal_voice_hosts(self, visitor_id: int) -> list[tuple[int, int]]:
+        """В чьих войсах человек сколько минут сидел: (внутренний ID владельца, минут), от большего."""
+        rows = self.fetchall("""
+            SELECT owner_id, minutes
+            FROM personal_voice_minutes
+            WHERE visitor_id = ?
+            ORDER BY minutes DESC, owner_id
+        """, (visitor_id,))
+        return [(row["owner_id"], row["minutes"]) for row in rows]
 
     def delete_user(self, user_id: int) -> bool:
         """

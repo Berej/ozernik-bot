@@ -549,6 +549,26 @@ class KarmaDatabase(Database):
                 # Награды за ивенты — основному.
                 self.execute("UPDATE karma_event_awards SET user_id = ? WHERE user_id = ?", (user_id, twink_id))
 
+                # Личные войсы: настройки — основному, если своих нет; каналы — основному
+                # (статистика каналов — по владельцу); минуты складываются —
+                # и в войсах твинка, и твинка в чужих войсах.
+                self.execute("""
+                    INSERT OR IGNORE INTO personal_voices (user_id, name, user_limit, locked, allowed, saved_at)
+                    SELECT ?, name, user_limit, locked, allowed, saved_at
+                    FROM personal_voices
+                    WHERE user_id = ?
+                """, (user_id, twink_id))
+                self.execute("UPDATE personal_voice_channels SET user_id = ? WHERE user_id = ?", (user_id, twink_id))
+                self.execute("""
+                    INSERT INTO personal_voice_minutes (owner_id, visitor_id, minutes)
+                    SELECT CASE WHEN owner_id = ? THEN ? ELSE owner_id END,
+                           CASE WHEN visitor_id = ? THEN ? ELSE visitor_id END,
+                           minutes
+                    FROM personal_voice_minutes
+                    WHERE owner_id = ? OR visitor_id = ?
+                    ON CONFLICT(owner_id, visitor_id) DO UPDATE SET minutes = minutes + excluded.minutes
+                """, (twink_id, user_id, twink_id, user_id, twink_id, twink_id))
+
                 # Сообщения моста ссылаются на пользователя без каскада — переносим, иначе удаление упадёт.
                 self.execute("UPDATE messages SET user_id = ? WHERE user_id = ?", (user_id, twink_id))
 
