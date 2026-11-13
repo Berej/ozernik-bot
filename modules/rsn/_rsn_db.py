@@ -8,6 +8,39 @@ from pathlib import Path
 from typing import Optional, List
 import time
 
+# Дело (РСН 2.0, решение Alium 2026-11-07): номер, чат, статус. У дела участники — у каждого
+# своя запись в rsn_records (причина, баллы, срок), т.к. в одном деле могут нарушить разные правила.
+CASES_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS rsn_cases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+        channel_id INTEGER,                        -- чат дела (NULL — без чата)
+        manual_chat INTEGER NOT NULL DEFAULT 0,    -- чат без мута: закрывается командой
+        created_by INTEGER,
+        created_at INTEGER NOT NULL,
+        closed_at INTEGER,
+        closed_by INTEGER
+    )
+"""
+
+# Запись участника дела. kind: mute — мут, ban — бан, warn — без мута (предупреждение/снятие баллов).
+RECORDS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS {name} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        case_id INTEGER REFERENCES rsn_cases(id),
+        user_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('mute', 'ban', 'warn')),
+        reason TEXT NOT NULL,
+        duration_hours REAL,
+        points_delta INTEGER NOT NULL DEFAULT 0,
+        moderator_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        points_before INTEGER,                     -- баллы до записи (для логов: «35 → 25»)
+        released_at INTEGER,                       -- когда освобождён из мута/бана
+        released_by INTEGER                        -- кто освободил досрочно (NULL — по сроку)
+    )
+"""
+
 
 class RsnDatabase:
     """
@@ -41,19 +74,9 @@ class RsnDatabase:
             )
         """)
 
-        # Таблица записей о нарушениях (мут, бан)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS rsn_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                kind TEXT NOT NULL CHECK (kind IN ('mute', 'ban')),
-                reason TEXT NOT NULL,
-                duration_hours REAL,
-                points_delta INTEGER NOT NULL DEFAULT 0,
-                moderator_id INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-            )
-        """)
+        # Дела и записи участников дел
+        cursor.execute(CASES_TABLE_SQL)
+        cursor.execute(RECORDS_TABLE_SQL.format(name="rsn_records"))
 
         # Таблица активных наказаний
         cursor.execute("""
@@ -66,6 +89,58 @@ class RsnDatabase:
         """)
 
         self.conn.commit()
+
+        self._migrate_records_to_cases()
+
+    def _migrate_records_to_cases(self):
+        """
+        Старые базы (до РСН 2.0): записи без дел и без вида 'warn'. Каждая старая запись
+        становится делом с тем же номером (номера, которые видели люди, не меняются);
+        дело открыто, если по записи ещё действует наказание.
+
+        Таблицу приходится пересоздать: SQLite не меняет CHECK у существующей таблицы.
+        Порядок важен: новая таблица под временным именем → копия → удалить старую →
+        переименовать новую. Вариант «переименовать старую» в современных SQLite переписал бы
+        внешний ключ rsn_active_punishments на переименованную старую — и после её удаления
+        ссылки повисли бы. Внешние ключи на время выключены (иначе DROP откажет: на старую
+        ссылаются), включаются обратно с проверкой целостности.
+        """
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(rsn_records)")}
+        if "case_id" in columns:
+            return
+
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys = OFF")  # вне транзакции — внутри не действует
+        try:
+            self.conn.execute("BEGIN")
+            try:
+                self.conn.execute(RECORDS_TABLE_SQL.format(name="rsn_records_new"))
+                self.conn.execute("""
+                    INSERT INTO rsn_records_new
+                        (id, case_id, user_id, kind, reason, duration_hours, points_delta, moderator_id, created_at)
+                    SELECT id, id, user_id, kind, reason, duration_hours, points_delta, moderator_id, created_at
+                    FROM rsn_records
+                """)
+                self.conn.execute("""
+                    INSERT INTO rsn_cases (id, status, created_by, created_at, closed_at)
+                    SELECT id, 'closed', moderator_id, created_at, created_at FROM rsn_records
+                """)
+                self.conn.execute("""
+                    UPDATE rsn_cases SET status = 'open', closed_at = NULL
+                    WHERE id IN (SELECT record_id FROM rsn_active_punishments)
+                """)
+                self.conn.execute("DROP TABLE rsn_records")
+                self.conn.execute("ALTER TABLE rsn_records_new RENAME TO rsn_records")
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        finally:
+            self.conn.execute("PRAGMA foreign_keys = ON")
+
+        broken = self.conn.execute("PRAGMA foreign_key_check").fetchall()
+        if broken:
+            raise RuntimeError(f"РСН: после переноса в дела нарушены ссылки: {broken}")
 
     def close(self):
         """Закрытие БД."""
@@ -120,6 +195,10 @@ class RsnDatabase:
         cursor.execute("UPDATE rsn_score SET active = ? WHERE user_id = ?", (active, user_id))
         self.conn.commit()
 
+    def get_all_scores(self) -> List[dict]:
+        """Очки всех, у кого есть запись (для обхода меток уровня 1–10)."""
+        return [dict(row) for row in self.conn.execute("SELECT * FROM rsn_score")]
+
     def get_all_active_users(self) -> List[dict]:
         """Получить всех пользователей с active=1."""
         cursor = self.conn.cursor()
@@ -134,18 +213,85 @@ class RsnDatabase:
         reason: str,
         duration_hours: Optional[float],
         points_delta: int,
-        moderator_id: int
+        moderator_id: int,
+        case_id: Optional[int] = None,
+        points_before: Optional[int] = None,
     ) -> int:
-        """Создать запись о нарушении. Вернуть id записи."""
+        """
+        Создать запись участника дела. Вернуть id записи.
+        Без case_id создаётся новое дело (закрытое — для записей без чата и наказания
+        его закрывает вызывающий код; см. create_case).
+        """
         cursor = self.conn.cursor()
         created_at = int(time.time())
+        if case_id is None:
+            case_id = self.create_case(created_by=moderator_id)
         cursor.execute("""
             INSERT INTO rsn_records
-            (user_id, kind, reason, duration_hours, points_delta, moderator_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, kind, reason, duration_hours, points_delta, moderator_id, created_at))
+            (case_id, user_id, kind, reason, duration_hours, points_delta, moderator_id, created_at, points_before)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (case_id, user_id, kind, reason, duration_hours, points_delta, moderator_id, created_at, points_before))
         self.conn.commit()
         return cursor.lastrowid
+
+    # ===== Дела =====
+
+    def create_case(self, created_by: Optional[int] = None, manual_chat: bool = False) -> int:
+        """Открыть дело. Вернуть его номер."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO rsn_cases (status, manual_chat, created_by, created_at) VALUES ('open', ?, ?, ?)",
+            (int(manual_chat), created_by, int(time.time()))
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_case(self, case_id: int) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM rsn_cases WHERE id = ?", (case_id,)).fetchone()
+        return dict(row) if row else None
+
+    def set_case_channel(self, case_id: int, channel_id: Optional[int]):
+        self.conn.execute("UPDATE rsn_cases SET channel_id = ? WHERE id = ?", (channel_id, case_id))
+        self.conn.commit()
+
+    def close_case(self, case_id: int, closed_by: Optional[int] = None):
+        self.conn.execute(
+            "UPDATE rsn_cases SET status = 'closed', closed_at = ?, closed_by = ? WHERE id = ?",
+            (int(time.time()), closed_by, case_id)
+        )
+        self.conn.commit()
+
+    def get_case_records(self, case_id: int) -> List[dict]:
+        """Записи участников дела, в порядке добавления."""
+        rows = self.conn.execute(
+            "SELECT * FROM rsn_records WHERE case_id = ? ORDER BY id", (case_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_case_active_users(self, case_id: int, kinds: tuple = ("mute", "ban")) -> List[int]:
+        """Участники дела, чьё наказание по этому делу ещё действует (по умолчанию — мут или бан)."""
+        marks = ",".join("?" * len(kinds))
+        rows = self.conn.execute(f"""
+            SELECT DISTINCT p.user_id
+            FROM rsn_active_punishments p
+            JOIN rsn_records r ON r.id = p.record_id
+            WHERE r.case_id = ? AND p.kind IN ({marks})
+        """, (case_id, *kinds)).fetchall()
+        return [row["user_id"] for row in rows]
+
+    def get_open_case_of_channel(self, channel_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM rsn_cases WHERE channel_id = ? AND status = 'open'", (channel_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def release_record(self, record_id: int, released_by: Optional[int] = None):
+        """Отметить освобождение участника (released_by — кто досрочно; None — по сроку)."""
+        self.conn.execute(
+            "UPDATE rsn_records SET released_at = ?, released_by = ? WHERE id = ? AND released_at IS NULL",
+            (int(time.time()), released_by, record_id)
+        )
+        self.conn.commit()
 
     def get_record(self, record_id: int) -> Optional[dict]:
         """Получить запись по ID."""

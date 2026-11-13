@@ -9,13 +9,47 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import discord
 import pytest
 
-from conftest import FakeBot, FakeGuild, FakeRole, karma, make_interaction
+from conftest import FakeBot, FakeChannel, FakeGuild, FakeMember, FakeRole, karma, make_interaction
 import modules.rsn.rsn as rsn
 from modules.rsn._rsn_db import RsnDatabase
 
 MUTE_ROLE_ID = 777
+ISOLATION_ROLE_ID = 778
+MARKER_ROLE_ID = 779
+LOG_CHANNEL_ID = 7100
+NOTIFY_CHANNEL_ID = 7200
+ADMIN_ROLE_ID = 7300
+
+
+class FakeTextChannel:
+    """Чат дела: права, сообщения, удаление, история."""
+
+    def __init__(self, channel_id, name, overwrites, guild):
+        self.id, self.name, self.guild = channel_id, name, guild
+        self.overwrites = dict(overwrites)
+        self.mention = f"<#{channel_id}>"
+        self.messages = []
+        self.send = AsyncMock()
+        self.delete = AsyncMock()
+        self.set_permissions = AsyncMock(side_effect=self._set_permissions)
+
+    async def _set_permissions(self, target, overwrite=None, reason=None):
+        if overwrite is None:
+            self.overwrites.pop(target, None)
+        else:
+            self.overwrites[target] = overwrite
+
+    def overwrites_for(self, target):
+        return self.overwrites.get(target, discord.PermissionOverwrite())
+
+    def history(self, limit=None, oldest_first=False):
+        async def gen():
+            for message in self.messages:
+                yield message
+        return gen()
 
 
 class BotTopRole:
@@ -28,21 +62,51 @@ class BotTopRole:
 @pytest.fixture
 def rsn_env(monkeypatch):
     guild = FakeGuild()
-    guild.me = SimpleNamespace(top_role=BotTopRole())
+    guild.me = FakeMember(999, guild, bot=True)  # сам бот: участник (хэшируемый — ключ в правах канала)
+    guild.me.top_role = BotTopRole()
     mute_role = FakeRole(MUTE_ROLE_ID, "Мут", guild=guild)
     guild.roles[MUTE_ROLE_ID] = mute_role
+    isolation_role = FakeRole(ISOLATION_ROLE_ID, "Изоляция", guild=guild)
+    guild.roles[ISOLATION_ROLE_ID] = isolation_role
+    marker_role = FakeRole(MARKER_ROLE_ID, "Порицание", guild=guild)
+    guild.roles[MARKER_ROLE_ID] = marker_role
+    admin_role = FakeRole(ADMIN_ROLE_ID, "Админ", guild=guild)
+    guild.roles[ADMIN_ROLE_ID] = admin_role
+    guild.default_role = FakeRole(guild.id, "@everyone", guild=guild)
+    guild.filesize_limit = 10 * 1024 * 1024
+    guild.ban = AsyncMock()
+    guild.unban = AsyncMock()
 
     shared_db = karma.KarmaDatabase()  # общая база бота (в памяти)
     bot = FakeBot(shared_db, guild)
     bot.get_guild = lambda guild_id: guild if guild_id == guild.id else None
+    for channel_id in (LOG_CHANNEL_ID, NOTIFY_CHANNEL_ID):
+        bot.channels[channel_id] = FakeChannel(channel_id)
+
+    created = []
+
+    async def create_text_channel(name, overwrites=None, reason=None):
+        channel = FakeTextChannel(8000 + len(created), name, overwrites or {}, guild)
+        created.append(channel)
+        bot.channels[channel.id] = channel
+        return channel
+
+    guild.create_text_channel = AsyncMock(side_effect=create_text_channel)
 
     # Фоновые циклы не запускаем: собираем Cog без __init__.
     cog = rsn.RsnCog.__new__(rsn.RsnCog)
     cog.bot = bot
     cog.db = RsnDatabase(":memory:")
+    cog.guild_id = guild.id
+    cog.rsn_data = rsn.RSN_DATA
+    cog.save_rsn_config = lambda: None
     cog._check_permissions = AsyncMock(return_value=True)
 
-    for key, value in {"mute_role_id": MUTE_ROLE_ID, "log_channel_id": 0, "admin_notify_channel_id": 0}.items():
+    for key, value in {
+        "mute_role_id": MUTE_ROLE_ID, "isolation_role_id": ISOLATION_ROLE_ID, "marker_role_id": MARKER_ROLE_ID,
+        "log_channel_id": LOG_CHANNEL_ID, "admin_notify_channel_id": NOTIFY_CHANNEL_ID,
+        "admin_role_ids": [ADMIN_ROLE_ID], "moderator_role_ids": [],
+    }.items():
         monkeypatch.setitem(rsn.RSN_DATA, key, value)
 
     main = guild.add_member(1)
@@ -52,7 +116,9 @@ def rsn_env(monkeypatch):
         member.create_dm = AsyncMock(return_value=member.dm)
 
     yield SimpleNamespace(guild=guild, bot=bot, cog=cog, db=cog.db, shared_db=shared_db,
-                          mute_role=mute_role, main=main, twink=twink)
+                          mute_role=mute_role, isolation_role=isolation_role, marker_role=marker_role,
+                          admin_role=admin_role, main=main, twink=twink, created_channels=created,
+                          log=bot.channels[LOG_CHANNEL_ID], notify=bot.channels[NOTIFY_CHANNEL_ID])
     cog.db.close()
 
 
@@ -138,7 +204,7 @@ class TestRsnCommands:
         assert rsn_env.db.get_score(11) is None
         assert rsn_env.db.get_active_punishment(1)["kind"] == "mute"
         assert has_mute(rsn_env.main) and has_mute(rsn_env.twink)
-        description = interaction.response.send_message.call_args.kwargs["embed"].description
+        description = interaction.followup.send.call_args.kwargs["embed"].description
         assert "Аккаунты: <@1>, <@11>" in description
         assert "Вам выдан мут" in rsn_env.main.dm.send.call_args.args[0]
 

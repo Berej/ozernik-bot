@@ -386,6 +386,14 @@ def current_hour() -> int:
     """Начало текущего часа в Unix-секундах (UTC) — ключ журнала активности."""
     return int(time.time()) // 3600 * 3600
 
+MOSCOW_OFFSET = 3 * 3600  # UTC+3, переходов времени в Москве нет с 2014
+
+def moscow_day_start(timestamp: float | None = None) -> int:
+    """Начало московских суток (00:00 МСК) в Unix-секундах — ключ учёта по каналам."""
+    if timestamp is None:
+        timestamp = time.time()
+    return (int(timestamp) + MOSCOW_OFFSET) // 86400 * 86400 - MOSCOW_OFFSET
+
 class OzernikNotfound(Exception):
     """Озёрник не найден в Discord"""
     pass
@@ -470,6 +478,85 @@ class Database:
             self.execute("""
                 CREATE INDEX IF NOT EXISTS idx_activity_kind_hour
                 ON activity(kind, hour);
+            """)
+
+            # Учёт по каналам (плашка статистики *i — модуль stats, решения Alium 2026-11-14):
+            # сколько сообщений человек написал в канале и сколько минут просидел в войсе.
+            # hour — начало часа в Unix-секундах UTC, как в activity: по часам, чтобы «топ каналов
+            # за сутки» был за последние 24 часа, как «1 д» на главной, а не «с полуночи».
+            # Ветка — её канал. kind: 'messages', 'voice_presence'.
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS channel_activity (
+                    user_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    hour INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    amount INTEGER NOT NULL DEFAULT 0,
+
+                    PRIMARY KEY (user_id, kind, hour, channel_id),
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+            """)
+
+            # Первый заход на сервер — по аккаунтам. Discord помнит только последний заход
+            # (Member.joined_at): вышел и вернулся — дата новая. Бот хранит самую раннюю из
+            # виденных (решение Alium 2026-11-14), поэтому перезаход стаж не обнуляет.
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS member_joins (
+                    discord_id INTEGER PRIMARY KEY,
+                    first_joined_at INTEGER NOT NULL
+                );
+            """)
+
+            # Личные войсы (решения Alium 2026-11-08, модуль voice_manager). Всё ведётся на
+            # человека (users.id), а не на аккаунт: войс с твинка — войс основного.
+            #
+            # Сохранённые настройки (/voice_save): следующий войс создаётся с ними.
+            # allowed — JSON-список Discord ID, кого пускать в закрытый войс.
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS personal_voices (
+                    user_id INTEGER PRIMARY KEY,
+                    name TEXT,
+                    user_limit INTEGER NOT NULL DEFAULT 0,
+                    locked INTEGER NOT NULL DEFAULT 0,
+                    allowed TEXT NOT NULL DEFAULT '[]',
+                    saved_at INTEGER NOT NULL DEFAULT 0,
+
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+            """)
+
+            # Каждый созданный личный войс: чей он. deleted_at IS NULL — канал жив.
+            # Строки не удаляются вместе с каналом: по ним «Топ каналов» плашки *i
+            # показывает удалённый войс как «Войс Имя». Поэтому и без внешнего ключа на users:
+            # история не должна пропадать (и не должна мешать удалить пользователя).
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS personal_voice_channels (
+                    channel_id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    category_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    deleted_at INTEGER
+                );
+            """)
+
+            self.execute("""
+                CREATE INDEX IF NOT EXISTS idx_personal_voice_channels_user
+                ON personal_voice_channels(user_id, deleted_at);
+            """)
+
+            # Кто сколько минут сидел в чьих личных войсах (owner — владелец войса, visitor —
+            # кто сидел, включая самого владельца). Пока только копится — показ в будущей плашке.
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS personal_voice_minutes (
+                    owner_id INTEGER NOT NULL,
+                    visitor_id INTEGER NOT NULL,
+                    minutes INTEGER NOT NULL DEFAULT 0,
+
+                    PRIMARY KEY (owner_id, visitor_id),
+                    FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY (visitor_id) REFERENCES users(id) ON DELETE CASCADE
+                );
             """)
 
             # Таблица мостов
@@ -883,6 +970,235 @@ class Database:
 
         return {row["day"]: row["amount"] for row in rows}
 
+    def get_activity_total(self, user_id: int, kind: str, since: int, until: int) -> int:
+        """Сумма активности за период [since, until) — Unix-секунды."""
+        row = self.fetchone("""
+            SELECT COALESCE(SUM(amount), 0) AS total
+            FROM activity
+            WHERE user_id = ?
+              AND kind = ?
+              AND hour >= ?
+              AND hour < ?
+        """, (user_id, kind, since, until))
+        return row["total"]
+
+    def get_activity_start(self, kind: str) -> int | None:
+        """С какого часа на сервере вообще копится этот вид активности (None — ещё не копится)."""
+        row = self.fetchone("SELECT MIN(hour) AS start FROM activity WHERE kind = ?", (kind,))
+        return row["start"]
+
+    # Учёт по каналам
+
+    def add_channel_activity_many(self, rows: list[tuple[int, int, int, str, int]]) -> None:
+        """
+        Прибавляет к учёту по каналам одной транзакцией.
+
+        :param rows: (внутренний ID, ID канала, начало часа, вид, сколько).
+        """
+        if not rows:
+            return
+
+        with self.transaction():
+            for user_id, channel_id, hour, kind, amount in rows:
+                self.execute("""
+                    INSERT INTO channel_activity (user_id, channel_id, hour, kind, amount)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, kind, hour, channel_id) DO UPDATE SET amount = amount + excluded.amount
+                """, (user_id, channel_id, hour, kind, amount))
+
+    def get_top_channels(self, user_id: int, kind: str, since: int = 0, until: int = 2**62) -> list[tuple[int, int]]:
+        """Каналы человека за период [since, until) — Unix-секунды: (ID канала, сколько) от большего."""
+        rows = self.fetchall("""
+            SELECT channel_id, SUM(amount) AS amount
+            FROM channel_activity
+            WHERE user_id = ?
+              AND kind = ?
+              AND hour >= ?
+              AND hour < ?
+            GROUP BY channel_id
+            HAVING SUM(amount) > 0
+            ORDER BY amount DESC, channel_id
+        """, (user_id, kind, since, until))
+        return [(row["channel_id"], row["amount"]) for row in rows]
+
+    def get_channel_activity_start(self) -> int | None:
+        """С какого часа на сервере копится учёт по каналам (None — ещё не копится)."""
+        row = self.fetchone("SELECT MIN(hour) AS start FROM channel_activity")
+        return row["start"]
+
+    # Заходы на сервер
+
+    def note_member_joins(self, rows: list[tuple[int, int]]) -> None:
+        """
+        Запомнить заходы: (Discord ID, когда зашёл — Unix-секунды). Хранится самый ранний.
+        """
+        if not rows:
+            return
+
+        with self.transaction():
+            for discord_id, joined_at in rows:
+                self.execute("""
+                    INSERT INTO member_joins (discord_id, first_joined_at)
+                    VALUES (?, ?)
+                    ON CONFLICT(discord_id) DO UPDATE SET first_joined_at = MIN(first_joined_at, excluded.first_joined_at)
+                """, (discord_id, joined_at))
+
+    def get_first_join(self, discord_ids: list[int]) -> int | None:
+        """Самый ранний известный заход среди аккаунтов (человек с твинками — один)."""
+        if not discord_ids:
+            return None
+        row = self.fetchone(f"""
+            SELECT MIN(first_joined_at) AS joined
+            FROM member_joins
+            WHERE discord_id IN ({", ".join("?" * len(discord_ids))})
+        """, tuple(discord_ids))
+        return row["joined"]
+
+    # Личные войсы
+
+    def get_personal_voice_settings(self, user_id: int) -> dict | None:
+        """Сохранённые настройки войса человека: name (None — стандартное), user_limit, locked, allowed."""
+        row = self.fetchone("SELECT * FROM personal_voices WHERE user_id = ?", (user_id,))
+
+        if row is None:
+            return None
+
+        settings = dict(row)
+        settings["locked"] = bool(settings["locked"])
+        settings["allowed"] = json.loads(settings["allowed"] or "[]")
+        return settings
+
+    def save_personal_voice_settings(self, user_id: int, name: str | None, user_limit: int,
+                                     locked: bool, allowed: list[int]) -> None:
+        with self.transaction():
+            self.execute("""
+                INSERT INTO personal_voices (user_id, name, user_limit, locked, allowed, saved_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    name = excluded.name,
+                    user_limit = excluded.user_limit,
+                    locked = excluded.locked,
+                    allowed = excluded.allowed,
+                    saved_at = excluded.saved_at
+            """, (user_id, name, user_limit, int(locked), json.dumps(sorted(set(allowed))), int(time.time())))
+
+    def delete_personal_voice_settings(self, user_id: int) -> bool:
+        with self.transaction():
+            row = self.fetchone("DELETE FROM personal_voices WHERE user_id = ? RETURNING user_id", (user_id,))
+        return row is not None
+
+    def add_personal_voice(self, channel_id: int, user_id: int, category_id: int | None) -> None:
+        with self.transaction():
+            self.execute("""
+                INSERT OR REPLACE INTO personal_voice_channels (channel_id, user_id, category_id, created_at, deleted_at)
+                VALUES (?, ?, ?, ?, NULL)
+            """, (channel_id, user_id, category_id, int(time.time())))
+
+    def get_personal_voice(self, channel_id: int) -> dict | None:
+        row = self.fetchone("SELECT * FROM personal_voice_channels WHERE channel_id = ?", (channel_id,))
+        return dict(row) if row else None
+
+    def get_live_personal_voice(self, user_id: int) -> dict | None:
+        """Живой (не удалённый) войс человека; если их почему-то несколько — последний созданный."""
+        row = self.fetchone("""
+            SELECT *
+            FROM personal_voice_channels
+            WHERE user_id = ?
+              AND deleted_at IS NULL
+            ORDER BY created_at DESC, channel_id DESC
+            LIMIT 1
+        """, (user_id,))
+        return dict(row) if row else None
+
+    def get_live_personal_voices(self) -> list[dict]:
+        rows = self.fetchall("SELECT * FROM personal_voice_channels WHERE deleted_at IS NULL ORDER BY channel_id")
+        return [dict(row) for row in rows]
+
+    def set_personal_voice_owner(self, channel_id: int, user_id: int) -> None:
+        with self.transaction():
+            self.execute("UPDATE personal_voice_channels SET user_id = ? WHERE channel_id = ?", (user_id, channel_id))
+
+    def mark_personal_voice_deleted(self, channel_id: int) -> None:
+        with self.transaction():
+            self.execute("""
+                UPDATE personal_voice_channels
+                SET deleted_at = ?
+                WHERE channel_id = ?
+                  AND deleted_at IS NULL
+            """, (int(time.time()), channel_id))
+
+    def get_personal_voice_owners(self, channel_ids: list[int]) -> dict[int, dict]:
+        """
+        Какие из каналов — личные войсы (живые и удалённые).
+
+        :return: {ID канала: {'user_id': владелец, 'category_id': категория}}.
+        """
+        if not channel_ids:
+            return {}
+
+        result = {}
+        ids = list(channel_ids)
+        # SQLite ограничивает число параметров в запросе — берём пачками.
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            rows = self.fetchall(f"""
+                SELECT channel_id, user_id, category_id
+                FROM personal_voice_channels
+                WHERE channel_id IN ({", ".join("?" * len(chunk))})
+            """, tuple(chunk))
+            for row in rows:
+                result[row["channel_id"]] = {"user_id": row["user_id"], "category_id": row["category_id"]}
+
+        return result
+
+    def add_personal_voice_minutes_many(self, rows: list[tuple[int, int, int]]) -> None:
+        """
+        Прибавляет минуты одной транзакцией.
+
+        :param rows: (владелец войса, кто сидел, минут) — внутренние ID.
+        """
+        if not rows:
+            return
+
+        with self.transaction():
+            for owner_id, visitor_id, minutes in rows:
+                self.execute("""
+                    INSERT INTO personal_voice_minutes (owner_id, visitor_id, minutes)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(owner_id, visitor_id) DO UPDATE SET minutes = minutes + excluded.minutes
+                """, (owner_id, visitor_id, minutes))
+
+    def personal_voice_title(self, owner_id: int, guild) -> str:
+        """«Войс Имя» — по имени владельца на сервере сейчас; ушёл — по прозвищу из базы."""
+        owner = self.get_user(owner_id)
+        member = guild.get_member(owner.discord_id) if guild and owner else None
+
+        if member is not None:
+            return f'Войс {member.display_name}'
+        if owner is not None and owner.alias:
+            return f'Войс {owner.alias}'
+        return 'Войс ушедшего'
+
+    def get_personal_voice_visitors(self, owner_id: int) -> list[tuple[int, int]]:
+        """Кто сколько минут сидел в войсах человека: (внутренний ID, минут), от большего."""
+        rows = self.fetchall("""
+            SELECT visitor_id, minutes
+            FROM personal_voice_minutes
+            WHERE owner_id = ?
+            ORDER BY minutes DESC, visitor_id
+        """, (owner_id,))
+        return [(row["visitor_id"], row["minutes"]) for row in rows]
+
+    def get_personal_voice_hosts(self, visitor_id: int) -> list[tuple[int, int]]:
+        """В чьих войсах человек сколько минут сидел: (внутренний ID владельца, минут), от большего."""
+        rows = self.fetchall("""
+            SELECT owner_id, minutes
+            FROM personal_voice_minutes
+            WHERE visitor_id = ?
+            ORDER BY minutes DESC, owner_id
+        """, (visitor_id,))
+        return [(row["owner_id"], row["minutes"]) for row in rows]
+
     def delete_user(self, user_id: int) -> bool:
         """
         Удаляет пользователя из таблицы users.
@@ -1067,6 +1383,45 @@ class BridgeDatabase(Database):
         chat_link = self.get_chat_link(row['link_chat_id'], 'link_id')
 
         return DataTypes.MessageLink(row, chat_link)
+
+# ---------- Текст на картинках (Pillow) — общее для карточек кармы и плашки *i ----------
+
+# Символ, которого нет в шрифте, Pillow рисует пустым «квадратиком» .notdef.
+# Эмодзи и разделители вроде «・» в названиях каналов Roboto не умеет — их выкидываем.
+_NOTDEF_MASKS: dict[tuple[str, float], tuple] = {}
+
+
+def drop_missing_glyphs(text: str, font) -> str:
+    """Убирает символы, которых нет в шрифте, и обрезает оставшийся по краям мусор."""
+    key = (font.path, font.size)
+    if key not in _NOTDEF_MASKS:
+        mask = font.getmask(chr(0x10FFFF))
+        _NOTDEF_MASKS[key] = (mask.size, bytes(mask))
+
+    notdef = _NOTDEF_MASKS[key]
+
+    def has_glyph(char: str) -> bool:
+        if char.isspace():
+            return True
+        mask = font.getmask(char)
+        return (mask.size, bytes(mask)) != notdef
+
+    kept = ''.join(char for char in text if has_glyph(char))
+    return ' '.join(kept.split()).strip(' -_|.·•:')
+
+
+def fit_text(draw, text: str, font, max_length: float) -> str:
+    """Обрезает текст с «...», чтобы он влез в max_length пикселей."""
+    if draw.textlength(text, font=font) <= max_length:
+        return text
+
+    while text:
+        text = text[:-1]
+        if draw.textlength(text.rstrip() + '...', font=font) <= max_length:
+            return text.rstrip() + '...'
+
+    return ''
+
 
 class Assets:
     def __init__(self, path: Path):

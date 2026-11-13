@@ -498,6 +498,10 @@ class KarmaSistem(commands.Cog):
         if await self.handle_shortcut(message, member):
             return
 
+        # Сокращения других модулей (*i — плашка статистики) карму тоже не дают.
+        if self.is_foreign_shortcut(message.content):
+            return
+
         if self.check_blocked_channels(message.channel.id): # Проверка заблокирован ли канал
             return
 
@@ -509,15 +513,14 @@ class KarmaSistem(commands.Cog):
         if not self.can_get_karma(member):
             return
 
-        # Активность — каждое сообщение, даже без кармы из-за задержки (решение Alium).
-        self.note_activity(ozernik.id, 'messages')
+        # Сообщения в журнал активности пишет модуль статистики (stats) — все, не только те,
+        # что идут в карму (решение Alium 2026-11-14). Карма пишет туда только минуты Связи.
 
         # Кулдаун проверяется последним, чтобы сообщения без кармы его не запускали.
         if self.check_delay(ozernik.id):
             return
 
-        # В статистику — канал сообщения; ветка засчитывается своему каналу (решение Alium).
-        old_karma, new_karma = _state.db.add_karma(ozernik.id, 1, True, channel_id=parent_id or message.channel.id)
+        old_karma, new_karma = _state.db.add_karma(ozernik.id, 1, True)
 
         await self.give_level_up_message(member, old_karma.karma, new_karma.karma)
 
@@ -601,7 +604,6 @@ class KarmaSistem(commands.Cog):
         binds = _state.db.add_bind_karma_many(
             [(ozernik_1.id, ozernik_2.id) for (_, ozernik_1), (_, ozernik_2) in pairs],
             karma=1,
-            channel_id=channel.id,  # +1 минута каждому в статистику канала
         )
 
         for ((member_1, _), (member_2, _)), bind in zip(pairs, binds):
@@ -736,83 +738,24 @@ class KarmaSistem(commands.Cog):
 
         return discord.File(rank_card_bytes, filename=f"{member.name}_cube_rank.png")
 
-    async def build_stats_file(self, member: discord.Member, ozernik: DataTypes.Ozernik, kind: str) -> discord.File:
-        """Страница «Где пишу» (text) или «Где сижу» (voice) карточки Сансары."""
-        avatar = await get_discord_avatar(member)
-
-        # База и сервер — здесь, в основном потоке; рисование — в отдельном.
-        page = get_channel_stats_page(ozernik.id, kind, self.bot.guild)
-        color = get_status(_state.db.get_karma(ozernik.id))['color']
-
-        card_bytes = await asyncio.to_thread(create_stats_card, avatar, member.display_name, color, page)
-
-        return discord.File(card_bytes, filename=f"{member.name}_sansara_{kind}.png")
-
-    async def build_events_file(self, member: discord.Member, ozernik: DataTypes.Ozernik) -> discord.File:
-        """Страница «Ивенты» карточки Сансары: карма за ивенты и последние награды."""
-        avatar = await get_discord_avatar(member)
-
-        page = get_events_page(ozernik.id)
-        color = get_status(_state.db.get_karma(ozernik.id))['color']
-
-        card_bytes = await asyncio.to_thread(create_events_card, avatar, member.display_name, color, page)
-
-        return discord.File(card_bytes, filename=f"{member.name}_sansara_events.png")
-
-    async def build_guises_file(self, member: discord.Member, ozernik: DataTypes.Ozernik) -> discord.File:
-        """Страница «Другие обличья» карточки Сансары: основной аккаунт и твинки."""
-        avatar = await get_discord_avatar(member)
-        color = get_status(_state.db.get_karma(ozernik.id))['color']
-        moscow = self.bot.moscow_tz
-
-        links = [(ozernik.discord_id, None)] + _state.db.get_twink_links(ozernik.id)
-
-        async def load(n: int, discord_id: int, linked_at: int | None) -> dict:
-            # Аккаунт мог уйти с сервера — тогда берём его как пользователя Discord.
-            try:
-                user = await self.get_user_anywhere(discord_id)
-            except discord.HTTPException:
-                user = None
-
-            since = ''
-            if linked_at:
-                since = datetime.fromtimestamp(linked_at / 1000, moscow).strftime('%d.%m.%Y')
-
-            return {
-                'name': user.display_name if user else f'ID {discord_id}',
-                'avatar': await get_discord_avatar(user) if user else None,
-                'main': n == 0,
-                'since': since,
-            }
-
-        # Все аккаунты — одновременно (по очереди скачивания складывались).
-        accounts = list(await asyncio.gather(
-            *(load(n, discord_id, linked_at) for n, (discord_id, linked_at) in enumerate(links[:GUISES_ON_PAGE]))
-        ))
-
-        # Оставшиеся (больше восьми) не рисуются — только их число («и ещё N»).
-        accounts += [{'name': '', 'avatar': None, 'main': False, 'since': ''}] * (len(links) - len(accounts))
-
-        card_bytes = await asyncio.to_thread(create_guises_card, avatar, member.display_name, color, accounts)
-
-        return discord.File(card_bytes, filename=f"{member.name}_sansara_guises.png")
-
     # ------ СТРАНИЦЫ КАРТОЧЕК ------
 
     BINDS_PER_PAGE = 10
 
     def card_pages_count(self, card: str, ozernik_id: int) -> int:
         if card == 'rs':
-            # «Другие обличья» — последняя страница и только у тех, у кого есть твинки (решение Alium).
-            has_twinks = bool(_state.db.get_twinks(ozernik_id))
-            return len(SANSARA_PAGE_NAMES) if has_twinks else len(SANSARA_PAGE_NAMES) - 1
+            # Одна страница: «Где пишу/сижу», «Ивенты» и «Другие обличья» переехали в плашку *i
+            # (модуль stats; решение Alium 2026-11-14 — без дублей).
+            return 1
 
         binds = len(_state.db.get_user_top_karmic_binds(ozernik_id))
         return max(1, -(-binds // self.BINDS_PER_PAGE))  # деление с округлением вверх
 
-    async def build_card_page(self, card: str, target: discord.abc.User, page: int = 0) -> tuple[discord.File, dict]:
+    async def build_card_page(self, card: str, target: discord.abc.User, page: int = 0,
+                              invoker_id: int | None = None) -> tuple[discord.File, dict]:
         """
-        Картинка страницы карточки и кнопки к ней.
+        Картинка страницы карточки и кнопки к ней. Листать кнопками может только invoker_id —
+        тот, кто вызвал карточку (по умолчанию — её владелец).
 
         :return: (файл, {'view': кнопки} или {} — если страница одна).
         """
@@ -821,29 +764,25 @@ class KarmaSistem(commands.Cog):
         page %= pages  # связей могло стать меньше, чем было страниц, когда рисовалась кнопка
 
         if card == 'rs':
-            if page == 0:
-                file = await self.build_rank_sansara_file(target)
-            elif page == 3:
-                file = await self.build_events_file(target, ozernik)
-            elif page == 4:
-                file = await self.build_guises_file(target, ozernik)
-            else:
-                file = await self.build_stats_file(target, ozernik, ('text', 'voice')[page - 1])
+            file = await self.build_rank_sansara_file(target)
         else:
             file = await self.build_rank_cube_file(target, offset=page * self.BINDS_PER_PAGE)
 
-        view = card_pages_view(card, target.id, page, pages)
+        view = card_pages_view(card, target.id, page, pages, invoker_id if invoker_id is not None else target.id)
         return file, ({'view': view} if view else {})
 
-    async def turn_card_page(self, interaction: Interaction, card: str, user_id: int, page: int) -> None:
-        """Нажата ◀ / ▶ под карточкой."""
+    async def turn_card_page(self, interaction: Interaction, card: str, user_id: int, page: int,
+                             invoker_id: int | None = None) -> None:
+        """Нажата ◀ / ▶ под карточкой (кто нажал — уже проверено в кнопке)."""
         # Картинка (и аватарки связей) готовится дольше 3 секунд, которые Discord ждёт ответа.
         await interaction.response.defer()
 
         target = await self.get_user_anywhere(user_id)
-        file, view = await self.build_card_page(card, target, page)
+        file, view = await self.build_card_page(card, target, page, invoker_id)
 
-        await interaction.edit_original_response(attachments=[file], **view)
+        # view=None явно: у страницы без кнопок старые кнопки должны исчезнуть. Без него Discord
+        # оставил бы прежние — например, ◀ ▶ на старых сообщениях ,rs, когда страниц было пять.
+        await interaction.edit_original_response(attachments=[file], view=view.get('view'))
 
     @staticmethod
     def build_leaderboard_embed(
@@ -1019,6 +958,48 @@ class KarmaSistem(commands.Cog):
         ',lbc': 'leaderboard_cubes',
     }
 
+    def leaderboard_places(self, ozernik_id: int) -> dict[str, int | None]:
+        """
+        Места человека в таблицах лидеров ,lb и ,lbw — для плашки *i (модуль stats).
+        Те же get_karma_rank / get_weekly_karma_rank, что у карточки ,rs: порядок как в таблицах.
+        И то же правило, что у ,rs: при нуле кармы места нет (None) — номер в таблице есть у
+        всех, кто в ней записан, и без этого человек с нулём за неделю получил бы «#57».
+        """
+        karma = _state.db.get_karma(ozernik_id)
+        total = karma.karma if karma else 0
+        weekly = karma.weekly_karma if karma else 0
+        return {
+            'karma': _state.db.get_karma_rank(ozernik_id) if total > 0 else None,
+            'weekly': _state.db.get_weekly_karma_rank(ozernik_id) if weekly > 0 else None,
+        }
+
+    EVENT_AWARDS_SHOWN = 5
+
+    def event_awards_summary(self, ozernik_id: int) -> dict:
+        """
+        «Ивенты» для плашки *i (модуль stats): карма за ивенты, число наград и последние
+        награды (новые сверху). Награды — данные кармы, поэтому отдаёт их модуль кармы.
+        """
+        total, count = _state.db.get_event_karma(ozernik_id)
+        awards = [
+            {
+                'id': award['id'],
+                'reason': award['reason'],
+                'amount': award['amount'],
+                'created_at': award['created_at'] / 1000,  # в базе — мс
+            }
+            for award in _state.db.get_event_awards(ozernik_id, self.EVENT_AWARDS_SHOWN)
+        ]
+        return {'total': total, 'count': count, 'awards': awards}
+
+    def is_foreign_shortcut(self, content: str) -> bool:
+        """Сокращение другого модуля? Модуль сам говорит, какие у него есть (атрибут SHORTCUTS)."""
+        words = content.split()
+        if not words:
+            return False
+        stats = self.bot.get_cog('Stats')
+        return words[0].lower() in getattr(stats, 'SHORTCUTS', ())
+
     async def handle_shortcut(self, message: discord.Message, member: discord.Member) -> bool:
         """
         Выполняет сокращение, если сообщение с него начинается (отдельным словом).
@@ -1043,7 +1024,8 @@ class KarmaSistem(commands.Cog):
             mentioned = (message.guild.get_member(user.id) for user in getattr(message, 'mentions', []))
             target = next((user for user in mentioned if user is not None), member)
 
-            file, view = await self.build_card_page('rs' if name == 'rank_sansara' else 'rc', target)
+            file, view = await self.build_card_page('rs' if name == 'rank_sansara' else 'rc', target,
+                                                    invoker_id=member.id)
 
             await message.reply(file=file, allowed_mentions=no_ping, **view)
             return True
@@ -1077,7 +1059,7 @@ class KarmaSistem(commands.Cog):
     async def rank_sansara(self, interaction: Interaction, user: discord.Member = None):
         await interaction.response.defer()
 
-        file, view = await self.build_card_page('rs', user or interaction.user)
+        file, view = await self.build_card_page('rs', user or interaction.user, invoker_id=interaction.user.id)
 
         await interaction.followup.send(file=file, **view)
 
@@ -1086,7 +1068,7 @@ class KarmaSistem(commands.Cog):
     async def rank_cube(self, interaction: Interaction, user: discord.Member = None):
         await interaction.response.defer()
 
-        file, view = await self.build_card_page('rc', user or interaction.user)
+        file, view = await self.build_card_page('rc', user or interaction.user, invoker_id=interaction.user.id)
 
         await interaction.followup.send(file=file, **view)
 

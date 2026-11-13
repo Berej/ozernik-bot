@@ -229,6 +229,9 @@ class FakeBot:
         self.add_dynamic_items = MagicMock()
         self.remove_dynamic_items = MagicMock()
 
+    def get_cog(self, name):
+        return None
+
     def get_channel(self, channel_id):
         return self.channels.get(channel_id)
 
