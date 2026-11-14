@@ -27,6 +27,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from modules.rsn._rsn_levels import ISOLATION_OVERWRITE, MUTE_OVERWRITE
+from utilities import is_moderator, staff_role_ids
 
 VOICE_ID = 1150378018771050537      # канал-вход
 CATEGORY_ID = 1002923440644304926   # категория личных войсов
@@ -58,6 +59,9 @@ FRESH_SECONDS = 30
 # кладёт). Перенос до этого события discord.py не сопоставит с каналом и решит, что человек вышел
 # из голоса совсем. Поэтому перед переносом ждём, пока канал появится в кэше.
 CACHE_WAIT_SECONDS = 5
+
+
+STAFF_OVERWRITE = discord.PermissionOverwrite(view_channel=True, connect=True, move_members=True)
 
 
 def is_fresh(voice: dict) -> bool:
@@ -162,6 +166,15 @@ class VoiceManager(commands.Cog):
         for role, overwrite in self._rsn_overwrites():
             overwrites[role] = overwrite
 
+        # Администрация и модерация (/staff_roles) — в любой личный войс (решение Alium 2026-11-15):
+        # видят и входят даже в закрытый — разрешение роли перебивает запрет @everyone, а /voice_lock
+        # трогает только @everyone; «Перемещать участников» — вход и в заполненный по лимиту (лимит
+        # Discord обходит только это право) и возможность перетащить или отключить нарушителя.
+        # У кого галочка «Администратор» — Discord и так пускает всюду.
+        for role in map(guild.get_role, staff_role_ids()):
+            if role is not None:
+                overwrites[role] = STAFF_OVERWRITE
+
         # Участникам лично — только connect, без view_channel. Личное разрешение в Discord сильнее
         # запрета роли в том же канале: с view_channel=True человек в «Изоляции» РСН, попавший
         # в допущенные, увидел бы войс. Видеть войс и так разрешено всем через @everyone.
@@ -181,6 +194,9 @@ class VoiceManager(commands.Cog):
         # запрещено видеть личные войсы, он не видел бы собственный войс — Discord выкидывает из
         # канала, который человек не видит, и войс сразу «пустел». Для РСН это безопасно: замученный
         # не попадёт и в канал-вход (/rsn_setup), а в личном войсе его отключит _kick_if_punished.
+        # Только «Управлять каналом» — БЕЗ «Управлять правами» (manage_roles): с ним владелец мог бы сам
+        # запретить вход ролям — например, модерации (решение Alium 2026-11-15). Закрывать войс — только
+        # командой /voice_lock, её выполняет бот. Есть тест.
         overwrites[member] = discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
         if guild.me:
             overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True)
@@ -219,6 +235,8 @@ class VoiceManager(commands.Cog):
         voice = self.db.get_personal_voice(channel.id)
         if voice is None or voice["deleted_at"] is not None:
             return
+        if is_moderator(member):
+            return  # администрацию и модерацию из войса не выкидывать (решение Alium 2026-11-15)
         punish_roles = {role for role, _ in self._rsn_overwrites()}
         if not punish_roles.intersection(member.roles):
             return

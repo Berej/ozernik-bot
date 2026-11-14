@@ -271,6 +271,73 @@ class TestCreate:
         assert muted.move_to.call_args.args[0] is None
         assert muted not in voice_env.created[0].members
 
+    async def test_staff_roles_enter_any_voice(self, voice_env, monkeypatch):
+        """
+        Решение Alium 2026-11-15: администрация и модерация (/staff_roles) — в любой личный войс:
+        видят, входят даже в закрытый (разрешение роли перебивает запрет @everyone) и в заполненный
+        («Перемещать участников» — единственный обход лимита в Discord).
+        """
+        import sys
+        admin_role = FakeRole(7300, "Администратор", guild=voice_env.guild)
+        mod_role = FakeRole(7400, "Модератор", guild=voice_env.guild)
+        voice_env.guild.roles.update({7300: admin_role, 7400: mod_role})
+        monkeypatch.setattr(sys.modules["config"].config, "ADMIN_ROLES_IDS", [7300])
+        monkeypatch.setattr(sys.modules["config"].config, "MODERATOR_ROLES_IDS", [7400])
+        me = voice_env.add_member(1)
+        owner = voice_env.db.add_user(discord_id=1)
+        voice_env.db.save_personal_voice_settings(owner, None, 2, True, [])  # закрыт и с лимитом
+
+        await enter(voice_env, me, voice_env.entry)
+
+        channel = voice_env.created[0]
+        assert channel.overwrites_for(voice_env.guild.default_role).connect is False
+        for role in (admin_role, mod_role):
+            overwrite = channel.overwrites_for(role)
+            assert (overwrite.view_channel, overwrite.connect, overwrite.move_members) == (True, True, True)
+
+        # /voice_lock трогает только @everyone — администрации вход не закрывает
+        await voice_env.cog.voice_unlock.callback(voice_env.cog, make_interaction(me, voice_env.guild))
+        await voice_env.cog.voice_lock.callback(voice_env.cog, make_interaction(me, voice_env.guild))
+        assert channel.overwrites_for(mod_role).connect is True
+
+    async def test_owner_cannot_edit_permissions(self, voice_env):
+        """
+        Владелец (не администрация) не должен сам ставить запреты по ролям — например, модерации на вход.
+        Права канала в Discord меняет только «Управлять правами» (manage_roles): его нет ни у создателя,
+        ни у того, кому войс передали.
+        """
+        me = voice_env.add_member(1)
+        await enter(voice_env, me, voice_env.entry)
+        channel = voice_env.created[0]
+        friend = voice_env.add_member(2)
+        join(friend, channel)
+
+        assert channel.overwrites_for(me).manage_channels is True
+        assert channel.overwrites_for(me).manage_roles is None
+
+        await voice_env.cog.voice_transfer.callback(voice_env.cog, make_interaction(me, voice_env.guild), friend)
+
+        assert channel.overwrites_for(friend).manage_channels is True
+        assert channel.overwrites_for(friend).manage_roles is None
+
+    async def test_staff_not_kicked_even_with_punish_role(self, voice_env, monkeypatch):
+        """Администрацию и модерацию из личного войса бот не выкидывает — даже с ролью наказания РСН."""
+        import sys
+        mod_role = FakeRole(7400, "Модератор", guild=voice_env.guild)
+        mute_role = FakeRole(777, "Мут", guild=voice_env.guild)
+        voice_env.guild.roles.update({7400: mod_role, 777: mute_role})
+        monkeypatch.setattr(sys.modules["config"].config, "MODERATOR_ROLES_IDS", [7400])
+        rsn = SimpleNamespace(_role=lambda key: mute_role if key == "mute_role_id" else None)
+        voice_env.bot.get_cog = lambda name: rsn if name == "RsnCog" else None
+        me = voice_env.add_member(1)
+        await enter(voice_env, me, voice_env.entry)
+        moderator = voice_env.add_member(2, roles=[mod_role, mute_role])
+
+        await enter(voice_env, moderator, voice_env.created[0])
+
+        moderator.move_to.assert_not_awaited()
+        assert moderator in voice_env.created[0].members
+
     async def test_bot_in_entry_ignored(self, voice_env):
         await enter(voice_env, voice_env.add_member(50, bot=True), voice_env.entry)
 
