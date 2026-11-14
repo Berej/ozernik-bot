@@ -501,8 +501,9 @@ class KarmaDatabase(Database):
                 # (плашка *i покажет их как войс основного); минуты складываются —
                 # и в войсах твинка, и твинка в чужих войсах.
                 self.execute("""
-                    INSERT OR IGNORE INTO personal_voices (user_id, name, user_limit, locked, allowed, saved_at)
-                    SELECT ?, name, user_limit, locked, allowed, saved_at
+                    INSERT OR IGNORE INTO personal_voices (user_id, name, user_limit, locked, allowed, saved_at,
+                                                           bitrate, video_quality, nsfw, slowmode)
+                    SELECT ?, name, user_limit, locked, allowed, saved_at, bitrate, video_quality, nsfw, slowmode
                     FROM personal_voices
                     WHERE user_id = ?
                 """, (user_id, twink_id))

@@ -398,6 +398,15 @@ class OzernikNotfound(Exception):
     """Озёрник не найден в Discord"""
     pass
 
+# Колонки personal_voices, добавленные после первой версии таблицы (см. миграцию в Database._init_db).
+PERSONAL_VOICE_ADDED_COLUMNS = (
+    ("bitrate", "INTEGER"),
+    ("video_quality", "INTEGER"),
+    ("nsfw", "INTEGER NOT NULL DEFAULT 0"),
+    ("slowmode", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
 class Database:
     def __init__(self) -> None:
         base_dir = Path(__file__).resolve().parent
@@ -513,6 +522,9 @@ class Database:
             #
             # Сохранённые настройки (/voice_save): следующий войс создаётся с ними.
             # allowed — JSON-список Discord ID, кого пускать в закрытый войс.
+            # bitrate (бит/с), video_quality (1 — авто, 2 — 720p), nsfw (возрастное ограничение —
+            # предупреждение перед входом), slowmode (медленный режим чата войса, секунды) —
+            # с 2026-11-15; NULL у битрейта и качества — стандартные Discord.
             self.execute("""
                 CREATE TABLE IF NOT EXISTS personal_voices (
                     user_id INTEGER PRIMARY KEY,
@@ -521,10 +533,19 @@ class Database:
                     locked INTEGER NOT NULL DEFAULT 0,
                     allowed TEXT NOT NULL DEFAULT '[]',
                     saved_at INTEGER NOT NULL DEFAULT 0,
+                    bitrate INTEGER,
+                    video_quality INTEGER,
+                    nsfw INTEGER NOT NULL DEFAULT 0,
+                    slowmode INTEGER NOT NULL DEFAULT 0,
 
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 );
             """)
+
+            # Миграция: таблица уже была создана без этих колонок (патч поработал на серверах
+            # 2026-11-14). CREATE TABLE IF NOT EXISTS существующую таблицу не меняет — колонки
+            # добавляются вручную. ADD COLUMN SQLite умеет на любой версии (DROP COLUMN — нет).
+            self._add_missing_columns("personal_voices", PERSONAL_VOICE_ADDED_COLUMNS)
 
             # Каждый созданный личный войс: чей он. deleted_at IS NULL — канал жив.
             # Строки не удаляются вместе с каналом: по ним «Топ каналов» плашки *i
@@ -536,9 +557,14 @@ class Database:
                     user_id INTEGER NOT NULL,
                     category_id INTEGER,
                     created_at INTEGER NOT NULL,
-                    deleted_at INTEGER
+                    deleted_at INTEGER,
+                    former_owners TEXT NOT NULL DEFAULT '[]'
                 );
             """)
+            # former_owners — JSON Discord ID аккаунтов прежних владельцев (после /voice_transfer,
+            # /voice_claim): /voice_save нового владельца не должен записать их «Имя's Room» как своё
+            # название, а их самих — в допущенные. С 2026-11-15 — миграция, как у personal_voices.
+            self._add_missing_columns("personal_voice_channels", (("former_owners", "TEXT NOT NULL DEFAULT '[]'"),))
 
             self.execute("""
                 CREATE INDEX IF NOT EXISTS idx_personal_voice_channels_user
@@ -598,6 +624,16 @@ class Database:
         self.execute(create_sql)
         self.execute(f"INSERT INTO {name} ({columns}) SELECT {columns} FROM {name}_old {where}")
         self.execute(f"DROP TABLE {name}_old")
+
+    def _add_missing_columns(self, name: str, columns) -> None:
+        """
+        Дописать в существующую таблицу недостающие колонки: (имя, определение). CREATE TABLE IF NOT
+        EXISTS уже созданную таблицу не меняет, а ADD COLUMN SQLite умеет на любой версии.
+        """
+        existing = self._table_columns(name)
+        for column, ddl in columns:
+            if column not in existing:
+                self.execute(f"ALTER TABLE {name} ADD COLUMN {column} {ddl}")
 
     def _table_columns(self, name: str) -> set[str]:
         return {row['name'] for row in self.fetchall(f"PRAGMA table_info({name})")}
@@ -1057,7 +1093,10 @@ class Database:
     # Личные войсы
 
     def get_personal_voice_settings(self, user_id: int) -> dict | None:
-        """Сохранённые настройки войса человека: name (None — стандартное), user_limit, locked, allowed."""
+        """
+        Сохранённые настройки войса человека: name (None — стандартное), user_limit, locked, allowed,
+        bitrate и video_quality (None — стандартные), nsfw, slowmode.
+        """
         row = self.fetchone("SELECT * FROM personal_voices WHERE user_id = ?", (user_id,))
 
         if row is None:
@@ -1065,22 +1104,31 @@ class Database:
 
         settings = dict(row)
         settings["locked"] = bool(settings["locked"])
+        settings["nsfw"] = bool(settings["nsfw"])
         settings["allowed"] = json.loads(settings["allowed"] or "[]")
         return settings
 
     def save_personal_voice_settings(self, user_id: int, name: str | None, user_limit: int,
-                                     locked: bool, allowed: list[int]) -> None:
+                                     locked: bool, allowed: list[int], bitrate: int | None = None,
+                                     video_quality: int | None = None, nsfw: bool = False,
+                                     slowmode: int = 0) -> None:
         with self.transaction():
             self.execute("""
-                INSERT INTO personal_voices (user_id, name, user_limit, locked, allowed, saved_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO personal_voices (user_id, name, user_limit, locked, allowed, saved_at,
+                                             bitrate, video_quality, nsfw, slowmode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     name = excluded.name,
                     user_limit = excluded.user_limit,
                     locked = excluded.locked,
                     allowed = excluded.allowed,
-                    saved_at = excluded.saved_at
-            """, (user_id, name, user_limit, int(locked), json.dumps(sorted(set(allowed))), int(time.time())))
+                    saved_at = excluded.saved_at,
+                    bitrate = excluded.bitrate,
+                    video_quality = excluded.video_quality,
+                    nsfw = excluded.nsfw,
+                    slowmode = excluded.slowmode
+            """, (user_id, name, user_limit, int(locked), json.dumps(sorted(set(allowed))), int(time.time()),
+                  bitrate, video_quality, int(nsfw), slowmode))
 
     def delete_personal_voice_settings(self, user_id: int) -> bool:
         with self.transaction():
@@ -1094,9 +1142,17 @@ class Database:
                 VALUES (?, ?, ?, ?, NULL)
             """, (channel_id, user_id, category_id, int(time.time())))
 
+    @staticmethod
+    def _personal_voice_row(row) -> dict | None:
+        if row is None:
+            return None
+        voice = dict(row)
+        voice["former_owners"] = json.loads(voice.get("former_owners") or "[]")
+        return voice
+
     def get_personal_voice(self, channel_id: int) -> dict | None:
         row = self.fetchone("SELECT * FROM personal_voice_channels WHERE channel_id = ?", (channel_id,))
-        return dict(row) if row else None
+        return self._personal_voice_row(row)
 
     def get_live_personal_voice(self, user_id: int) -> dict | None:
         """Живой (не удалённый) войс человека; если их почему-то несколько — последний созданный."""
@@ -1108,15 +1164,21 @@ class Database:
             ORDER BY created_at DESC, channel_id DESC
             LIMIT 1
         """, (user_id,))
-        return dict(row) if row else None
+        return self._personal_voice_row(row)
 
     def get_live_personal_voices(self) -> list[dict]:
         rows = self.fetchall("SELECT * FROM personal_voice_channels WHERE deleted_at IS NULL ORDER BY channel_id")
-        return [dict(row) for row in rows]
+        return [self._personal_voice_row(row) for row in rows]
 
-    def set_personal_voice_owner(self, channel_id: int, user_id: int) -> None:
+    def set_personal_voice_owner(self, channel_id: int, user_id: int, former_discord_ids=()) -> None:
+        """Сменить владельца войса; Discord ID аккаунтов прежнего — в former_owners."""
+        voice = self.get_personal_voice(channel_id)
+        former = sorted(set(voice["former_owners"] if voice else []) | set(former_discord_ids))
         with self.transaction():
-            self.execute("UPDATE personal_voice_channels SET user_id = ? WHERE channel_id = ?", (user_id, channel_id))
+            self.execute(
+                "UPDATE personal_voice_channels SET user_id = ?, former_owners = ? WHERE channel_id = ?",
+                (user_id, json.dumps(former), channel_id),
+            )
 
     def mark_personal_voice_deleted(self, channel_id: int) -> None:
         with self.transaction():
