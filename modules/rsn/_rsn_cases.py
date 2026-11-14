@@ -15,6 +15,8 @@ import traceback
 
 import discord
 
+from utilities import is_admin, staff_role_ids
+
 from ._rsn_case_chat import (
     add_to_chat, collect_chat, format_transcript, open_case_chat, pack_attachments, remove_from_chat,
 )
@@ -38,15 +40,14 @@ class CaseMixin:
         return guild.get_role(role_id) if guild and role_id else None
 
     def _staff_roles(self) -> list:
+        """Роли администрации и модерации из общего списка бота (config.json) — кому видеть чаты дел."""
         guild = self._guild()
         if not guild:
             return []
-        ids = list(self.rsn_data.get("admin_role_ids", [])) + list(self.rsn_data.get("moderator_role_ids", []))
-        return [role for role in map(guild.get_role, ids) if role is not None]
+        return [role for role in map(guild.get_role, staff_role_ids()) if role is not None]
 
     def _is_admin(self, member) -> bool:
-        admin_ids = set(self.rsn_data.get("admin_role_ids", []))
-        return any(role.id in admin_ids for role in getattr(member, "roles", []))
+        return is_admin(member)
 
     def _punish_role(self, points_before):
         """Роль мута по уровню: «Изоляция» для 0–30, «Мут» для 31–50 (нет «Изоляции» — «Мут»)."""

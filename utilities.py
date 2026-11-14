@@ -1446,6 +1446,58 @@ class BridgeDatabase(Database):
 
         return DataTypes.MessageLink(row, chat_link)
 
+# ---------- Администрация бота — общая для всех модулей (решение Alium 2026-11-15) ----------
+# Списки ролей — в config.json: ADMIN_ROLES_IDS и MODERATOR_ROLES_IDS (задаются /staff_roles).
+# Администратор — право «Администратор» на сервере или роль из ADMIN_ROLES_IDS; модератор — ещё и
+# роль из MODERATOR_ROLES_IDS. Одной проверки guild_permissions.administrator мало: у модераторов
+# этой галочки нет, а доступ к части бота им нужен.
+
+def _bot_config():
+    # Лениво, внутри функции: config.py сам импортирует utilities — импорт наверху был бы круговым.
+    from config import config
+    return config
+
+
+def _role_ids(key: str) -> list[int]:
+    return list(getattr(_bot_config(), key, None) or [])
+
+
+def staff_role_ids() -> list[int]:
+    """Роли администрации и модерации — например, кому видеть чаты дел РСН."""
+    return _role_ids("ADMIN_ROLES_IDS") + _role_ids("MODERATOR_ROLES_IDS")
+
+
+def _has_role(member, role_ids) -> bool:
+    wanted = set(role_ids)
+    return any(role.id in wanted for role in getattr(member, "roles", []))
+
+
+def is_admin(member) -> bool:
+    permissions = getattr(member, "guild_permissions", None)
+    if permissions is not None and permissions.administrator:
+        return True
+    return _has_role(member, _role_ids("ADMIN_ROLES_IDS"))
+
+
+def is_moderator(member) -> bool:
+    """Модератор — или выше (администратор)."""
+    return is_admin(member) or _has_role(member, _role_ids("MODERATOR_ROLES_IDS"))
+
+
+STAFF_DENIED = {
+    "admin": "Только для администрации.",
+    "moderator": "Только для администрации и модерации.",
+}
+
+
+async def require_staff(interaction, level: Literal["admin", "moderator"] = "admin", denied: str | None = None) -> bool:
+    """Пропустить, если вызвавший — нужного уровня; иначе — скрытый отказ и False."""
+    allowed = is_admin(interaction.user) if level == "admin" else is_moderator(interaction.user)
+    if not allowed:
+        await interaction.response.send_message(denied or STAFF_DENIED[level], ephemeral=True)
+    return allowed
+
+
 # ---------- Текст на картинках (Pillow) — общее для карточек кармы и плашки *i ----------
 
 # Символ, которого нет в шрифте, Pillow рисует пустым «квадратиком» .notdef.

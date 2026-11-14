@@ -8,6 +8,7 @@ from discord import Embed
 from typing_extensions import Literal
 
 from config import config
+from utilities import require_staff
 
 LOG_CHANNEL = 1131880136053100616
 
@@ -17,6 +18,89 @@ ALLOWED_ROLES = [725675581881974794, # admin role main server
                  779015800555176006,
                  1398937618527293510 # admin role test server
                  ]
+
+# Выключение и перезапуск по сообщению. Код выхода для «выключить» — в юните systemd нужна строка
+# RestartPreventExitStatus=64, иначе Restart=always поднимет бота снова (см. on_message).
+SHUTDOWN_EXIT_CODE = 64
+BOT_POWER_COMMANDS = {".bot_shutdown": "shutdown", ".bot_restart": "restart"}
+
+
+# ---------- /staff_roles: роли администрации и модерации бота (решение Alium 2026-11-15) ----------
+
+STAFF_LEVELS = (("ADMIN_ROLES_IDS", "Администрация"), ("MODERATOR_ROLES_IDS", "Модерация"))
+
+
+def staff_roles_text(guild) -> str:
+    lines = ["**Роли администрации и модерации бота** — общие для всех модулей."]
+    for key, title in STAFF_LEVELS:
+        roles = [f"<@&{role_id}>" for role_id in (getattr(config, key, None) or []) if guild.get_role(role_id)]
+        lines.append(f"{title}: {', '.join(roles) if roles else 'не задано'}")
+    lines.append("-# У кого есть право «Администратор» на сервере — администрация в любом случае. "
+                 "Модерации доступны муты и дела РСН, твинки и /settings_karma.")
+
+    # Отдельный, зашитый в код список панели (/send_message, /edit_message, .bot_shutdown, .bot_restart) —
+    # с общим не сведён: чьи две роли из него, неизвестно. Показ здесь — чтобы узнать на выкатке.
+    lines.append("")
+    lines.append("**Старый список панели** (`/send_message`, `/edit_message`, `.bot_shutdown`, `.bot_restart`) — "
+                 "сведём с общим в следующем патче:")
+    for role_id in ALLOWED_ROLES:
+        role = guild.get_role(role_id)
+        if role is not None:
+            members = len(getattr(role, "members", []))
+            lines.append(f"- <@&{role_id}> (`{role_id}`) — участников: {members}")
+        else:
+            lines.append(f"- `{role_id}` — такой роли на этом сервере нет")
+    return "\n".join(lines)
+
+
+class StaffRolesView(discord.ui.View):
+    """
+    Два списка ролей и «Сохранить». Нажимать может только вызвавший.
+
+    Select.values хранит только то, что выбрали в ЭТОМ меню, — предвыбранные значения туда не попадают.
+    Если менять одну модерацию и нажать «Сохранить», администрация пришла бы пустой и стёрлась.
+    Поэтому выбор запоминается в self.picked, а нетронутый список остаётся как был.
+    """
+
+    def __init__(self, author_id: int, guild):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+        self.picked: dict[str, list[int]] = {}
+        for row, (key, title) in enumerate(STAFF_LEVELS):
+            # Только роли, что ещё есть на сервере; Object(type=Role) — так Discord понимает «предвыбрать роль».
+            current = [
+                discord.Object(id=role.id, type=discord.Role)
+                for role in map(guild.get_role, getattr(config, key, None) or []) if role is not None
+            ]
+            select = discord.ui.RoleSelect(
+                placeholder=f"{title}: выберите роли",
+                min_values=0,
+                max_values=10,
+                default_values=current,
+                row=row,
+            )
+            select.callback = self._make_callback(key, select)
+            self.add_item(select)
+
+    def _make_callback(self, key: str, select: discord.ui.RoleSelect):
+        async def callback(interaction: discord.Interaction):
+            self.picked[key] = [role.id for role in select.values]
+            await interaction.response.defer()
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message("Это меню вызвал другой человек.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Сохранить", style=discord.ButtonStyle.success, row=2)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for key, role_ids in self.picked.items():
+            setattr(config, key, role_ids)
+        self.stop()
+        await interaction.response.edit_message(content="✓ Сохранено.\n" + staff_roles_text(interaction.guild), view=None)
+
 
 class Panel(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -69,65 +153,67 @@ class Panel(commands.Cog):
             print(f"Error in {func_name}: {tb}")
             await interaction.followup.send(f"Произошла ошибка:\n```\n{e}\n```", ephemeral=True)
 
+    @app_commands.command(name='staff_roles', description='Роли администрации и модерации бота — общие для всех модулей.')
+    @app_commands.guilds(config.GUILD_ID)
+    @app_commands.default_permissions(administrator=True)
+    async def staff_roles(self, interaction: discord.Interaction):
+        if not await require_staff(interaction, "admin"):
+            return
+        await interaction.response.send_message(
+            staff_roles_text(interaction.guild),
+            view=StaffRolesView(interaction.user.id, interaction.guild),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """
-        Listen for the exact text ".bot_shutdown" in the main guild.
-        If author is a guild member with one of ALLOWED_ROLES, acknowledge and shut the bot down.
-        This is an emergency immediate shutdown — the bot will attempt to send a confirmation
-        message and then call bot.close().
+        `.bot_shutdown` — выключить бота, `.bot_restart` — перезапустить (решение Alium 2026-11-15).
+
+        На сервере бот работает под systemd с Restart=always: ЛЮБОЙ выход процесса — перезапуск через
+        RestartSec (5 с). Поэтому прежний .bot_shutdown на деле был перезапуском. Теперь бот выходит
+        с разными кодами: перезапуск — 0 (systemd поднимет), выключение — SHUTDOWN_EXIT_CODE, а в юните
+        стоит RestartPreventExitStatus=64 — процесс, вышедший с этим кодом, systemd не поднимает.
+        Без этой строки в юните .bot_shutdown по-прежнему будет перезапуском.
         """
-        # ignore bots (including self)
         if message.author.bot:
             return
 
-        # only react to the exact command (case-insensitive), trim whitespace
-        if message.content.strip().lower() != ".bot_shutdown":
+        action = BOT_POWER_COMMANDS.get(message.content.strip().lower())
+        if action is None:
             return
 
-        # require this to happen in the configured guild
         if message.guild is None or message.guild.id != config.GUILD_ID:
             return
 
-        # ensure author is a guild Member (has roles)
-        if not isinstance(message.author, discord.Member):
-            return
-
-        # role check: user must have at least one allowed role
-        if not any(role.id in ALLOWED_ROLES for role in message.author.roles):
-            # polite refusal; auto-delete to avoid clutter
+        # Права — пока по старому списку панели (ALLOWED_ROLES); с общим сведём в следующем патче.
+        if not any(role.id in ALLOWED_ROLES for role in getattr(message.author, "roles", [])):
             try:
-                await message.channel.send("You do not have permission to shut down the bot.", delete_after=8)
-            except Exception: # noqa
+                await message.channel.send("Нет прав выключать или перезапускать бота.", delete_after=8)
+            except discord.HTTPException:
                 pass
             return
 
-        # Acknowledge and shutdown (give a short delay to allow the message to be delivered)
+        if action == "shutdown":
+            text = f"Выключаюсь по команде {message.author.mention}."
+        else:
+            text = f"Перезапускаюсь по команде {message.author.mention} — вернусь через несколько секунд."
         try:
-            await message.channel.send(f"Shutdown command received from {message.author.mention}. Shutting down...", delete_after=5)
-        except Exception: # noqa
-            # If we can't send in-channel, try DM to the author as a last resort (best-effort)
-            try:
-                await message.author.send("Shutdown command received. Bot is shutting down.")
-            except Exception: # noqa
-                pass
+            await message.channel.send(text, delete_after=5)
+        except discord.HTTPException:
+            pass
 
-        # small delay so Discord has time to deliver the confirmation message
+        # Небольшая пауза — чтобы ответ успел уйти до отключения.
         await asyncio.sleep(0.5)
 
-        # Log and close the bot cleanly
-        print(f"Shutdown initiated by {message.author} (id={message.author.id})")
+        print(f"{'Выключение' if action == 'shutdown' else 'Перезапуск'} по команде {message.author} (id={message.author.id})")
+        # Код выхода читает bot.py после остановки (sys.exit(bot.exit_code)).
+        self.bot.exit_code = SHUTDOWN_EXIT_CODE if action == "shutdown" else 0
         try:
             await self.bot.close()
-        except Exception as e:
-            # if close fails for some reason, log and force-exit the process
-            print("Error while closing bot:", repr(e))
-            try:
-                # best-effort: stop the loop
-                loop = asyncio.get_running_loop()
-                loop.stop()
-            except Exception: # noqa
-                pass
+        except Exception as error:
+            print("Ошибка при остановке бота:", repr(error))
 
 
     # --------- BOT TEXT MODERATION COMMANDS --------- 

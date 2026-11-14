@@ -108,6 +108,10 @@ def rsn_env(monkeypatch):
         "admin_role_ids": [ADMIN_ROLE_ID], "moderator_role_ids": [],
     }.items():
         monkeypatch.setitem(rsn.RSN_DATA, key, value)
+    # Роли администрации и модерации — общий список бота в config.json (с 2026-11-15), не rsn_data.json.
+    import sys
+    monkeypatch.setattr(sys.modules["config"].config, "ADMIN_ROLES_IDS", [ADMIN_ROLE_ID])
+    monkeypatch.setattr(sys.modules["config"].config, "MODERATOR_ROLES_IDS", [])
 
     main = guild.add_member(1)
     twink = guild.add_member(11)

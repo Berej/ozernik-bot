@@ -25,6 +25,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from config import config
+from utilities import is_admin
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKUP_DIR = ROOT / "backups"
@@ -168,7 +169,8 @@ class Backup(commands.Cog):
 
     @staticmethod
     async def check_admin(interaction: discord.Interaction) -> bool:
-        if interaction.user.guild_permissions.administrator:
+        # Администрация из общего списка (utilities.is_admin), модераторам — нет: в архиве данные участников.
+        if is_admin(interaction.user):
             return True
 
         await interaction.response.send_message("Только для Администраторов.", ephemeral=True)

@@ -62,6 +62,7 @@ CONFIG_TEMPLATE = {
         436586208450052099
     ],
     "ADMIN_ROLES_IDS": [],
+    "MODERATOR_ROLES_IDS": [],
     "MODULES": {}
 }
 

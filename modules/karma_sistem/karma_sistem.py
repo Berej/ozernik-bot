@@ -694,11 +694,8 @@ class KarmaSistem(commands.Cog):
     @app_commands.command(name='settings_karma', description='Настройка системы Кармы.')
     @app_commands.guilds(config.GUILD_ID)
     async def settings_karma(self, interaction: Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "Только для Администраторов.",
-                ephemeral=True
-            )
+        # Модераторам тоже (решение Alium 2026-11-15); часть пунктов внутри — только разработчикам бота.
+        if not await require_staff(interaction, "moderator"):
             return
 
         navigator = Navigator(SettingsMainPage, author=interaction.user, bot=self.bot)
@@ -1185,12 +1182,13 @@ class KarmaSistem(commands.Cog):
             ephemeral=True,
         )
 
+    # Твинки — модераторам тоже (решение Alium 2026-11-15). Без default_permissions(administrator=True):
+    # с ним Discord сам прятал бы команду от всех без этой галочки, и до проверки бота модератор не дошёл бы.
     @app_commands.command(name='twink_link', description='Привязать твинк к человеку без его подтверждения.')
     @app_commands.guilds(config.GUILD_ID)
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(main='Основной аккаунт', account='Твинк (можно ID, даже если он ушёл с сервера)')
     async def twink_link(self, interaction: Interaction, main: discord.User, account: discord.User):
-        if not await self.check_admin(interaction):
+        if not await require_staff(interaction, "moderator"):
             return
 
         summary = ''
@@ -1227,15 +1225,11 @@ class KarmaSistem(commands.Cog):
 
     @app_commands.command(name='twink_remove', description='Отвязать твинк. Карма, набранная за время привязки, остаётся у основного.')
     @app_commands.guilds(config.GUILD_ID)
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(account='Твинк, который нужно отвязать')
     async def twink_remove(self, interaction: Interaction, account: discord.User):
-        # Только администрация (решение Alium): иначе твинк можно отвязать, чтобы уйти от наказания.
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                'Отвязать твинк может только администрация — обратитесь к ней.',
-                ephemeral=True,
-            )
+        # Только администрация и модерация (решение Alium): иначе твинк отвязывали бы, чтобы уйти от наказания.
+        if not await require_staff(interaction, "moderator",
+                                   'Отвязать твинк может только администрация или модерация — обратитесь к ним.'):
             return
 
         owner = _state.db.get_user_by_discord_id(account.id) if _state.db.is_twink(account.id) else None
@@ -1285,9 +1279,8 @@ class KarmaSistem(commands.Cog):
 
     @app_commands.command(name='twinks_all', description='Таблица всех твинков сервера.')
     @app_commands.guilds(config.GUILD_ID)
-    @app_commands.default_permissions(administrator=True)
     async def twinks_all(self, interaction: Interaction):
-        if not await self.check_admin(interaction):
+        if not await require_staff(interaction, "moderator"):
             return
 
         groups = _state.db.get_all_twinks()
@@ -1308,7 +1301,8 @@ class KarmaSistem(commands.Cog):
 
     @staticmethod
     async def check_admin(interaction: Interaction) -> bool:
-        if interaction.user.guild_permissions.administrator:
+        """Администрация: право «Администратор» или роль из ADMIN_ROLES_IDS (utilities.is_admin)."""
+        if is_admin(interaction.user):
             return True
 
         await interaction.response.send_message(
