@@ -772,13 +772,13 @@ class TestRoles:
 # ---------- КОМАНДЫ -----------
 
 class TestCommands:
-    async def test_settings_only_for_admins(self, env):
+    async def test_settings_only_for_staff(self, env):
         user = env.guild.add_member(1)
         interaction = make_interaction(user, env.guild)
 
         await env.cog.settings_karma.callback(env.cog, interaction)
 
-        interaction.response.send_message.assert_awaited_once_with("Только для Администраторов.", ephemeral=True)
+        interaction.response.send_message.assert_awaited_once_with("Только для администрации и модерации.", ephemeral=True)
 
     async def test_settings_opens_menu_for_admin(self, env):
         user = env.guild.add_member(1)
@@ -896,8 +896,18 @@ def test_cog_commands(env):
 
 def test_admin_commands_hidden_from_non_admins(env):
     for command in env.cog.get_app_commands():
-        if command.name.startswith("karma_") or command.name in {"twink_link", "twink_remove", "twinks_all"}:
+        if command.name.startswith("karma_"):
             assert command.default_permissions.administrator is True
+
+
+def test_moderator_commands_not_hidden_by_discord(env):
+    """
+    Твинки и /settings_karma — и модераторам (решение Alium 2026-11-15). С default_permissions(administrator=True)
+    Discord сам прятал бы их от всех без этой галочки — до проверки бота модератор не дошёл бы.
+    """
+    for command in env.cog.get_app_commands():
+        if command.name in {"twink_link", "twink_remove", "twinks_all", "settings_karma"}:
+            assert command.default_permissions is None, command.name
 
 
 # ---------- РОЛИ ПРИ ВХОДЕ НА СЕРВЕР -----------

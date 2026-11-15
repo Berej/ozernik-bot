@@ -7,6 +7,7 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from config import config as cfg
+from utilities import is_moderator
 import json
 import re
 import traceback
@@ -122,8 +123,6 @@ def format_duration(hours: Optional[float]) -> str:
 
 
 # ==================== END INITIALIZATION ====================
-ADMIN_ROLE_ID = 725675581881974794
-MOD_ROLE_ID = 779015800555176006
 
 
 # === RSN CONFIG (modules/rsn/rsn_data.json) ===
@@ -158,9 +157,27 @@ def save_rsn_config() -> None:
 
 RSN_DATA = load_rsn_config()
 
-for _required_key in ("mute_role_id", "log_channel_id", "admin_notify_channel_id", "admin_role_ids", "moderator_role_ids"):
+for _required_key in ("mute_role_id", "log_channel_id", "admin_notify_channel_id"):
     if not RSN_DATA.get(_required_key):
         print(f"[RSN] WARNING: {_required_key} is not set in rsn_data.json")
+
+
+def seed_staff_roles(rsn_data: dict, bot_config) -> None:
+    """
+    Один раз перенести роли администрации и модерации из rsn_data.json (admin_role_ids,
+    moderator_role_ids) в общий список config.json — теперь его читают все модули (решение Alium
+    2026-11-15). Отметка STAFF_ROLES_SEEDED — чтобы не переносить снова: иначе после того, как
+    администрация намеренно очистит список через /staff_roles, перезапуск вернул бы старые роли.
+    Ключи в rsn_data.json не удаляются: файл в git, и без них при обновлении на сервере переносить
+    было бы нечего.
+    """
+    if getattr(bot_config, "STAFF_ROLES_SEEDED", None):
+        return
+    if not getattr(bot_config, "ADMIN_ROLES_IDS", None) and rsn_data.get("admin_role_ids"):
+        bot_config.ADMIN_ROLES_IDS = list(rsn_data["admin_role_ids"])
+    if not getattr(bot_config, "MODERATOR_ROLES_IDS", None) and rsn_data.get("moderator_role_ids"):
+        bot_config.MODERATOR_ROLES_IDS = list(rsn_data["moderator_role_ids"])
+    bot_config.STAFF_ROLES_SEEDED = True
 
 
 class CaseViewPagination(discord.ui.View):
@@ -295,6 +312,7 @@ class RsnCog(CaseMixin, commands.Cog):
         self.guild_id = GUILD_ID
         self.rsn_data = RSN_DATA
         self.save_rsn_config = save_rsn_config
+        seed_staff_roles(RSN_DATA, cfg)
 
         # Запуск фоновых задач
         self._weekly_gain_task.start()
@@ -470,7 +488,7 @@ class RsnCog(CaseMixin, commands.Cog):
         )
 
     async def _check_admin(self, interaction: discord.Interaction) -> bool:
-        """Только роли из admin_role_ids (бан, разбан, настройка). Важны роли, а не тип объекта."""
+        """Только администрация — общий список бота (utilities.is_admin): бан, разбан, настройка."""
         if self._is_admin(interaction.user):
             return True
         await interaction.response.send_message("❌ Только для администраторов.", ephemeral=True)
@@ -496,37 +514,11 @@ class RsnCog(CaseMixin, commands.Cog):
             print(f"[RSN] Чат дела #{case_id}: {e}")
 
     async def _check_permissions(self, interaction: discord.Interaction) -> bool:
-        """Проверить, есть ли у пользователя права администратора или модератора."""
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message(
-                "❌ Ошибка: не удалось определить ваш статус на сервере.",
-                ephemeral=True
-            )
-            return False
-
-        user_role_ids = {role.id for role in interaction.user.roles}
-
-        allowed_role_ids = (
-            set(RSN_DATA.get("admin_role_ids", []))
-            | set(RSN_DATA.get("moderator_role_ids", []))
-        )
-
-        if not allowed_role_ids:
-            print(
-                "[RSN] WARNING: no admin/moderator role IDs "
-                "configured in rsn_data.json"
-            )
-
-        has_permission = bool(user_role_ids & allowed_role_ids)
-
-        if not has_permission:
-            await interaction.response.send_message(
-                "❌ У вас нет прав на выполнение этой команды.",
-                ephemeral=True
-            )
-            return False
-
-        return True
+        """Модерация и администрация — общий список бота (utilities.is_moderator)."""
+        if is_moderator(interaction.user):
+            return True
+        await interaction.response.send_message("❌ У вас нет прав на выполнение этой команды.", ephemeral=True)
+        return False
 
     async def _log_action(
         self,

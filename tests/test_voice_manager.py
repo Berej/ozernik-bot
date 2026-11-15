@@ -16,12 +16,17 @@ from modules.rsn._rsn_levels import ISOLATION_OVERWRITE, MUTE_OVERWRITE
 
 
 class FakeVoiceChannel:
-    def __init__(self, channel_id, name, guild, *, category=None, overwrites=None, user_limit=0):
+    def __init__(self, channel_id, name, guild, *, category=None, overwrites=None, user_limit=0,
+                 bitrate=64000, video_quality_mode=discord.VideoQualityMode.auto, nsfw=False):
         self.id = channel_id
         self.name = name
         self.guild = guild
         self.category = category
         self.user_limit = user_limit
+        self.bitrate = bitrate
+        self.video_quality_mode = video_quality_mode
+        self.nsfw = nsfw
+        self.slowmode_delay = 0
         self.members = []
         self._overwrites = dict(overwrites or {})
         self.send = AsyncMock()
@@ -29,11 +34,10 @@ class FakeVoiceChannel:
         async def delete(reason=None):
             guild.channels.pop(self.id, None)
 
-        async def edit(name=None, user_limit=None, reason=None):
-            if name is not None:
-                self.name = name
-            if user_limit is not None:
-                self.user_limit = user_limit
+        async def edit(reason=None, **changes):
+            # Как VoiceChannel.edit: name, user_limit, bitrate, video_quality_mode, nsfw, slowmode_delay
+            for field, value in changes.items():
+                setattr(self, field, value)
 
         async def set_permissions(target, *, overwrite=None, reason=None):
             if overwrite is None or overwrite.is_empty():
@@ -86,8 +90,9 @@ def voice_env(env):
     entry = FakeVoiceChannel(vm.VOICE_ID, "➕ Создать войс", guild, category=category)
     guild.channels[entry.id] = entry
 
-    async def create_voice_channel(name, *, category=None, overwrites=None, user_limit=0, reason=None):
-        channel = FakeVoiceChannel(next(next_id), name, guild, category=category, overwrites=overwrites, user_limit=user_limit)
+    async def create_voice_channel(name, *, category=None, overwrites=None, user_limit=0, reason=None, **options):
+        channel = FakeVoiceChannel(next(next_id), name, guild, category=category, overwrites=overwrites,
+                                   user_limit=user_limit, **options)
         guild.channels[channel.id] = channel
         created.append(channel)
         return channel
@@ -170,6 +175,25 @@ class TestCreate:
         assert channel.overwrites_for(voice_env.guild.default_role).connect is False
         assert channel.overwrites_for(friend).connect is True  # допущен; 12345 нет на сервере — пропущен
 
+    async def test_saved_discord_settings_applied(self, voice_env):
+        """Битрейт, качество видео, возрастное ограничение — при создании; медленный режим — после переноса."""
+        voice_env.guild.bitrate_limit = 96000.0  # без бустов
+        me = voice_env.add_member(1)
+        owner = voice_env.db.add_user(discord_id=1)
+        voice_env.db.save_personal_voice_settings(owner, None, 0, False, [], bitrate=384000,
+                                                  video_quality=2, nsfw=True, slowmode=30)
+
+        await enter(voice_env, me, voice_env.entry)
+
+        channel = voice_env.created[0]
+        # Сохранено 384 кбит/с (было при третьем уровне бустов) — урезано до нынешнего потолка,
+        # иначе Discord отказал бы в создании войса.
+        assert channel.bitrate == 96000
+        assert channel.video_quality_mode == discord.VideoQualityMode.full
+        assert channel.nsfw is True
+        assert channel.slowmode_delay == 30
+        assert me in channel.members
+
     async def test_twink_opens_voice_of_main(self, voice_env):
         main = voice_env.add_member(1)
         twink = voice_env.add_member(11)
@@ -198,18 +222,40 @@ class TestCreate:
         assert channel.overwrites_for(isolation) == ISOLATION_OVERWRITE
 
     async def test_members_get_connect_only_not_view(self, voice_env):
-        """Личное разрешение сильнее запрета роли: с view_channel «Изоляция» допущенного увидела бы войс."""
+        """
+        Личное разрешение сильнее запрета роли: с view_channel «Изоляция» допущенного увидела бы войс.
+        Исключение — владелец (кейс 2026-11-14): см. test_owner_with_forbidden_role_sees_own_voice.
+        """
         me = voice_env.add_member(1)
         voice_env.add_member(2)
         owner = voice_env.db.add_user(discord_id=1)
         voice_env.db.save_personal_voice_settings(owner, None, 0, True, [2])
+        voice_env.db.link_twink(owner, 11)
+        voice_env.add_member(11)
 
         await enter(voice_env, me, voice_env.entry)
 
         channel = voice_env.created[0]
         for target, overwrite in channel.overwrites.items():
-            if isinstance(target, FakeMember) and target.id != voice_env.guild.me.id:
+            if isinstance(target, FakeMember) and target.id not in (voice_env.guild.me.id, me.id):
                 assert overwrite.view_channel is None, target
+        assert channel.overwrites_for(me).view_channel is True
+
+    async def test_owner_with_forbidden_role_sees_own_voice(self, voice_env):
+        """
+        Кейс 2026-11-14 (Бердж): у владельца роль из FORBIDDEN_ROLE_IDS (запрет видеть) — без личного
+        view_channel он не видел бы собственный войс, Discord выкидывал бы его, и войс сразу «пустел».
+        Личное разрешение сильнее запрета роли — владелец видит свой войс.
+        """
+        forbidden = FakeRole(vm.FORBIDDEN_ROLE_IDS[0], "Полный мут", guild=voice_env.guild)
+        voice_env.guild.roles[forbidden.id] = forbidden
+        me = voice_env.add_member(1, roles=[forbidden])
+
+        await enter(voice_env, me, voice_env.entry)
+
+        channel = voice_env.created[0]
+        assert channel.overwrites_for(forbidden).view_channel is False
+        assert channel.overwrites_for(me).view_channel is True and channel.overwrites_for(me).connect is True
 
     async def test_punished_member_kicked_from_personal_voice(self, voice_env):
         mute_role = FakeRole(777, "Мут", guild=voice_env.guild)
@@ -224,6 +270,73 @@ class TestCreate:
         muted.move_to.assert_awaited_once()
         assert muted.move_to.call_args.args[0] is None
         assert muted not in voice_env.created[0].members
+
+    async def test_staff_roles_enter_any_voice(self, voice_env, monkeypatch):
+        """
+        Решение Alium 2026-11-15: администрация и модерация (/staff_roles) — в любой личный войс:
+        видят, входят даже в закрытый (разрешение роли перебивает запрет @everyone) и в заполненный
+        («Перемещать участников» — единственный обход лимита в Discord).
+        """
+        import sys
+        admin_role = FakeRole(7300, "Администратор", guild=voice_env.guild)
+        mod_role = FakeRole(7400, "Модератор", guild=voice_env.guild)
+        voice_env.guild.roles.update({7300: admin_role, 7400: mod_role})
+        monkeypatch.setattr(sys.modules["config"].config, "ADMIN_ROLES_IDS", [7300])
+        monkeypatch.setattr(sys.modules["config"].config, "MODERATOR_ROLES_IDS", [7400])
+        me = voice_env.add_member(1)
+        owner = voice_env.db.add_user(discord_id=1)
+        voice_env.db.save_personal_voice_settings(owner, None, 2, True, [])  # закрыт и с лимитом
+
+        await enter(voice_env, me, voice_env.entry)
+
+        channel = voice_env.created[0]
+        assert channel.overwrites_for(voice_env.guild.default_role).connect is False
+        for role in (admin_role, mod_role):
+            overwrite = channel.overwrites_for(role)
+            assert (overwrite.view_channel, overwrite.connect, overwrite.move_members) == (True, True, True)
+
+        # /voice_lock трогает только @everyone — администрации вход не закрывает
+        await voice_env.cog.voice_unlock.callback(voice_env.cog, make_interaction(me, voice_env.guild))
+        await voice_env.cog.voice_lock.callback(voice_env.cog, make_interaction(me, voice_env.guild))
+        assert channel.overwrites_for(mod_role).connect is True
+
+    async def test_owner_cannot_edit_permissions(self, voice_env):
+        """
+        Владелец (не администрация) не должен сам ставить запреты по ролям — например, модерации на вход.
+        Права канала в Discord меняет только «Управлять правами» (manage_roles): его нет ни у создателя,
+        ни у того, кому войс передали.
+        """
+        me = voice_env.add_member(1)
+        await enter(voice_env, me, voice_env.entry)
+        channel = voice_env.created[0]
+        friend = voice_env.add_member(2)
+        join(friend, channel)
+
+        assert channel.overwrites_for(me).manage_channels is True
+        assert channel.overwrites_for(me).manage_roles is None
+
+        await voice_env.cog.voice_transfer.callback(voice_env.cog, make_interaction(me, voice_env.guild), friend)
+
+        assert channel.overwrites_for(friend).manage_channels is True
+        assert channel.overwrites_for(friend).manage_roles is None
+
+    async def test_staff_not_kicked_even_with_punish_role(self, voice_env, monkeypatch):
+        """Администрацию и модерацию из личного войса бот не выкидывает — даже с ролью наказания РСН."""
+        import sys
+        mod_role = FakeRole(7400, "Модератор", guild=voice_env.guild)
+        mute_role = FakeRole(777, "Мут", guild=voice_env.guild)
+        voice_env.guild.roles.update({7400: mod_role, 777: mute_role})
+        monkeypatch.setattr(sys.modules["config"].config, "MODERATOR_ROLES_IDS", [7400])
+        rsn = SimpleNamespace(_role=lambda key: mute_role if key == "mute_role_id" else None)
+        voice_env.bot.get_cog = lambda name: rsn if name == "RsnCog" else None
+        me = voice_env.add_member(1)
+        await enter(voice_env, me, voice_env.entry)
+        moderator = voice_env.add_member(2, roles=[mod_role, mute_role])
+
+        await enter(voice_env, moderator, voice_env.created[0])
+
+        moderator.move_to.assert_not_awaited()
+        assert moderator in voice_env.created[0].members
 
     async def test_bot_in_entry_ignored(self, voice_env):
         await enter(voice_env, voice_env.add_member(50, bot=True), voice_env.entry)
@@ -244,6 +357,8 @@ class TestCleanup:
         await enter(voice_env, me, None)
 
         channel.delete.assert_awaited_once()  # музыкальный бот войс не держит
+        # Причина в журнале аудита — по ней видно, какая проверка удалила войс
+        assert channel.delete.call_args.kwargs["reason"] == "Личный войс опустел: вышел последний"
         assert voice_env.db.get_personal_voice(channel.id)["deleted_at"] is not None
         assert voice_env.db.get_live_personal_voice(person(voice_env, 1)) is None
 
@@ -294,6 +409,7 @@ class TestCleanup:
         await voice_env.cog.voice_tick()
 
         channel.delete.assert_awaited_once()
+        assert channel.delete.call_args.kwargs["reason"] == "Личный войс опустел (проверка раз в минуту)"
 
     async def test_fresh_voice_not_in_cache_not_marked_deleted(self, voice_env):
         """Канал только что создан, событие «канал создан» ещё не обработано — не считать его удалённым."""
@@ -346,6 +462,7 @@ class TestCleanup:
 
         channel = voice_env.created[0]
         channel.delete.assert_awaited_once()
+        assert channel.delete.call_args.kwargs["reason"] == "Личный войс: не удалось перенести владельца"
         assert voice_env.db.get_personal_voice(channel.id)["deleted_at"] is not None
 
     async def test_deleted_by_hand_marked(self, voice_env):
@@ -486,6 +603,22 @@ class TestCommands:
 
         assert voice_env.db.get_personal_voice_settings(person(voice_env, 1)) is None
 
+    async def test_save_takes_discord_settings(self, voice_env):
+        """То, что владелец поменял в настройках канала в самом Discord, /voice_save тоже запоминает."""
+        me, channel = await self.open(voice_env)
+        channel.bitrate = 128000
+        channel.video_quality_mode = discord.VideoQualityMode.full
+        channel.nsfw = True
+        channel.slowmode_delay = 600
+
+        interaction = await run(voice_env, voice_env.cog.voice_save, me)
+
+        settings = voice_env.db.get_personal_voice_settings(person(voice_env, 1))
+        assert (settings["bitrate"], settings["video_quality"], settings["nsfw"], settings["slowmode"]) == (128000, 2, True, 600)
+        text = reply(interaction)
+        assert "Битрейт: **128 кбит/с**" in text and "Качество видео: **720p**" in text
+        assert "Возрастное ограничение: **да**" in text and "Медленный режим: **10 мин**" in text
+
     async def test_default_name_saved_as_default(self, voice_env):
         me, _ = await self.open(voice_env)
 
@@ -514,7 +647,97 @@ class TestCommands:
         assert channel.overwrites_for(friend).manage_channels is True
         assert channel.overwrites_for(me).manage_channels is None
         assert channel.overwrites_for(me).connect is True
-        assert "управляет <@2>" in channel.send.call_args.args[0]
+        assert channel.send.call_args.args[0] == "<@2>, теперь вы владелец этого голосового канала."
+
+    async def test_transfer_renames_by_new_owners_save(self, voice_env):
+        """Решение Alium 2026-11-15: название — по сохранённому у нового владельца, остальное как было."""
+        me, channel = await self.open(voice_env)
+        await run(voice_env, voice_env.cog.voice_limit, me, 4)
+        friend = voice_env.add_member(2)
+        join(friend, channel)
+        friend_id = voice_env.bot.db_ensure_user(friend).id
+        voice_env.db.save_personal_voice_settings(friend_id, "Логово", 2, True, [])
+
+        await run(voice_env, voice_env.cog.voice_transfer, me, friend)
+
+        assert channel.name == "Логово"
+        assert channel.user_limit == 4  # остальные настройки — прежние
+        assert channel.overwrites_for(voice_env.guild.default_role).connect is True
+        message = channel.send.call_args.args[0]
+        assert message == ("<@2>, теперь вы владелец этого голосового канала.\n"
+                           "Если вы хотите применить свои настройки из `/voice_save`, введите `/voice_apply`.")
+        assert channel.send.call_args.kwargs["allowed_mentions"].users is True  # пинг нового владельца
+
+    async def test_transfer_without_save_gets_default_name_no_hint(self, voice_env):
+        me, channel = await self.open(voice_env)
+        friend = voice_env.add_member(2)
+        join(friend, channel)
+
+        await run(voice_env, voice_env.cog.voice_transfer, me, friend)
+
+        assert channel.name == "User 2's Room"
+        assert "/voice_apply" not in channel.send.call_args.args[0]  # применять нечего
+
+    async def test_transfer_rename_rate_limited(self, voice_env):
+        me, channel = await self.open(voice_env)
+        friend = voice_env.add_member(2)
+        join(friend, channel)
+        import time as time_module
+        voice_env.cog._renames[channel.id] = [time_module.time(), time_module.time()]  # уже 2 раза за 10 минут
+
+        await run(voice_env, voice_env.cog.voice_transfer, me, friend)
+
+        assert channel.name == "User 1's Room"
+        assert "/voice_name" in channel.send.call_args.args[0]
+
+    async def test_save_after_transfer_skips_former_owner(self, voice_env):
+        """
+        Ловушки: прежний владелец получил право войти при передаче — это не «допущенный» нового;
+        его «Имя's Room» (если переименовать не вышло) — не название, которое стоит запомнить.
+        """
+        me, channel = await self.open(voice_env)
+        friend = voice_env.add_member(2)
+        guest = voice_env.add_member(3)
+        join(friend, channel)
+        join(guest, channel)
+        await run(voice_env, voice_env.cog.voice_lock, me)  # гость и друг допущены
+        import time as time_module
+        voice_env.cog._renames[channel.id] = [time_module.time(), time_module.time()]
+        await run(voice_env, voice_env.cog.voice_transfer, me, friend)
+
+        await run(voice_env, voice_env.cog.voice_save, friend)
+
+        settings = voice_env.db.get_personal_voice_settings(person(voice_env, 2))
+        assert settings["name"] is None           # «User 1's Room» — стандартное, не своё
+        assert settings["allowed"] == [3]         # прежний владелец (1) — не в допущенных
+        assert voice_env.db.get_personal_voice(channel.id)["former_owners"] == [1]
+
+    async def test_apply_saved_settings(self, voice_env):
+        me, channel = await self.open(voice_env)
+        friend = voice_env.add_member(2)
+        join(friend, channel)
+        voice_env.add_member(7)
+        voice_env.guild.bitrate_limit = 128000.0
+        friend_id = voice_env.bot.db_ensure_user(friend).id
+        voice_env.db.save_personal_voice_settings(friend_id, "Логово", 3, True, [7], bitrate=384000,
+                                                  video_quality=2, nsfw=True, slowmode=60)
+        await run(voice_env, voice_env.cog.voice_transfer, me, friend)
+
+        interaction = await run(voice_env, voice_env.cog.voice_apply, friend)
+
+        assert (channel.name, channel.user_limit, channel.bitrate) == ("Логово", 3, 128000)
+        assert channel.video_quality_mode == discord.VideoQualityMode.full and channel.nsfw is True
+        assert channel.slowmode_delay == 60
+        assert channel.overwrites_for(voice_env.guild.default_role).connect is False
+        assert channel.overwrites_for(voice_env.guild.get_member(7)).connect is True
+        assert "применены" in reply(interaction)
+
+    async def test_apply_without_save(self, voice_env):
+        me, _ = await self.open(voice_env)
+
+        interaction = await run(voice_env, voice_env.cog.voice_apply, me)
+
+        assert "/voice_save" in reply(interaction)
 
     async def test_transfer_needs_member_inside(self, voice_env):
         me, _ = await self.open(voice_env)
@@ -542,6 +765,64 @@ class TestCommands:
 # ---------- БАЗА: ТВИНКИ ----------
 
 class TestTwinkMerge:
+    def test_link_twink_keeps_discord_settings(self, voice_env):
+        db = voice_env.db
+        main = db.add_user(discord_id=1)
+        twink = db.add_user(discord_id=11)
+        db.save_personal_voice_settings(twink, "Твинкова", 0, False, [], bitrate=96000, video_quality=2,
+                                        nsfw=True, slowmode=5)
+
+        db.link_twink(main, 11)
+
+        settings = db.get_personal_voice_settings(main)
+        assert (settings["bitrate"], settings["video_quality"], settings["nsfw"], settings["slowmode"]) == (96000, 2, True, 5)
+
+    def test_migration_adds_columns_to_old_table(self):
+        """
+        Таблица personal_voices уже была создана без новых колонок (патч поработал на серверах).
+        CREATE TABLE IF NOT EXISTS её не меняет — колонки добавляет миграция, старые строки целы.
+        """
+        import sqlite3
+        import utilities
+
+        db = utilities.Database.__new__(utilities.Database)
+        db._con = sqlite3.connect(":memory:")
+        db._con.row_factory = sqlite3.Row
+        db._con.execute("""
+            CREATE TABLE personal_voices (
+                user_id INTEGER PRIMARY KEY, name TEXT, user_limit INTEGER NOT NULL DEFAULT 0,
+                locked INTEGER NOT NULL DEFAULT 0, allowed TEXT NOT NULL DEFAULT '[]', saved_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        db._con.execute("INSERT INTO personal_voices (user_id, name, user_limit) VALUES (7, 'Чайная', 3)")
+
+        db._init_db()
+
+        assert {"bitrate", "video_quality", "nsfw", "slowmode"} <= db._table_columns("personal_voices")
+        settings = db.get_personal_voice_settings(7)
+        assert (settings["name"], settings["user_limit"]) == ("Чайная", 3)
+        assert (settings["bitrate"], settings["video_quality"], settings["nsfw"], settings["slowmode"]) == (None, None, False, 0)
+
+    def test_migration_adds_former_owners(self):
+        """Таблица войсов уже была на серверах без former_owners — колонку добавляет миграция."""
+        import sqlite3
+        import utilities
+
+        db = utilities.Database.__new__(utilities.Database)
+        db._con = sqlite3.connect(":memory:")
+        db._con.row_factory = sqlite3.Row
+        db._con.execute("""
+            CREATE TABLE personal_voice_channels (
+                channel_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, category_id INTEGER,
+                created_at INTEGER NOT NULL, deleted_at INTEGER
+            )
+        """)
+        db._con.execute("INSERT INTO personal_voice_channels VALUES (5001, 1, NULL, 100, NULL)")
+
+        db._init_db()
+
+        assert db.get_personal_voice(5001)["former_owners"] == []
+
     def test_link_twink_moves_voice_data(self, voice_env):
         db = voice_env.db
         main = db.add_user(discord_id=1)

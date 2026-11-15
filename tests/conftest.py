@@ -40,6 +40,7 @@ _config_module.config = SimpleNamespace(
     GUILD_ID=GUILD_ID,
     OWNERS_IDS=[OWNER_ID, 436586208450052099],
     ADMIN_ROLES_IDS=[],
+    MODERATOR_ROLES_IDS=[],
     MODULES={},
 )
 _config_module.DISCORD_TOKEN_MAIN = "test"

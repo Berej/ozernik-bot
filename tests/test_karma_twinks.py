@@ -323,7 +323,8 @@ class TestTwinkRemoveAndList:
         await env.cog.twink_remove.callback(env.cog, interaction, accounts.twink)
 
         assert env.db.is_twink(11)
-        assert interaction.response.send_message.call_args.args[0] == "Отвязать твинк может только администрация — обратитесь к ней."
+        assert interaction.response.send_message.call_args.args[0] == \
+            "Отвязать твинк может только администрация или модерация — обратитесь к ним."
 
     async def test_unlink_not_a_twink(self, env, accounts):
         interaction = self.admin(env, accounts)
@@ -367,7 +368,7 @@ class TestAllTwinks:
 
         await env.cog.twinks_all.callback(env.cog, interaction)
 
-        assert interaction.response.send_message.call_args.args[0] == "Только для Администраторов."
+        assert interaction.response.send_message.call_args.args[0] == "Только для администрации и модерации."
 
     async def test_empty(self, env, accounts):
         accounts.stranger.guild_permissions.administrator = True
@@ -457,7 +458,7 @@ class TestTwinkLink:
         await env.cog.twink_link.callback(env.cog, interaction, accounts.stranger, accounts.twink)
 
         assert not env.db.is_twink(11)
-        assert interaction.response.send_message.call_args.args[0] == "Только для Администраторов."
+        assert interaction.response.send_message.call_args.args[0] == "Только для администрации и модерации."
 
     @pytest.mark.parametrize(
         ("case", "reason"),

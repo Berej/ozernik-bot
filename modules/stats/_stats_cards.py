@@ -399,8 +399,8 @@ def render_channels(avatar: Image.Image, name: str, name_color: str, data: dict)
     image, draw = new_page(avatar, name, name_color, subtitle)
 
     (l1, l2), (r1, r2) = two_columns()
-    draw_ranked_column(draw, l1, l2, "ТЕКСТОВЫЕ · СООБЩЕНИЯ", data["text"], format_count, MESSAGES_COLOR, icon="#")
-    draw_ranked_column(draw, r1, r2, "ГОЛОСОВЫЕ · ВРЕМЯ", data["voice"], format_hours, VOICE_COLOR, icon="voice")
+    draw_ranked_column(draw, l1, l2, "ТЕКСТОВЫЕ КАНАЛЫ", data["text"], format_count, MESSAGES_COLOR, icon="#")
+    draw_ranked_column(draw, r1, r2, "ГОЛОСОВЫЕ КАНАЛЫ", data["voice"], format_hours, VOICE_COLOR, icon="voice")
     return to_png(image)
 
 

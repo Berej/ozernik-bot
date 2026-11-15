@@ -211,3 +211,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+    # Код выхода ставит .bot_shutdown / .bot_restart (модуль panel): под systemd 0 — перезапуск,
+    # 64 — выключение (в юните RestartPreventExitStatus=64). Обычная остановка — 0.
+    sys.exit(getattr(bot, "exit_code", 0))
